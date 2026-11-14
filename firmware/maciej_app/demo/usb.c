@@ -451,18 +451,27 @@ static int no_device(void)
 
 /* a control transfer to a device (IN data, or none), tried three times
    unless the device stalls it: the bytes received, -1 (usb_error_text says
-   why) */
+   why).  Through a hub's translator a stall is tried again too: the
+   translator answers a complete-split it has no start-split for with one
+   -- on the box 3 of 25 GET_STATUS to a mouse behind a hub (whose IN was
+   pending on endpoint B) ended so, at the data or the status stage, and 1
+   of 25 to a serial adapter; a mouse whose CLEAR_FEATURE failed that way
+   was not read again */
 static int request(const struct device *d, u8 rtype, u8 req, u16 value, u16 index, u8 *data, u16 len, u32 timeout_ms)
 {
     u8 setup[8] = {rtype, req, (u8)value, (u8)(value >> 8), (u8)index, (u8)(index >> 8), (u8)len, (u8)(len >> 8)};
     aim(d);
     for (int attempt = 0; attempt < 3; attempt++) {
         int n = control_once(setup, data, len, timeout_ms);
-        if (n >= 0)
-            return n;
-        if (last_error & 0x80)
+        if (n > 0 || (n == 0 && (!len || !d->split || attempt == 2)))
+            return n;                   /* (asked for data through a translator and none came, without an
+                                           error: 1 of 60 GET_STATUS on the box -- asked again) */
+        if (n == 0)
+            last_error = 0;
+        if ((last_error & 0x80) && !d->split)
             break;                      /* a stall is the device's answer */
-        delay_ms(2);
+        delay_ms(d->split ? 20 : 2);    /* (a translator still busy answers nothing: 2 ms after its stall
+                                           2 of 40 requests to the serial adapter failed three times) */
     }
     note_failure();
     return -1;
@@ -1092,17 +1101,43 @@ void usb_epd_counts(u32 *every_us, u32 *reports, u32 *drops)
     *drops = epd_drops;
 }
 
+/* would toggle_sync clear the device endpoint's halt (its toggle not known to be in step)? */
+static int needs_clear(const struct device *d, u8 ep, int out)
+{
+    u8 dev_ep = out ? d->out_ep : d->in_ep, tagged = (u8)((ep & 0x0F) | 0x10);
+    if (owner[!out] == d->address && owner_ep[!out] == tagged && dev_ep == tagged)
+        return 0;
+    return dev_ep && (dev_ep != tagged || (out ? d->out_toggle : d->in_toggle));
+}
+
 /* a bulk-only command is about to begin: both endpoints' toggles in step
    now -- a CLEAR_FEATURE(ENDPOINT_HALT) between its command block and its
    data ends the command on a real stick (it stalled the status; a card
-   reader refused the request and timed out) */
-int usb_bulk_sync(u8 device, u8 out_ep, u8 in_ep)
+   reader refused the request and timed out).
+   A 64 GB stick on the box (090c:2000) needs two more things, measured
+   with NTFS reads of 2 and 8 sectors (data and status: an odd number of IN
+   packets, the IN's toggle DATA1 after each): (1) a command whose IN data
+   starts at DATA1 failed about every second time -- its command block was
+   lost (the data stage NAKed for 2 s), its first data packet dropped for
+   its toggle (7 x 512 + the 13-byte status received), or its status never
+   came -- while each that started at DATA0 worked (the 05e3 card reader
+   takes either); (2) it puts BOTH its bulk toggles back to DATA0 when
+   either endpoint's halt is cleared (its IN's alone cleared, the next
+   command block, DATA1, was dropped as a repeat).  So a command with data
+   in (`data_in`) never starts at DATA1: both halts are cleared first, as
+   they are whenever one of them is (disk.c reads an odd number of sectors
+   from high-speed disks, so this is seldom needed) */
+int usb_bulk_sync(u8 device, u8 out_ep, u8 in_ep, int data_in)
 {
     struct device *d = device_at(device);
     if (!d)
         return no_device();
     usb_in_stop();                      /* (the keyboard's IN: kbd.c starts it again) */
     last_stage = "toggle set-up";
+    if (needs_clear(d, out_ep, 1) || needs_clear(d, in_ep, 0) || (data_in && d->in_toggle)) {
+        toggle_unknown(d, 1);           /* (both cleared, OUT first) */
+        toggle_unknown(d, 0);
+    }
     if (toggle_sync(d, out_ep, 1) < 0 || toggle_sync(d, in_ep, 0) < 0)
         return -1;
     return 0;

@@ -128,6 +128,9 @@ void uart_rx_poll(void);        /* received bytes from the chip's FIFO into the 
 void uart_flush(void);          /* until the transmitter is empty */
 void uart_capture(u8 *buf, u32 max);    /* what is printed goes into buf instead ('command > file'; LF line ends) */
 u32 uart_capture_end(u32 *over);        /* the bytes captured; *over: the ones that did not fit */
+void uart_inject(u8 c);                 /* a character uart_getc returns as if received (the telnet console) */
+int uart_inject_room(void);
+#define INJECT_ROOM 255                 /* uart_inject_room() with nothing waiting */
 void uprintf(const char *fmt, ...);
 void vuprintf(const char *fmt, va_list ap);
 int usnprintf(char *buf, int size, const char *fmt, ...);
@@ -236,7 +239,8 @@ int usb_bulk_in_packet(u8 device, u8 ep, u16 maxp, u8 *data, u32 timeout_ms);
                                            zero-length packet (a token spoilt on the bus: tried again) */
 int usb_bulk_out(u8 device, u8 ep, u16 maxp, const u8 *data, u32 len, u32 timeout_ms);  /* 0, -1 */
 int usb_clear_halt(u8 device, u8 ep);   /* CLEAR_FEATURE(ENDPOINT_HALT) (bit 7 of ep: IN): 0, -1 */
-int usb_bulk_sync(u8 device, u8 out_ep, u8 in_ep);  /* before a bulk-only command: both toggles in step */
+int usb_bulk_sync(u8 device, u8 out_ep, u8 in_ep, int data_in);   /* before a bulk-only command: both
+                                           toggles in step (with data in: the IN's at DATA0) */
 int usb_epd_open(u8 device, u8 ep, u16 size, u8 interval);  /* endpoint D polls the device's interrupt IN
                                            endpoint by itself: 0, -1 no answer, -2 it polls another device */
 void usb_epd_close(void);
@@ -254,24 +258,70 @@ int mouse_moving_on_b(void);            /* moving, read through endpoint B: eth.
 const char *mouse_poll(void);           /* every main loop pass; a line to show, or 0 */
 void mouse_show_status(void);
 
-/* disk.c: USB mass storage (bulk-only, SCSI) and FAT file systems */
+/* disk.c: USB mass storage (bulk-only, SCSI), FAT file systems and NTFS (read and written) */
 const char *disk_attach(u8 device, u8 iface, u8 in_ep, u8 out_ep, u16 maxp);  /* a line about the disk */
 void disk_detach(u8 device);
 void disk_list(void);                   /* 'disks' */
 void disk_ls(const char *path);         /* 'ls [n:][/path]' (relative to the current directory) */
 void disk_cat(const char *path);        /* 'cat [n:]/path' */
+void disk_sum(const char *path);        /* 'sum [n:]path': a file's size and CRC-32, read to its end */
+void disk_rm_r(const char *path);       /* 'rm -r': a directory and everything in it */
+void disk_cp_r(const char *from, const char *to);       /* 'cp -r': a directory with all in it */
+void disk_df(const char *path);         /* 'df [n:]': the volumes' size, free and used space */
+void disk_head(const char *path, u32 lines);    /* 'head [-n N]': a file's first lines */
+void disk_tail(const char *path, u32 lines);    /* 'tail [-n N]': its last lines (of its last 16 KB) */
 void disk_sector(const char *where);    /* 'sector [n:]<lba>' */
 int disk_count(void);
 void disk_cd(const char *path);         /* 'cd [n:][path]' */
 void disk_pwd(void);                    /* 'pwd' */
 const char *disk_cwd(void);             /* "3:/docs" (the prompt shows it), "" before any 'cd' */
-void disk_mkdir(const char *path);      /* 'mkdir', 'rmdir', 'rm', 'touch': the FAT volume written */
+void disk_mkdir(const char *path);      /* 'mkdir', 'rmdir', 'rm', 'touch': the volume written (FAT; NTFS when
+                                           its journal is clean: 'ntfs' tells) */
 void disk_rmdir(const char *path);
 void disk_rm(const char *path);
 void disk_touch(const char *path);
 void disk_write_file(const char *path, const u8 *data, u32 len, int append);  /* 'command > path' / '>>' */
-void disk_cp(const char *from, const char *to);         /* 'cp': a file, onto any FAT volume */
+void disk_cp(const char *from, const char *to);         /* 'cp': a file, onto any FAT or NTFS volume */
 void disk_mv(const char *from, const char *to);         /* 'mv': rename / move on the same volume */
+void disk_ntfs(const char *volume, const char *what);   /* 'ntfs [n:]': an NTFS volume's geometry, its journal's
+                                                           state, whether the demo writes it; 'ntfs n: reset-journal' */
+/* what the explorer reads (explorer.c); errors are said on the UART like the commands' */
+#define DISK_ENTRY_NAME 128
+#define DISK_FILE       0
+#define DISK_DIR        1
+#define DISK_VOLUME     2
+struct disk_entry {
+    char name[DISK_ENTRY_NAME];         /* the long name as 'ls' shows it; a volume: "4:  FAT32 'STICK', ..." */
+    u32 size;                           /* bytes (a volume: MB) */
+    u32 size_hi;                        /* the size's bits 32..63 (NTFS: a file of 4 GB or more) */
+    u16 date, time;                     /* FAT's */
+    u8 kind;                            /* DISK_FILE, DISK_DIR, DISK_VOLUME */
+    u8 attr;                            /* FAT's attribute byte (0x02 hidden; a volume: 0x02 not readable) */
+};
+int disk_dir_read(const char *path, struct disk_entry *out, int max, u32 *total);  /* entries, -1 */
+int disk_volumes(struct disk_entry *out, int max);      /* every disk's volumes, named as 'cd' takes them */
+void disk_cwd_volume(char *out, int size);              /* "disk 4: FAT32 'STICK', 39 MB", "" */
+int disk_read_head(const char *path, u8 *buf, u32 max, u32 *size);       /* a file's first bytes, -1 */
+u32 disk_changes(void);                 /* changes when a disk comes or goes or a sector is written */
+/* disk.c for ftp.c: a reader and a writer of its own (they last across main loop passes), -1 said why */
+int disk_stat(const char *path, struct disk_entry *o);  /* a file, a directory, a volume's root: 0, -1 */
+int disk_stream_open(const char *path, u64 *size);      /* 0, -1 */
+int disk_stream_read(u8 *buf, u32 max);                 /* max: 512 x n, 4096 at most; bytes, 0 the end, -1 */
+void disk_stream_close(void);
+int disk_upload_open(const char *path, int append);     /* made / emptied / added to: 0, -1 */
+int disk_upload_put(const u8 *data, u32 n);             /* 0, -1 (its clusters freed again) */
+int disk_upload_close(void);                            /* its entry set: 0, -1 */
+/* ftp.c: an FTP server on port 21 (the disks' volumes at its root, all of them, no password) */
+const char *ftp_poll(void);             /* net_poll (the main loop only): a line to show, or 0 */
+void ftp_status(void);                  /* 'netstat' */
+
+/* explorer.c: a file explorer on the TV (the test screen's picture), synced to the current directory */
+void explorer_show(void);               /* 'explorer': on the TV (the listing follows on the next poll) */
+void explorer_hide(void);               /* the test screen's picture is drawn by something else now */
+int explorer_shown(void);               /* on the TV now: the USB keyboard's keys and the mouse are its own */
+void explorer_key(int c);               /* a character from the USB keyboard (escape sequences in pieces) */
+void explorer_mouse(int x, int y, u8 buttons, int wheel);  /* every mouse report while shown */
+int explorer_poll(void);                /* every main loop pass: 1 when it changed the current directory */
 
 /* serial.c: USB serial ports (a GSM / LTE module's AT, modem and diagnostic ports; CDC ACM) */
 #define SERIAL_PORTS 8
@@ -296,6 +346,75 @@ void eth_dhcp(void);                    /* 'dhcp': ask for an address again */
 void eth_arp_list(void);                /* 'arp' */
 void eth_ping(const char *host, int count);     /* 'ping [-c count] <host>' (0: until Ctrl-C) */
 int eth_parse_ip(const char *s, u8 ip[4]);
+
+/* ---- networking: eth.c's IPv4 for tcp.c / net.c, TCP, wget, telnet, netload, NTP ---- */
+#define KSEG0(p)         (0x80000000u | (p))
+/* RAM the networking (and disk.c's NTFS reading) uses (physical; written through KSEG0, cached; clear of the
+   video buffers the original firmwares' display set-up points the display engine and VCAP at: 0x0116xxxx,
+   0x0146xxxx) */
+#define WGET_PHYS        0x05000000u      /* 'wget -O': the body, up to WGET_MAX */
+#define WGET_MAX         0x00800000u
+#define NETLOAD_PHYS     0x06000000u      /* netload: the image received, up to NETLOAD_MAX */
+#define NETLOAD_MAX      0x00700000u      /* (it is copied to 0x80000200: below the stack's 64 KB at 0x807F0000) */
+#define NETLOAD_STUB_PHYS 0x06800000u     /* the copy + cache stub, run uncached from here */
+#define NTFS_RUNS_PHYS   0x04000000u      /* disk.c: the runs of the NTFS file being read (cp, cat, sum), */
+#define NTFS_RUNS_SIZE   0x00100000u      /* 12 bytes each: 87381 pieces at most */
+#define NTFS_RUNS2_PHYS  0x04100000u      /* the same for the file the FTP server sends (NTFS_RUNS_SIZE bytes) */
+#define FTP_ENTRIES_PHYS 0x04200000u      /* ftp.c: a directory's entries for a listing (1 MB) */
+#define FTP_TEXT_PHYS    0x04300000u      /* ftp.c: the listing's text (1 MB) */
+#define NTFS_UPCASE_PHYS 0x04400000u      /* disk.c, writing NTFS: the volume's $UpCase table (128 KB) */
+#define NTFS_WORK_PHYS   0x04420000u      /* a directory's index being rebuilt: where its entries are, the plan of
+                                             its new blocks (0x20000 bytes) */
+#define NTFS_INDEX_PHYS  0x04500000u      /* that directory's entries themselves, up to NTFS_INDEX_SIZE */
+#define NTFS_INDEX_SIZE  0x00400000u      /* (4096 entries with the longest names: 2.4 MB) */
+int eth_ready(void);                    /* an address from DHCP */
+const u8 *eth_address(void);
+u32 eth_bound_count(void);              /* DHCP acknowledgements so far */
+int eth_inside(void);                   /* eth code is reading / handling frames now (no eth_service in it) */
+void eth_service(void);                 /* the frames waiting and TCP's timers, now (a command's waits) */
+int eth_route(const u8 *ip, u8 mac[6]); /* the next hop's MAC (ARP up to 1 s): 1, 0 */
+int eth_send_ipv4(u8 *frame, const u8 *mac, const u8 *ip, u8 proto, int len);  /* payload at frame + 34 */
+int eth_lookup(const char *host, u8 ip[4], const char *who);   /* a.b.c.d or DNS: 1, 0 (said why) */
+int eth_dns_start(const char *name);    /* a DNS question, not waited for: 0, -1 */
+int eth_dns_result(u8 ip[4]);           /* its answer: 1, 0 none yet, -1 no such name */
+
+/* tcp.c: a few TCP connections, active (tcp_connect) and passive (tcp_listen + tcp_accept) */
+#define TCP_FAILED     -1               /* refused, reset, timed out, the network went (tcp_why) */
+#define TCP_CONNECTING  0
+#define TCP_OPEN        1
+#define TCP_PEER_DONE   2               /* the peer closed its side: what it sent can still be read */
+#define TCP_DONE        3               /* closed both ways */
+void tcp_input(const u8 *src, const u8 *dst, const u8 *src_mac, const u8 *seg, int len);   /* eth.c */
+void tcp_poll(void);                    /* timers, sending (eth_poll, eth_service) */
+int tcp_busy(void);                     /* a connection moves data: eth_poll reads frames on every pass */
+void tcp_drop_all(void);                /* the Ethernet port went or got a new address */
+int tcp_listen(u16 port);               /* 0, -1 no room */
+int tcp_accept(u16 port);               /* an established connection that came in on the port: its number, -1 */
+int tcp_connect(const u8 ip[4], u16 port);      /* its number (SYN sent), -1 no route / no room */
+int tcp_status(int c);                  /* TCP_* */
+const char *tcp_why(int c);             /* why it is TCP_FAILED */
+int tcp_send(int c, const void *data, int len);         /* bytes taken into its send buffer (sent by tcp_poll) */
+u32 tcp_room(int c);                    /* free bytes in its send buffer */
+void tcp_push(int c);                   /* send what the buffer and the peer's window allow, now */
+int tcp_recv(int c, void *data, int max);       /* bytes received so far (0 none) */
+u32 tcp_unread(int c);                  /* received bytes not read yet */
+void tcp_shutdown(int c);               /* a FIN after the data; the connection stays the caller's */
+void tcp_close(int c);                  /* the same, and the connection is given up (it ends by itself) */
+void tcp_abort(int c);                  /* RST, given up */
+void tcp_peer(int c, u8 ip[4], u16 *port);
+void tcp_list(void);                    /* 'netstat' */
+
+/* net.c: wget, the telnet console (port 23), network loading (port 6464), NTP time */
+void net_udp_input(const u8 *src, u16 sport, u16 dport, const u8 *data, int len);   /* eth.c */
+const char *net_poll(void);             /* eth_poll's servers and the clock's setting; a line to show, or 0 */
+void net_command(int running);          /* main.c: a command runs (1) / ended (0) */
+void net_uart_poll(void);               /* uart_getc: the telnet client's typing (in a command: the network too) */
+void telnet_putc(char c);               /* uart_putc: every character printed, to the telnet client */
+int ntp_clock_text(char *buf, int size);        /* "11:23:45 CET" once NTP set the clock: 1, else 0 */
+void cmd_wget(int argc, char **argv);
+void cmd_ntp(int argc, char **argv);
+void cmd_date(int argc, char **argv);
+void cmd_netstat(int argc, char **argv);
 
 /* kbd.c: a USB keyboard (HID boot protocol) typing into the command line */
 const char *kbd_start(u8 device, u8 iface, u8 ep, u16 size, u8 interval);   /* after SET_CONFIGURATION */

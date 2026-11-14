@@ -16,7 +16,9 @@
    covers and takes it away before anything is drawn under it).  With the
    left button held it paints; the right button picks the next colour; the
    wheel is told.  Every button going down or up is told on the UART with the
-   pointer's place: '[usb] mouse: left down at 640,360'. */
+   pointer's place: '[usb] mouse: left down at 640,360'.  While the explorer
+   is on the TV (explorer.c) the buttons and the wheel are its own: no
+   painting, nothing told. */
 #include "hw.h"
 
 #define SLOT 1                          /* (usb.c's slots for interrupt endpoints) */
@@ -167,15 +169,19 @@ static const char *on_report(const u8 *r, int n)
         dy *= 2;
     x = clamp(x + dx, 0, SCREEN_W - 1);
     y = clamp(y + dy, 0, SCREEN_H - 1);
+    /* the explorer on the TV takes the buttons and the wheel: no painting, no lines on the UART */
+    int explorer = explorer_shown();
     /* a wheel byte after X and Y: a step of a few at most (the boot protocol does not define it: the A4Tech
        tried sends 83 there in the small movements it reports by itself -- no wheel) */
-    if (n >= 4 && r[3] && (signed char)r[3] >= -15 && (signed char)r[3] <= 15) {
-        wheel += (signed char)r[3];
-        usnprintf(message, sizeof(message), "mouse: wheel %d (%d in all) at %d,%d", (signed char)r[3], wheel, x, y);
-        say = message;
+    int step = n >= 4 && r[3] && (signed char)r[3] >= -15 && (signed char)r[3] <= 15 ? (signed char)r[3] : 0;
+    if (step) {
+        wheel += step;
+        usnprintf(message, sizeof(message), "mouse: wheel %d (%d in all) at %d,%d", step, wheel, x, y);
+        say = explorer ? 0 : message;
     }
     u8 changed = (u8)(r[0] ^ buttons);
-    int paint = !gfx_view_console();    /* (painting is the test screen's; the console's text would cover it) */
+    /* (painting is the test screen's; the console's text would cover it) */
+    int paint = !gfx_view_console() && !explorer;
     if (paint && (buttons & 1) && (r[0] & 1))
         paint_to(x, y);
     for (u8 bit = 1; bit <= 4; bit <<= 1)
@@ -188,14 +194,15 @@ static const char *on_report(const u8 *r, int n)
                 paint_y = y;
                 paint_to(x, y);
             }
-            if (bit == 2 && down)
+            if (bit == 2 && down && !explorer)
                 colour = (colour + 1) % (int)(sizeof(colours) / sizeof(colours[0]));
             usnprintf(message, sizeof(message), "mouse: %s %s at %d,%d%s%s", button_name(bit), down ? "down" : "up",
                       x, y, bit == 2 && down ? "; paint colour " : "", bit == 2 && down ? colour_names[colour] : "");
-            say = message;
+            say = explorer ? 0 : message;
         }
     buttons = r[0];
     gfx_cursor(x, y, 1);
+    explorer_mouse(x, y, r[0], explorer ? step : 0);   /* (it follows the buttons when hidden too) */
     return say;
 }
 

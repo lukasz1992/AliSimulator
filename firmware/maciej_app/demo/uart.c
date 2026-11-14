@@ -33,6 +33,23 @@ void uart_rx_poll(void)
         rx_store(UART[0]);
 }
 
+/* what a telnet client types (net.c) waits here: uart_getc hands it out after
+   the UART's own bytes, so every loop that reads the UART (the command line,
+   ping's and cat's Ctrl-C) gets it too */
+static u8 in_buf[256];
+static u8 in_head, in_tail;
+
+void uart_inject(u8 c)
+{
+    if ((u8)(in_head + 1) != in_tail)
+        in_buf[in_head++] = c;
+}
+
+int uart_inject_room(void)
+{
+    return 255 - (u8)(in_head - in_tail);
+}
+
 /* a command's output going into a file ('command > path'): kept here
    instead, without the CRs (the file gets Linux line ends) */
 static u8 *cap;
@@ -69,6 +86,7 @@ void uart_putc(char c)
             rx_store(UART[0]);
     UART[0] = (u8)c;
     console_putc(c);                    /* the TV's console shows the same */
+    telnet_putc(c);                     /* and a telnet client (net.c) */
 }
 
 void uart_puts(const char *s)
@@ -80,9 +98,12 @@ void uart_puts(const char *s)
 int uart_getc(void)
 {
     uart_rx_poll();
-    if (rx_head == rx_tail)
+    if (rx_head != rx_tail)
+        return rx_buf[rx_tail++];
+    net_uart_poll();                    /* (a telnet client's bytes into in_buf) */
+    if (in_head == in_tail)
         return -1;
-    return rx_buf[rx_tail++];
+    return in_buf[in_tail++];
 }
 
 void uart_flush(void)

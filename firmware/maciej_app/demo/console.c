@@ -178,23 +178,24 @@ static int put_text(char *to, int at, const char *s)
     return at;
 }
 
-/* the title bar: what this is, how to look back, the uptime */
+/* the title bar: what this is, how to look back, the uptime -- and the date and time once NTP set the clock */
 static void draw_title(void)
 {
     char t[COLS];
     u8 a[COLS];
-    char right[64];
+    char right[112], clock[40];
     for (int i = 0; i < COLS; i++) {
         t[i] = ' ';
         a[i] = 0;
     }
     int n = put_text(t, 1, "M3801 console - demo " APP_VERSION);
     u32 s = uptime_s();
-    if (back)
-        usnprintf(right, sizeof(right), "%u lines back - PgDn returns", back);
-    else
-        usnprintf(right, sizeof(right), "PgUp/PgDn: earlier lines   testscreen   up %u:%02u:%02u", s / 3600,
-                  (s / 60) % 60, s % 60);
+    int timed = ntp_clock_text(clock, sizeof(clock));  /* (the hint shorter then: 105 columns) */
+    int at = back ? usnprintf(right, sizeof(right), "%u lines back - PgDn returns", back)
+                  : usnprintf(right, sizeof(right), "%s   testscreen   up %u:%02u:%02u",
+                              timed ? "PgUp/PgDn" : "PgUp/PgDn: earlier lines", s / 3600, (s / 60) % 60, s % 60);
+    if (timed && at > 0 && at < (int)sizeof(right))
+        usnprintf(right + at, (int)sizeof(right) - at, "   %s", clock);
     int len = 0;
     while (right[len])
         len++;

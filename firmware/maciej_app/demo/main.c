@@ -143,6 +143,8 @@ static void update_uptime(void)
     u32 s = uptime_s();
     usnprintf(buf, sizeof(buf), "%u:%02u:%02u", s / 3600, (s / 60) % 60, s % 60);
     box_line(&BOX_SYSTEM, 3, "Uptime", buf, 2, C_VALUE);
+    if (ntp_clock_text(buf, sizeof(buf)))       /* (once NTP set the clock: net.c) */
+        box_line(&BOX_SYSTEM, 4, "Time", buf, 2, C_VALUE);
 }
 
 static void update_remote(void)
@@ -204,6 +206,7 @@ static void update_usb_box(void)
 static void draw_screen(void)
 {
     char buf[48];
+    explorer_hide();                    /* (the explorer drew on this picture) */
     demo_shown = 1;
     gfx_gradient(0, 0, SCREEN_W, SCREEN_H, C_BG_TOP, C_BG_BOT);
     gfx_fill(0, 0, SCREEN_W, 96, C_HEADER);
@@ -377,7 +380,7 @@ static char raw_line[LINE_MAX];
 static const char *raw_rest;
 static char history[HISTORY][LINE_MAX];
 static int history_count, history_pos;
-static int esc_state;
+static int esc_state, esc_num;
 
 /* "m3801> ", with the current directory once 'cd' chose one: "m3801 3:/docs> " */
 static void prompt(void)
@@ -442,6 +445,7 @@ static void cmd_lsusb(int argc, char **argv);
 static void cmd_disks(int argc, char **argv);
 static void cmd_ls(int argc, char **argv);
 static void cmd_cat(int argc, char **argv);
+static void cmd_sum(int argc, char **argv);
 static void cmd_sector(int argc, char **argv);
 static void cmd_watchdog(int argc, char **argv);
 static void cmd_clear(int argc, char **argv);
@@ -450,6 +454,7 @@ static void cmd_bootloader(int argc, char **argv);
 static void cmd_video(int argc, char **argv);
 static void cmd_testscreen(int argc, char **argv);
 static void cmd_console(int argc, char **argv);
+static void cmd_explorer(int argc, char **argv);
 static void cmd_history(int argc, char **argv);
 static void cmd_cd(int argc, char **argv);
 static void cmd_pwd(int argc, char **argv);
@@ -457,6 +462,10 @@ static void cmd_mkdir(int argc, char **argv);
 static void cmd_rmdir(int argc, char **argv);
 static void cmd_rm(int argc, char **argv);
 static void cmd_touch(int argc, char **argv);
+static void cmd_head(int argc, char **argv);
+static void cmd_tail(int argc, char **argv);
+static void cmd_df(int argc, char **argv);
+static void cmd_ntfs(int argc, char **argv);
 static void cmd_cp(int argc, char **argv);
 static void cmd_mv(int argc, char **argv);
 static void cmd_tty(int argc, char **argv);
@@ -542,6 +551,11 @@ static const struct command commands[] = {
     {"testscreen", "", "the demo's test screen on the TV (its boxes, the colour bars); a key on the USB "
                    "keyboard (it types too) or 'console' brings the console back", cmd_testscreen},
     {"console", "", "the console on the TV again", cmd_console},
+    {"explorer", "[n:][path]", "a file explorer on the TV, in the current directory (cd follows it, it follows cd; "
+     "with a path: cd there first): USB keyboard Up/Down/PgUp/PgDn/Home/End, Enter opens, Backspace goes up, "
+     "'/' or Tab types a path, Esc: the console again; the mouse clicks, double-clicks, scrolls; on FAT: F2 "
+     "renames, F7 makes a directory, Delete / F8 deletes (y), F5 / F6 mark a file to copy / move and Insert "
+     "pastes it here", cmd_explorer},
     {"panel", "[text|bright <n>]", "front panel digits", cmd_panel},
     {"keys", "", "front panel key state", cmd_keys},
     {"ir", "[raw on|off]", "remote control receiver", cmd_ir},
@@ -551,18 +565,27 @@ static const struct command commands[] = {
      "<value> <index> <len> [device]: a control request", cmd_usb},
     {"lsusb", "", "the USB devices, one line each", cmd_lsusb},
     {"disks", "", "USB disks (sticks, card readers): their size, partitions and file systems", cmd_disks},
-    {"ls", "[n:][path]", "a directory on a USB disk's FAT volume (n: the disk's device number, as "
+    {"ls", "[n:][path]", "a directory on a USB disk's FAT or NTFS volume (n: the disk's device number, as "
      "lsusb lists it; n.p: its partition p; a path without '/' starts in the current directory)", cmd_ls},
     {"dir", "[n:][path]", "the same as ls", cmd_ls},
     {"cd", "[n:][path]", "the current directory ('..' one up, '/' the volume's root; alone: back to none)",
      cmd_cd},
     {"pwd", "", "the current directory", cmd_pwd},
     {"cat", "[n:]path", "a text file on a USB disk (Ctrl-C stops it)", cmd_cat},
+    {"sum", "[n:]path", "a file read to its end: its size, CRC-32 (as zlib's, 7-Zip's), first bytes, how fast "
+     "(Ctrl-C stops it)", cmd_sum},
     {"mkdir", "<path>", "make a directory (this writes the disk)", cmd_mkdir},
     {"rmdir", "<path>", "remove an empty directory (writes the disk)", cmd_rmdir},
-    {"rm", "<path>", "remove a file (writes the disk)", cmd_rm},
+    {"rm", "[-r] <path>", "remove a file; -r: a directory and everything in it (writes the disk)", cmd_rm},
     {"touch", "<path>", "make an empty file (writes the disk)", cmd_touch},
-    {"cp", "<from> <to>", "copy a file (to a directory: into it; another disk too; writes the disk)", cmd_cp},
+    {"cp", "[-r] <from> <to>", "copy a file (to a directory: into it; another disk too, between FAT and NTFS "
+     "too); -r: a directory with everything in it (writes the disk)", cmd_cp},
+    {"head", "[-n N] <path>", "a text file's first N lines (10)", cmd_head},
+    {"tail", "[-n N] <path>", "a text file's last N lines (10)", cmd_tail},
+    {"df", "[n:]", "the disks' volumes: size, free and used space", cmd_df},
+    {"ntfs", "[n: [reset-journal]]", "an NTFS volume: its version, cluster and record sizes, $MFT, free space, "
+     "dirty flag and journal -- and whether the demo writes it (only when Windows left it clean: 'Safely "
+     "remove' the disk there); reset-journal: its journal emptied, as ntfs-3g does (writes the disk)", cmd_ntfs},
     {"mv", "<from> <to>", "rename a file or directory, or move it into another directory of the same volume "
      "(writes the disk)", cmd_mv},
     {"sector", "[n:]<number>", "one sector of a USB disk in hex", cmd_sector},
@@ -575,6 +598,13 @@ static const struct command commands[] = {
      cmd_ifconfig},
     {"dhcp", "", "ask the network's DHCP server for an address again", cmd_dhcp},
     {"arp", "", "the ARP table: addresses and the MACs they answer at", cmd_arp},
+    /* net.c: wget, NTP, the TCP state (the telnet console on port 23 and netload on 6464 need no command) */
+    {"wget", "[-O n:path] <url>", "an http:// URL: its status line and body on the console, or with -O saved to "
+     "a file (Ctrl-C stops it)", cmd_wget},
+    {"ntp", "[server]", "set the clock from an NTP server (pool.ntp.org; done once after DHCP too)", cmd_ntp},
+    {"date", "", "the time of day: UTC and Polish (CET / CEST), once NTP set it", cmd_date},
+    {"netstat", "", "TCP: the ports listened on, the connections; the telnet console's client, the FTP server's",
+     cmd_netstat},
     {"watchdog", "[test|off|on]", "the chip's watchdog: a demo stopped for 8 s restarts the box; "
      "test: stop feeding it (the box restarts)", cmd_watchdog},
     {"clear", "", "clear the terminal", cmd_clear},
@@ -994,8 +1024,10 @@ static void cmd_screen(int argc, char **argv)
         uprintf("usage: screen [demo|on|off|bars|clear [rrggbb]|text <x> <y> <words>|rect <x> <y> <w> <h> <rrggbb>]\n");
         return;
     }
-    if (!str_eq(argv[1], "on") && !str_eq(argv[1], "off"))
+    if (!str_eq(argv[1], "on") && !str_eq(argv[1], "off")) {
+        explorer_hide();                /* (drawn over it) */
         gfx_view(0);                    /* (what was drawn is on the TV) */
+    }
     uprintf("ok\n");
 }
 
@@ -1212,6 +1244,16 @@ static void cmd_cat(int argc, char **argv)
     disk_cat(joined(argc, argv));
 }
 
+static void cmd_sum(int argc, char **argv)
+{
+    if (argc < 2) {
+        uprintf("usage: sum [device:]path\n");
+        return;
+    }
+    disk_sum(joined(argc, argv));
+}
+
+
 static void cmd_sector(int argc, char **argv)
 {
     if (argc != 2) {
@@ -1231,6 +1273,17 @@ static void cmd_pwd(int argc, char **argv)
     (void)argc;
     (void)argv;
     disk_pwd();
+}
+
+/* 'explorer [n:][path]': the file explorer on the TV (explorer.c), on the test screen's picture */
+static void cmd_explorer(int argc, char **argv)
+{
+    if (argc > 1)
+        disk_cd(joined(argc, argv));
+    demo_shown = 0;                     /* (the picture is the explorer's: the demo's boxes stay away) */
+    explorer_show();
+    uprintf("the explorer is on the TV, in %s ('help explorer': its keys); Esc on the USB keyboard or 'console' "
+            "brings the console back\n", disk_cwd()[0] ? disk_cwd() : "the list of disks");
 }
 
 /* mkdir / rmdir / rm / touch: one path (spaces in it allowed) */
@@ -1255,8 +1308,52 @@ static void cmd_rmdir(int argc, char **argv)
 
 static void cmd_rm(int argc, char **argv)
 {
-    if (one_path(argc, argv))
+    if (argc >= 3 && str_eq(argv[1], "-r"))
+        disk_rm_r(joined(argc - 1, argv + 1));  /* (a directory and everything in it) */
+    else if (one_path(argc, argv))
         disk_rm(joined(argc, argv));
+}
+
+/* 'head [-n N] path' / 'tail [-n N] path' (10 lines when no -n) */
+static void head_tail(int argc, char **argv, void (*fn)(const char *, u32))
+{
+    u32 lines = 10;
+    int first = 1;
+    if (argc >= 3 && str_eq(argv[1], "-n")) {
+        if (!parse_u32(argv[2], &lines) || !lines) {
+            uprintf("usage: %s [-n lines] <path>\n", argv[0]);
+            return;
+        }
+        first = 3;
+    }
+    if (argc <= first) {
+        uprintf("usage: %s [-n lines] <path>\n", argv[0]);
+        return;
+    }
+    fn(joined(argc - first + 1, argv + first - 1), lines);
+}
+
+static void cmd_head(int argc, char **argv)
+{
+    head_tail(argc, argv, disk_head);
+}
+
+static void cmd_tail(int argc, char **argv)
+{
+    head_tail(argc, argv, disk_tail);
+}
+
+static void cmd_df(int argc, char **argv)
+{
+    disk_df(joined(argc, argv));
+}
+
+static void cmd_ntfs(int argc, char **argv)
+{
+    if (argc > 3)
+        uprintf("usage: ntfs [n: [reset-journal]]\n");
+    else
+        disk_ntfs(argc > 1 ? argv[1] : "", argc > 2 ? argv[2] : "");
 }
 
 static void cmd_touch(int argc, char **argv)
@@ -1276,7 +1373,9 @@ static int two_paths(int argc, char **argv)
 
 static void cmd_cp(int argc, char **argv)
 {
-    if (two_paths(argc, argv))
+    if (argc == 4 && str_eq(argv[1], "-r"))
+        disk_cp_r(argv[2], argv[3]);            /* (a directory with everything in it) */
+    else if (two_paths(argc, argv))
         disk_cp(argv[1], argv[2]);
 }
 
@@ -1516,15 +1615,26 @@ static void cli_input(int c)
             recall(-1);
         else if (c == 'B')
             recall(1);
-        else if (c == '5' || c == '6')
-            esc_state = c == '5' ? 3 : 4;   /* PgUp / PgDn: ESC [ 5 ~, ESC [ 6 ~ */
+        else if (c >= '0' && c <= '9') {
+            esc_state = 3;                  /* ESC [ <number> ~: PgUp 5, PgDn 6, Delete 3, Insert 2, F-keys */
+            esc_num = c - '0';
+        }
         return;
     }
-    if (esc_state >= 3) {
-        if (c == '~')
-            console_scroll(esc_state == 3 ? 1 : -1);    /* the TV's console looks back or forward */
+    if (esc_state == 3) {
+        if (c >= '0' && c <= '9') {
+            if (esc_num < 100)
+                esc_num = esc_num * 10 + (c - '0');
+            return;
+        }
+        if (c == ';')
+            return;                         /* (a modifier: ESC [ 5 ; 2 ~) */
         esc_state = 0;
-        return;
+        if (c == '~' && (esc_num == 5 || esc_num == 6))
+            console_scroll(esc_num == 5 ? 1 : -1);      /* the TV's console looks back or forward */
+        else if (c == '~' && esc_num == 3)
+            cli_input(0x08);                /* (Delete: as Backspace -- the line has no cursor) */
+        return;                             /* (Insert, F-keys: the explorer's) */
     }
     switch (c) {
     case 0x1b:
@@ -1536,7 +1646,9 @@ static void cli_input(int c)
             return;                         /* the LF of a CR LF */
         uart_puts("\r\n");
         line[line_len] = 0;
+        net_command(1);                     /* (a telnet client's typing and output go on during it: net.c) */
         run_line();
+        net_command(0);
         line_len = 0;
         history_pos = history_count;
         prompt();
@@ -1650,6 +1762,10 @@ void app_main(void)
         }
         typing_on_usb = 1;
         while ((c = kbd_getc()) >= 0) {
+            if (explorer_shown()) {
+                explorer_key(c);                /* the explorer on the TV: its keys (Esc: the console again) */
+                continue;
+            }
             if (!gfx_view_console())
                 show_console();                 /* the test screen: any key brings the console back -- and
                                                    types, so a command typed at once loses nothing */
@@ -1671,6 +1787,8 @@ void app_main(void)
             show_line();
         }
         loop_part(2, &t);
+        if (explorer_poll())                    /* the explorer: the shell's 'cd' followed, its own done */
+            show_line();                        /* (it changed the current directory: the prompt shows it) */
         if (ir_poll(&ev)) {
             event_begin();
             on_ir(&ev);

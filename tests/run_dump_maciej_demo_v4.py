@@ -1085,6 +1085,152 @@ def check_shell(box):
     box.run(0.6)
 
 
+# the file explorer (explorer.c): its path bar's text from (90, 62), the list's rows every 22 pixels from y 124
+# (the names' cells from x 40, 64 of them), the status lines every 24 pixels from y 648
+EXP_PATH, EXP_ROW_Y, EXP_ROW_H, EXP_NAME_X, EXP_STATUS_Y = (90, 62), 124, 22, 40, 648
+
+
+def cells_text(rgb, x, y, n):
+    """n of the 12 x 16 cells from (x, y) as text, trailing blanks dropped."""
+    return "".join(read_cell(rgb, x + 12 * c, y)[0] for c in range(n)).rstrip()
+
+
+def explorer_view(box, settle=0.6):
+    """The explorer on the TV after a moment: its path bar, the names of its 23 rows, its 3 status lines."""
+    box.run(settle)
+    rgb = box.sim.capture_screen().astype(int)
+    rows = [cells_text(rgb, EXP_NAME_X, EXP_ROW_Y + EXP_ROW_H * r + 3, 64) for r in range(23)]
+    status = [cells_text(rgb, 16, EXP_STATUS_Y + 24 * i, 104) for i in range(3)]
+    return cells_text(rgb, *EXP_PATH, 97), rows, status
+
+
+def any_prompt(box, line, timeout=30):
+    """A command line on the UART; its output up to the prompt, whatever directory it shows."""
+    box.t.pending.clear()
+    box.t.write(line.encode("latin-1") + b"\r")
+    out, deadline = bytearray(), box.sim._vtime() + timeout
+    while not re.search(rb"\r\nm3801[^\r\n>]*> $", bytes(out)):
+        if box.sim._vtime() >= deadline:
+            raise AssertionError(f"no prompt after {line!r}: {bytes(out[-300:])!r}")
+        out.extend(box.t.read(4096, deadline - box.sim._vtime()))
+    return out.decode("latin-1")
+
+
+def mouse_to(box, mouse, x, y):
+    """The pointer moved slowly to (x, y) -- a count every 10 ms: under 7 a report even when the mouse takes turns
+    with the keyboard on endpoint B, so no acceleration; there?"""
+    for _ in range(3):
+        m = re.search(r"pointer at (\d+),(\d+)", any_prompt(box, "usb mouse"))
+        dx, dy = x - int(m.group(1)), y - int(m.group(2))
+        if not dx and not dy:
+            return True
+        box.run(mouse.move(dx, dy, over=(max(abs(dx), abs(dy)) + 1) * 0.01) + 0.4)
+    return False
+
+
+def check_explorer(box):
+    """The file explorer on the TV ('explorer'), with a FAT32 stick, a keyboard and a mouse behind a hub: the
+    disks' volumes before any cd; a directory's entries (directories first, then files, by name); synced with the
+    shell both ways -- a cd typed on the UART lists the new directory, one opened on the TV is the shell's (the
+    prompt follows); the keyboard's keys and the mouse's buttons are its own (no painting, no mouse lines); a path
+    typed into its path bar, a wrong one told in its status line; a file's beginning shown on the TV, not on the
+    UART; a directory made in the shell listed; Esc back to the console."""
+    import fat_image
+    files = {"README.TXT": DISK_TEXT, "Docs/A long file name.txt": DISK_LONG, "Docs/sub/deep.bin": bytes(range(256)),
+             "Docs/notes.txt": b"first line\n", "Empty/": None, "lower.txt": b"lower case\n"}
+    for i in range(30):
+        files[f"Many/file{i:02d}.txt"] = b"%d\n" % i
+    stick = VirtualStick(fat_image.build(files, fat=32, size_mb=40, label="EXPLORE"), writable=True)
+    kbd, mouse, hub = VirtualKeyboard(get_report="empty", composite=True), VirtualMouse(), VirtualHub(4)
+    for port, dev in ((1, stick), (2, kbd), (3, mouse)):
+        hub.plug(port, dev, "high" if dev is stick else "low")
+    box.usb.attach("high", hub)
+    out = box.run(12.0)
+    check("disk 2: AliSim Virtual stick 1.00, 40 MB; partition 1: FAT32 'EXPLORE', 39 MB" in out,
+          "explorer: a stick, a keyboard and a mouse behind a hub")
+    out = any_prompt(box, "explorer")
+    path, rows, status = explorer_view(box, 1.0)
+    check("the explorer is on the TV, in the list of disks" in out and mmio(box.sim, 0x6304, 4) == HEAD_PHYS
+          and rows[0].startswith("2:  FAT32 'EXPLORE', 39 MB  -  AliSim Virtual stick 1.00")
+          and status[0].startswith("1 volume on 1 USB disk"),
+          f"explorer before any cd: the disks' volumes on the test screen's picture ({rows[0]!r})")
+    mark = len(box.t.received)
+    box.run(kbd.type("\r") + 0.8)
+    path, rows, status = explorer_view(box)
+    uart = bytes(box.t.received[mark:]).decode("latin-1")
+    check(path == "2:/" and rows[:7] == ["..  (the list of disks)", "Docs", "Empty", "Many", "lower.txt", "README.TXT",
+                                         ""] and status[0] == "3 directories, 2 files, 659 bytes"
+          and uart.endswith("\x1b[Km3801 2:/> "),
+          f"Enter on the keyboard opens it: the root, directories first, then files by name; the shell's prompt "
+          f"follows ('m3801 2:/> '): {rows[:6]}")
+    any_prompt(box, "cd Docs")
+    path, rows, status = explorer_view(box)
+    check(path == "2:/Docs" and rows[:4] == ["..  (one directory up)", "sub", "A long file name.txt", "notes.txt"],
+          f"cd typed on the UART: the explorer lists the new directory ({path!r}, {rows[:4]})")
+    # the mouse: dragged with the left button down (no painting), a click selects, a double-click opens
+    x = 850                                                  # (right of the names, left of the sizes)
+    moved = mouse_to(box, mouse, x, EXP_ROW_Y + 2 * EXP_ROW_H + 11)
+    mouse.press(1)
+    mouse.move(30, 0, over=0.3, delay=0.05)
+    mouse.release(1, delay=0.05)
+    out = box.run(1.0)
+    path, rows, status = explorer_view(box, 0.2)
+    rgb = box.sim.capture_screen().astype(int)
+    painted = (np.abs(rgb[130:620, 20:1240] - shown(255, 230, 120)).sum(axis=2) < 10).sum()
+    check(moved and not painted and "mouse: left" not in out and status[1].startswith("A long file name.txt: 5200 bytes"),
+          "a click on a row selects it (the status line tells its size); the left button does not paint, the mouse "
+          "lines stay off the UART")
+    mouse_to(box, mouse, x, EXP_ROW_Y + EXP_ROW_H + 11)
+    mark = len(box.t.received)
+    mouse.click(1, hold=0.1)
+    mouse.click(1, hold=0.1, delay=0.15)
+    box.run(2.0)
+    path, rows, status = explorer_view(box)
+    uart = bytes(box.t.received[mark:]).decode("latin-1")
+    check(path == "2:/Docs/sub" and rows[:2] == ["..  (one directory up)", "deep.bin"]
+          and "m3801 2:/Docs/sub> " in uart, f"a double-click opens 'sub': the shell's cd too ({path!r})")
+    box.run(kbd.type("{BS}") + 0.8)
+    path, rows, status = explorer_view(box)
+    check(path == "2:/Docs" and status[1].startswith("sub: a directory"),
+          "Backspace goes up, the directory come from selected")
+    # the path bar: Tab puts the caret there, Ctrl-U clears, Enter goes; a wrong path is told, Esc cancels
+    box.run(kbd.type("{TAB}{CTRL-U}2:/Many\r") + 0.8)
+    path, rows, status = explorer_view(box)
+    check(path == "2:/Many" and rows[1] == "file00.txt" and status[0] == "0 directories, 30 files, 80 bytes"
+          and rows[22] == "file21.txt", f"a path typed into the path bar: listed ({status[0]!r})")
+    box.run(kbd.type("{DOWN}{DOWN}") + 0.5)
+    mouse.wheel(-2)
+    path, rows, status = explorer_view(box)
+    check(rows[0] == "file05.txt" and status[1].startswith("file01.txt: 2 bytes"),
+          f"Down moves the selection, the wheel scrolls ({rows[0]!r} on top)")
+    box.run(kbd.type("/nothere\r") + 0.8)
+    path, rows, status = explorer_view(box)
+    check(path == "2:/Many/nothere" and status[1] == "not found: nothere",
+          f"a path that is not there: told in the status line, the path kept to be put right ({status[1]!r})")
+    box.run(kbd.type("{ESC}{TAB}{CTRL-U}/\rr") + 0.8)
+    path, rows, status = explorer_view(box)
+    mark = len(box.t.received)
+    box.run(kbd.type("\r") + 0.8)
+    box.run(0.6)
+    rgb = box.screen("v4_explorer_preview_screen.png", "the explorer: README.TXT's beginning on the TV")
+    uart = bytes(box.t.received[mark:]).decode("latin-1")
+    check(path == "2:/" and status[1].startswith("README.TXT: 648 bytes")
+          and cells_text(rgb, 24, 128, 100) == "Hello from the virtual stick." and "Hello" not in uart,
+          "Esc cancels the path, '/' Enter the root, 'r' jumps to README.TXT, Enter shows its beginning on the TV "
+          "(not on the UART)")
+    box.run(kbd.type("x") + 0.5)
+    any_prompt(box, "mkdir NEWDIR")
+    path, rows, status = explorer_view(box, 1.0)
+    rgb = box.screen("v4_explorer_screen.png", "the file explorer on the TV after 'mkdir NEWDIR' in the shell")
+    check(rows[4] == "NEWDIR" and rows[6] == "README.TXT", "a key closes it; a directory made in the shell is listed")
+    box.run(kbd.type("{ESC}") + 0.5)
+    out = box.run(kbd.type("cd\r") + 0.8)
+    check(mmio(box.sim, 0x6304, 4) == CON_HEAD_PHYS and out.endswith("m3801> "),
+          "Esc: the console on the TV again, the keyboard types into the shell")
+    box.usb.detach()
+    box.run(0.6)
+
+
 def check_modem(box):
     """USB serial ports: an LTE module (usb_host.VirtualModem, the A7670E's interfaces and endpoints) behind
     a hub, a writable stick next to it.  tty lists the module's four ports; at sends one AT command to the
@@ -1313,7 +1459,7 @@ def run(args):
     # ---- the command line ------------------------------------------------
     out = box.command("help")
     names = ["help", "version", "ping", "info", "uptime", "loop", "echo", "md", "mr", "mw", "screen", "testscreen",
-             "console", "panel", "keys", "ir", "usb", "lsusb", "disks", "ls", "dir", "cd", "pwd", "cat", "mkdir", "rmdir",
+             "console", "explorer", "panel", "keys", "ir", "usb", "lsusb", "disks", "ls", "dir", "cd", "pwd", "cat", "mkdir", "rmdir",
              "rm", "touch", "cp", "mv", "sector", "tty", "cu", "at", "ifconfig", "dhcp", "arp", "watchdog", "clear",
              "history", "video", "reboot", "restart", "bootloader"]
     check(all(f"\r\n  {n} " in out for n in names), f"help lists all {len(names)} commands")
@@ -1599,6 +1745,9 @@ def run(args):
 
     # ---- a shell on the USB disks: cd, mkdir, rm, ... ------------------------------
     check_shell(box)
+
+    # ---- the file explorer on the TV ------------------------------------------------
+    check_explorer(box)
 
     # ---- USB serial ports: an LTE module's AT ports (tty, at, cu) --------------------
     check_modem(box)

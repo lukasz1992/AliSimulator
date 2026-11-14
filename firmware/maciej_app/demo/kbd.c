@@ -16,7 +16,9 @@
    A key going down becomes what the UART would deliver for it (US layout;
    Enter = CR, Backspace = BS, Escape = Ctrl-C, Up / Down = ESC [ A / B,
    PgUp / PgDn = ESC [ 5 ~ / ESC [ 6 ~ (the TV's console looks back),
-   Ctrl with a letter = its control code); a held key repeats after 500 ms,
+   Right / Left / Home / End = ESC [ C / D / H / F (the explorer's; the
+   command line ignores them), Ctrl with a letter = its control code); a
+   held key repeats after 500 ms,
    25 times a second.  Caps Lock is kept here (the keyboard's LED stays as it
    is: the demo sends no output reports).  'usb kbd raw on' prints every
    report that differs from the one before, as it arrives. */
@@ -101,6 +103,16 @@ static int key_down(u8 k, u8 mods)
         push(c);
         return k != 0x28 && k != 0x29 && k != 0x2B;      /* not Enter, Escape, Tab */
     }
+    if (k >= 0x3A && k <= 0x45) {                         /* F1..F12 as a VT220's: ESC [ 11 ~ .. ESC [ 24 ~ */
+        static const u8 code[12] = {11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 23, 24};
+        u8 n = code[k - 0x3A];
+        push(0x1b);
+        push('[');
+        push((char)('0' + n / 10));
+        push((char)('0' + n % 10));
+        push('~');
+        return 0;                                         /* (no repeat: the explorer's F2 renames, F8 deletes) */
+    }
     if (k >= 0x59 && k <= 0x62) {                         /* keypad 1..9, 0 */
         push(k == 0x62 ? '0' : (char)('1' + k - 0x59));
         return 1;
@@ -111,7 +123,12 @@ static int key_down(u8 k, u8 mods)
     case 0x51: push(0x1b); push('['); push('B'); return 1;   /* Down */
     case 0x4B: push(0x1b); push('['); push('5'); push('~'); return 1;   /* PgUp: the console looks back */
     case 0x4E: push(0x1b); push('['); push('6'); push('~'); return 1;   /* PgDn */
-    case 0x4C: push(0x08); return 1;                      /* Delete: as Backspace (no cursor) */
+    case 0x4F: push(0x1b); push('['); push('C'); return 1;   /* Right, Left, Home, End: the explorer's (the */
+    case 0x50: push(0x1b); push('['); push('D'); return 1;   /* command line passes them over) */
+    case 0x4A: push(0x1b); push('['); push('H'); return 0;
+    case 0x4D: push(0x1b); push('['); push('F'); return 0;
+    case 0x4C: push(0x1b); push('['); push('3'); push('~'); return 1;   /* Delete (the command line: as Backspace) */
+    case 0x49: push(0x1b); push('['); push('2'); push('~'); return 0;   /* Insert (the explorer pastes) */
     case 0x54: push('/'); return 1;                       /* keypad / * - + Enter . */
     case 0x55: push('*'); return 1;
     case 0x56: push('-'); return 1;

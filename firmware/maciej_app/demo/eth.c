@@ -8,9 +8,18 @@
    from the network's server, at the start), ARP (answered for our address;
    asked for a host or the router), ICMP echo (answered: the box can be
    pinged; 'ping [-c n] <host>' sends them like Linux's ping), DNS (an A
-   record asked of the DHCP's DNS server for ping's names).  The frames are read in the main
-   loop every 20 ms (eth_poll), through endpoint B -- which the keyboard's
-   IN shares: usb.c keeps a report that came while a frame was read. */
+   record asked of the DHCP's DNS server for the names ping, wget and ntp
+   get).  The frames are read in the main loop every 20 ms (eth_poll),
+   through endpoint B -- which the keyboard's IN shares: usb.c keeps a
+   report that came while a frame was read.  TCP segments go to tcp.c, UDP
+   datagrams for other ports to net.c (NTP); while a TCP connection is busy
+   the frames are read on every main loop pass (on the box: netload took
+   296 KB in 0.11 s, wget 1 MB from the internet in 1.3 s).
+
+   Not re-entrant: a frame is read into the one rx[] and handled from there,
+   so the code that reads frames (take, eth_poll) counts itself in `depth`
+   and eth_service refuses to run inside it (the telnet console's output
+   could otherwise poll the network from a uprintf in the middle of it). */
 #include "hw.h"
 
 #define FRAME_MAX 1514
@@ -28,8 +37,16 @@ static struct {
     u32 xid;
     u64 dhcp_next, last_poll;
     u32 rx, tx, rx_ignored;
+    u32 rx_ours, rx_multi;              /* frames to our MAC; broadcasts and multicasts */
+    u32 dhcp_ours, dhcp_multi;          /* DHCP answers: sent to our MAC, broadcast */
+    u8 again;                           /* the packet filter was set again while DHCP had no answer */
     u16 ip_id;
+    u32 bound;                          /* DHCP acknowledgements so far (net.c sets the clock after the first) */
+    const char *pending;                /* a line from a frame handled outside eth_poll, for its next pass */
 } eth;
+static int depth;                       /* frames being read / handled (rx[] in use) */
+static u8 revived, reviving;            /* the adapter was set up again while DHCP had no answer (once, until
+                                           it has one or another is plugged in); that is under way */
 
 static u8 rx[FRAME_MAX + 512], tx[FRAME_MAX + 2];
 static char said[96];
@@ -116,6 +133,12 @@ int eth_parse_ip(const char *s, u8 ip[4])
 static int ip_text(char *buf, int size, const u8 *ip)
 {
     return usnprintf(buf, size, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+}
+
+/* frames for us and broadcasts (SET_ETHERNET_PACKET_FILTER: directed | broadcast) */
+static void set_filter(void)
+{
+    (void)usb_request(eth.device, 0x21, 0x43, 0x000C, eth.ctrl_if, 0, 0, 500);
 }
 
 /* ---- frames ---- */
@@ -312,6 +335,8 @@ static const char *dhcp_input(const u8 *b, int len)
         copy(eth.dns, dns, 4);
         eth.lease = lease;
         eth.dhcp = 3;
+        eth.bound++;
+        revived = 0;
         char a[16], r[16];
         ip_text(a, sizeof(a), eth.ip);
         ip_text(r, sizeof(r), eth.router);
@@ -376,75 +401,94 @@ static void dns_input(const u8 *d, int len)
 static const u8 *resolve(const u8 *ip);
 static const char *handle(int len);
 
-/* a host name's address: 1 found (ip), 0 no such name or no answer (a line said why) */
-static int dns_lookup(const char *name, u8 *ip)
+/* one frame read (up to wait_ms for it) and handled, for the waits of eth.c's own commands and eth_service: 1
+   when one came.  A line handle() returns (a DHCP acknowledgement) waits for eth_poll's next pass */
+static int take(u32 wait_ms)
+{
+    depth++;
+    int n = receive(wait_ms);
+    if (n >= 14) {
+        eth.rx++;
+        const char *s = handle(n);
+        if (s)
+            eth.pending = s;
+    }
+    depth--;
+    return n >= 14;
+}
+
+/* the question for `name`'s A record sent to the DNS server DHCP named (dns_got 0 until its answer): 0, or why
+   it could not be */
+static const char *dns_ask(const char *name)
 {
     static const u8 none[4];
-    if (same(eth.dns, none, 4)) {
-        uprintf("ping: %s: no DNS server (DHCP named none)\n", name);
-        return 0;
-    }
+    if (same(eth.dns, none, 4))
+        return "no DNS server (DHCP named none)";
     const u8 *mac = resolve(eth.dns);
-    if (!mac) {
-        uprintf("ping: the DNS server does not answer ARP\n");
-        return 0;
-    }
+    if (!mac)
+        return "the DNS server does not answer ARP";
     u8 to[6];
     copy(to, mac, 6);
+    dns_id = (u16)(cp0_count() | 1);
+    dns_got = 0;
+    u8 *h = ether(tx, to, 0x0800), *u = h + 20, *d = u + 8;
+    put16(d, dns_id);
+    put16(d + 2, 0x0100);                       /* a standard query, recursion desired */
+    put16(d + 4, 1);
+    put16(d + 6, 0);
+    put16(d + 8, 0);
+    put16(d + 10, 0);
+    u8 *q = d + 12;
+    for (const char *s = name; *s;) {          /* the name as labels */
+        u8 *count = q++;
+        int k = 0;
+        while (*s && *s != '.' && k < 63) {
+            *q++ = (u8)*s++;
+            k++;
+        }
+        *count = (u8)k;
+        if (*s == '.')
+            s++;
+        if (q - d > 300)
+            return "the name is too long";
+    }
+    *q++ = 0;
+    put16(q, 1);                                /* A, IN */
+    put16(q + 2, 1);
+    q += 4;
+    int dlen = (int)(q - d);
+    put16(u, DNS_PORT);
+    put16(u + 2, 53);
+    put16(u + 4, (u16)(8 + dlen));
+    u[6] = u[7] = 0;
+    ipv4(h, eth.ip, eth.dns, 17, 8 + dlen);
+    if (send_frame(tx, 14 + 20 + 8 + dlen) < 0)
+        return usb_error_text();
+    return 0;
+}
+
+/* a host name's address: 1 found (ip), 0 no such name or no answer (a line, `who`: first, said why) */
+static int dns_lookup(const char *name, u8 *ip, const char *who)
+{
     for (int attempt = 0; attempt < 2; attempt++) {
-        dns_id = (u16)(cp0_count() | 1);
-        dns_got = 0;
-        u8 *h = ether(tx, to, 0x0800), *u = h + 20, *d = u + 8;
-        put16(d, dns_id);
-        put16(d + 2, 0x0100);                   /* a standard query, recursion desired */
-        put16(d + 4, 1);
-        put16(d + 6, 0);
-        put16(d + 8, 0);
-        put16(d + 10, 0);
-        u8 *q = d + 12;
-        for (const char *s = name; *s;) {      /* the name as labels */
-            u8 *count = q++;
-            int k = 0;
-            while (*s && *s != '.' && k < 63) {
-                *q++ = (u8)*s++;
-                k++;
-            }
-            *count = (u8)k;
-            if (*s == '.')
-                s++;
-            if (q - d > 300)
-                return 0;
-        }
-        *q++ = 0;
-        put16(q, 1);                            /* A, IN */
-        put16(q + 2, 1);
-        q += 4;
-        int dlen = (int)(q - d);
-        put16(u, DNS_PORT);
-        put16(u + 2, 53);
-        put16(u + 4, (u16)(8 + dlen));
-        u[6] = u[7] = 0;
-        ipv4(h, eth.ip, eth.dns, 17, 8 + dlen);
-        if (send_frame(tx, 14 + 20 + 8 + dlen) < 0)
+        const char *why = dns_ask(name);
+        if (why) {
+            uprintf("%s: %s: %s\n", who, name, why);
             return 0;
-        u64 t = now_ms();
-        while (!dns_got && now_ms() - t < 2000) {
-            int n = receive(5);
-            if (n >= 14) {
-                eth.rx++;
-                handle(n);
-            }
         }
+        u64 t = now_ms();
+        while (!dns_got && now_ms() - t < 2000)
+            take(5);
         if (dns_got == 1) {
             copy(ip, dns_answer, 4);
             return 1;
         }
         if (dns_got < 0) {
-            uprintf("ping: %s: no such name\n", name);
+            uprintf("%s: %s: no such name\n", who, name);
             return 0;
         }
     }
-    uprintf("ping: %s: no answer from the DNS server\n", name);
+    uprintf("%s: %s: no answer from the DNS server\n", who, name);
     return 0;
 }
 
@@ -454,6 +498,10 @@ static const char *handle(int len)
     const u8 *f = rx;
     u16 type = be16(f + 12);
     int to_us = same(f, eth.mac, 6);
+    if (to_us)
+        eth.rx_ours++;
+    else if (f[0] & 1)
+        eth.rx_multi++;
     if (type == 0x0806 && len >= 42) {
         const u8 *a = f + 14;
         if (eth.dhcp != 3 || !same(a + 24, eth.ip, 4)) {
@@ -474,12 +522,27 @@ static const char *handle(int len)
         return 0;                               /* (no fragments) */
     const u8 *p = h + hl;
     int plen = total - hl;
-    if (h[9] == 17 && plen >= 8 && be16(p + 2) == 68 && be16(p) == 67)
+    if (h[9] == 17 && plen >= 8 && be16(p + 2) == 68 && be16(p) == 67) {
+        if (to_us)
+            eth.dhcp_ours++;
+        else
+            eth.dhcp_multi++;
         return dhcp_input(p + 8, plen - 8);
+    }
     if (eth.dhcp != 3 || !same(h + 16, eth.ip, 4))
         return 0;
     if (h[9] == 17 && plen >= 8 + 12 && be16(p) == 53 && be16(p + 2) == DNS_PORT) {
         dns_input(p + 8, plen - 8);
+        return 0;
+    }
+    if (h[9] == 17 && plen >= 8) {              /* another UDP port: net.c's (NTP) */
+        int ulen = be16(p + 4);
+        if (ulen >= 8 && ulen <= plen)
+            net_udp_input(h + 12, be16(p), be16(p + 2), p + 8, ulen - 8);
+        return 0;
+    }
+    if (h[9] == 6 && to_us) {                   /* TCP (never to a broadcast) */
+        tcp_input(h + 12, h + 16, f + 6, p, plen);
         return 0;
     }
     if (h[9] == 1 && plen >= 8) {
@@ -509,22 +572,26 @@ static const char *handle(int len)
     return 0;
 }
 
-/* every main loop pass: the frames waiting (every POLL_MS), DHCP's timers; a line to show, or 0 */
+/* every main loop pass: the frames waiting (every POLL_MS; on every pass while a TCP connection is busy), DHCP's
+   timers, TCP's, then net.c's servers (telnet, netload) and its NTP; a line to show, or 0 */
 const char *eth_poll(void)
 {
-    if (!eth.used)
+    if (!eth.used || depth)
         return 0;
     u64 now = now_ms();
     int moving = mouse_moving_on_b();
-    if (now - eth.last_poll < (moving ? POLL_MOUSE_MS : POLL_MS))
+    if (now - eth.last_poll < (u32)(moving ? POLL_MOUSE_MS : tcp_busy() ? 0 : POLL_MS))
         return 0;                               /* (the adapter keeps the frames meanwhile) */
     /* a moving mouse's IN is almost always half way through the hub's split transaction: ending it lost that
        report and the next (on the box 99 of 211 with frames read every 100 ms).  So the frames are read only
-       between its reports -- endpoint B is free from a report until the main loop asks for the next */
+       between its reports -- endpoint B is free from a report until the main loop asks for the next.  (TCP's
+       segments wait too: a bulk OUT ends that IN as well) */
     if (moving && usb_in_pending())
         return 0;
     eth.last_poll = now;
-    const char *line = 0;
+    const char *line = eth.pending;
+    eth.pending = 0;
+    depth++;
     for (int k = 0; k < 16; k++) {              /* (a busy network: up to 16 frames a look) */
         int n = receive(1);
         if (n < 14)
@@ -534,15 +601,120 @@ const char *eth_poll(void)
         if (s)
             line = s;
     }
+    depth--;
     if ((eth.dhcp == 1 || eth.dhcp == 2) && now_ms() >= eth.dhcp_next) {
         if (++eth.dhcp_tries > 8) {
             eth.dhcp = 4;
-            return "eth0: no answer from a DHCP server ('dhcp' asks again)";
+            line = "eth0: no answer from a DHCP server ('dhcp' asks again)";
+        } else {
+            /* No offer: the adapter may not send.  On the box an RTL8153 plugged in while the demo ran took
+               its frames (10 DISCOVERs in 3 minutes: each bulk OUT done) and received the network's
+               broadcasts, but no offer came -- the router answers by broadcast, so it never got one; after
+               a restart of the box the same adapter had its address in 2 s, and plugged in again later it
+               had too.  So after the second DISCOVER its packet filter is set again, and after the fourth
+               (14 s) the adapter is set up again as if it had been plugged in again: its hub port reset,
+               its configuration, eth_attach -- once, until DHCP has an answer */
+            if (eth.dhcp == 1 && eth.dhcp_tries == 2) {
+                set_filter();
+                eth.again = 1;
+            } else if (eth.dhcp == 1 && eth.dhcp_tries == 4 && !revived) {
+                revived = 1;
+                reviving = 1;
+                int r = usb_set_up_again(eth.device);
+                reviving = 0;
+                return r < 0 ? "eth0: no DHCP answer, and the adapter did not come back from its port's reset"
+                             : "eth0: no DHCP answer: the adapter set up again (its port reset)";
+            }
+            dhcp_send(eth.dhcp == 1 ? 1 : 3);
+            eth.dhcp_next = now_ms() + 2000u * (u32)(eth.dhcp_tries < 4 ? eth.dhcp_tries : 4);
         }
-        dhcp_send(eth.dhcp == 1 ? 1 : 3);
-        eth.dhcp_next = now_ms() + 2000u * (u32)(eth.dhcp_tries < 4 ? eth.dhcp_tries : 4);
     }
-    return line;
+    tcp_poll();
+    if (line)
+        return line;                            /* (net_poll's turn comes in the next pass) */
+    return net_poll();
+}
+
+/* ---- for tcp.c and net.c ---- */
+int eth_ready(void)                             /* an address from DHCP: IPv4 can be sent */
+{
+    return eth.used && eth.dhcp == 3;
+}
+
+const u8 *eth_address(void)
+{
+    return eth.ip;
+}
+
+u32 eth_bound_count(void)
+{
+    return eth.bound;
+}
+
+int eth_inside(void)                            /* frames are being read / handled now: not a time to read more */
+{
+    return depth;
+}
+
+/* the frames waiting now (up to 16) and TCP's timers -- for a command's own waits (wget, ntp) and the telnet
+   console; nothing inside eth code (rx[] in use) */
+void eth_service(void)
+{
+    if (!eth.used || depth)
+        return;
+    for (int k = 0; k < 16 && take(1); k++)
+        ;
+    tcp_poll();
+}
+
+/* the MAC address packets to `ip` go to: the host's on our network, else the router's (ARP, up to 1 s): 1, 0 no
+   answer */
+int eth_route(const u8 *ip, u8 mac[6])
+{
+    if (!eth_ready() || depth)
+        return 0;
+    const u8 *m = resolve(ip);
+    if (!m)
+        return 0;
+    copy(mac, m, 6);
+    return 1;
+}
+
+/* an IPv4 packet in the caller's own frame (`len` bytes of payload at frame + 34, room before it for the headers
+   and FRAME_MAX + 2 bytes in all) to `ip` through `mac`: 0 sent, -1 not */
+int eth_send_ipv4(u8 *frame, const u8 *mac, const u8 *ip, u8 proto, int len)
+{
+    if (!eth_ready() || len > FRAME_MAX - 34)
+        return -1;
+    ipv4(ether(frame, mac, 0x0800), eth.ip, ip, proto, len);
+    return send_frame(frame, 14 + 20 + len);
+}
+
+/* "a.b.c.d" or a name (DNS): 1 and its address, 0 (a line starting with `who` said why) */
+int eth_lookup(const char *host, u8 ip[4], const char *who)
+{
+    if (eth_parse_ip(host, ip))
+        return 1;
+    if (!eth_ready()) {
+        uprintf("%s: eth0 has no address yet ('ifconfig')\n", who);
+        return 0;
+    }
+    return dns_lookup(host, ip, who);
+}
+
+/* a DNS question sent without waiting for its answer (the clock's setting after DHCP): 0, -1 not sent */
+int eth_dns_start(const char *name)
+{
+    if (!eth_ready() || depth)
+        return -1;
+    return dns_ask(name) ? -1 : 0;
+}
+
+int eth_dns_result(u8 ip[4])                    /* its answer: 1 (ip), 0 none yet, -1 no such name */
+{
+    if (dns_got == 1)
+        copy(ip, dns_answer, 4);
+    return dns_got;
 }
 
 /* ---- the commands ---- */
@@ -562,19 +734,22 @@ const char *eth_attach(u8 device, u8 ctrl_if, u8 data_if, u8 data_alt, u8 in_ep,
             return "an Ethernet port without a MAC address";
         eth.mac[i] = (u8)(hi << 4 | lo);
     }
-    /* frames for us and broadcasts (SET_ETHERNET_PACKET_FILTER: directed | broadcast) */
-    (void)usb_request(device, 0x21, 0x43, 0x000C, ctrl_if, 0, 0, 500);
     eth.used = 1;
     eth.device = device;
     eth.ctrl_if = ctrl_if;
+    set_filter();
+    if (!reviving)
+        revived = 0;
     eth.in_ep = in_ep;
     eth.out_ep = out_ep;
     eth.maxp = maxp;
-    eth.rx = eth.tx = eth.rx_ignored = 0;
+    eth.rx = eth.tx = eth.rx_ignored = eth.rx_ours = eth.rx_multi = eth.dhcp_ours = eth.dhcp_multi = 0;
+    eth.again = 0;
     for (int i = 0; i < 4; i++)
         eth.ip[i] = 0;
     for (int i = 0; i < ARP_ENTRIES; i++)
         arp_table[i].used = 0;
+    tcp_drop_all();                             /* (an address of its own again: the old connections are gone) */
     dhcp_start();
     usnprintf(said, sizeof(said), "eth0: Ethernet (CDC ECM), MAC %02x:%02x:%02x:%02x:%02x:%02x; DHCP asks for an "
               "address", eth.mac[0], eth.mac[1], eth.mac[2], eth.mac[3], eth.mac[4], eth.mac[5]);
@@ -583,8 +758,10 @@ const char *eth_attach(u8 device, u8 ctrl_if, u8 data_if, u8 data_alt, u8 in_ep,
 
 void eth_detach(u8 device)
 {
-    if (!device || eth.device == device)
+    if (eth.used && (!device || eth.device == device)) {
         eth.used = 0;
+        tcp_drop_all();
+    }
 }
 
 void eth_show(void)
@@ -604,7 +781,12 @@ void eth_show(void)
         uprintf("  inet %s, mask %s, router %s, DNS %s (DHCP, lease %u s)\n", a, m, r, d, eth.lease);
     else
         uprintf("  no address yet (DHCP: %s)\n", eth.dhcp == 4 ? "no answer" : eth.dhcp == 2 ? "requesting" : "asking");
-    uprintf("  %u frames in, %u out\n", eth.rx, eth.tx);
+    uprintf("  %u frames in (%u to this MAC, %u broadcast / multicast), %u out\n", eth.rx, eth.rx_ours,
+            eth.rx_multi, eth.tx);
+    if (eth.dhcp != 3 || eth.again || revived)
+        uprintf("  DHCP answers seen: %u to this MAC, %u broadcast%s%s\n", eth.dhcp_ours, eth.dhcp_multi,
+                eth.again ? "; the packet filter was set again" : "",
+                revived ? "; the adapter was set up again" : "");
 }
 
 void eth_dhcp(void)
@@ -653,11 +835,7 @@ static const u8 *resolve(const u8 *ip)
         arp_send(1, bcast, none, via);
         u64 t = now_ms();
         while (now_ms() - t < 333) {
-            int n = receive(5);
-            if (n >= 14) {
-                eth.rx++;
-                handle(n);
-            }
+            take(5);
             if (arp_find(via))
                 break;
         }
@@ -697,7 +875,7 @@ void eth_ping(const char *host, int count)
         return;
     }
     u8 ip[4];
-    if (!eth_parse_ip(host, ip) && !dns_lookup(host, ip))
+    if (!eth_parse_ip(host, ip) && !dns_lookup(host, ip, "ping"))
         return;
     char a[16];
     ip_text(a, sizeof(a), ip);
@@ -733,11 +911,8 @@ void eth_ping(const char *host, int count)
         }
         int answered = 0, last = count && seq == count;
         while (now_ms() - ms0 < 1000) {
-            int n = receive(5);
-            if (n >= 14) {
-                eth.rx++;
-                handle(n);
-            }
+            take(5);
+            tcp_poll();                         /* (the telnet console's output and its connection's timers) */
             if (!answered && ping_seq_seen == seq && same(ping_from, ip, 4)) {
                 u32 us = (u32)(ping_seen_at - t0) / (ticks_per_ms() / 1000);    /* (32-bit: under a second) */
                 char t[16];

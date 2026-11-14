@@ -35,6 +35,14 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
                        klawisz klawiatury USB (wpisuje sie tez) albo
                        "console" wraca do konsoli
   console              konsola na TV (widok po starcie)
+  explorer [n:][sciezka]
+                       menedzer plikow na TV w biezacym katalogu, zgrany z
+                       "cd" w obie strony: strzalki/PgUp/PgDn wybieraja,
+                       Enter otwiera (plik: jego poczatek), Backspace w gore,
+                       "/" albo Tab - wpisywanie sciezki w pasku; mysz:
+                       klik, podwojny klik, kolko; Esc wraca do konsoli;
+                       na FAT: F2 zmienia nazwe, F7 nowy katalog, Delete/F8
+                       usuwa (y), F5/F6 kopiuj/przenies plik, Insert wkleja
   panel <tekst>        4 znaki na wyswietlaczu panelu; panel bright 0..7
                        (plyty z TM1650)
   keys                 stan klawiszy panelu (klawisze sa tez zglaszane same);
@@ -53,7 +61,8 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
   disks                dyski USB (pendrive, czytnik kart): rozmiar, partycje,
                        systemy plikow
   ls [n:][sciezka]     katalog na dysku USB (FAT12, FAT16, FAT32, dlugie
-                       nazwy); n - numer urzadzenia z lsusb (np. ls 3:/docs),
+                       nazwy; NTFS tylko do odczytu - zapis na NTFS jest
+                       zawsze odmawiany); n - numer urzadzenia z lsusb (np. ls 3:/docs),
                        bez niego biezacy katalog (cd), a przed pierwszym cd
                        pierwszy wolumin FAT; "dir" to samo
   cd [n:][sciezka]     biezacy katalog, widoczny w znaku zachety
@@ -63,17 +72,23 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
                        binarny: pierwsze 256 bajtow szesnastkowo)
   mkdir <sciezka>      nowy katalog (ZAPIS na dysk; dlugie nazwy tez)
   rmdir <sciezka>      usuwa pusty katalog (zapis)
-  rm <sciezka>         usuwa plik (zapis)
+  rm [-r] <sciezka>    usuwa plik; -r: katalog z cala zawartoscia (zapis)
   touch <sciezka>      nowy pusty plik (zapis)
-  cp <skad> <dokad>    kopiuje plik (do katalogu: do niego, pod ta sama
-                       nazwa; takze na inny dysk) (zapis)
+  cp [-r] <skad> <dokad>
+                       kopiuje plik (do katalogu: do niego, pod ta sama
+                       nazwa; takze na inny dysk); -r: katalog z cala
+                       zawartoscia (zapis)
   mv <skad> <dokad>    zmienia nazwe pliku lub katalogu albo przenosi go
                        do innego katalogu tego samego woluminu (zapis)
   komenda > plik       to, co komenda wypisuje, trafia do pliku (np.
                        ls > 4:/lista.txt, echo tekst > 4:/a.txt); >> dopisuje
                        na koncu pliku; nazwy ze spacjami w "..." albo '...'
   sector [n:]<numer>   jeden sektor dysku USB szesnastkowo
-  tty                  porty szeregowe USB: porty modulu GSM / LTE (SIMCom,
+  sum [n:]sciezka      plik przeczytany do konca: rozmiar, CRC-32 (jak 7-Zip),
+                       pierwsze bajty, predkosc (Ctrl-C przerywa)
+  head [-n N] <plik>   pierwsze N linii pliku (10); tail - ostatnie N
+  df [n:]              woluminy dyskow: rozmiar, wolne i zajete miejsce
+  tty                 porty szeregowe USB: porty modulu GSM / LTE (SIMCom,
                        Quectel, Huawei, ZTE ...) i urzadzenia CDC ACM
   at [komenda]         jedna komenda AT do portu AT modulu i jej odpowiedz do
                        OK / ERROR oraz to, co przychodzi zaraz po nich (dane
@@ -91,6 +106,21 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
   ping [-c n] <host>   ping jak w Linuksie przez Ethernet: adres albo nazwa
                        (DNS z DHCP), TTL i czas kazdej odpowiedzi, Ctrl-C
                        konczy i pokazuje statystyke (samo "ping": pong)
+  wget [-O n:plik] <url>
+                       strona http:// przez Ethernet: na konsoli albo
+                       zapisana na dysku USB (https nieobslugiwane)
+  ntp [serwer] / date  zegar z sieci (sam po DHCP) / data i godzina: UTC
+                       i polska (CET / CEST)
+  netstat              TCP: porty, polaczenia, liczniki
+  loop                 petla glowna: przebiegi, najwolniejszy, co trwalo
+  Przez siec: telnet <adres tunera> (port 23) - ta sama linia polecen co
+  na UART; python tools/maciej_netload.py <adres> [app.bin] - nowa wersja
+  demo uruchamiana z RAM w ~1 s (flash bez zmian, restart wraca do niej);
+  ftp://<adres tunera> (port 21, bez hasla, 2 klienty) - serwer FTP: w katalogu
+  glownym wszystkie dyski ("4 PHONE CARD", "9 ..."), pobieranie z FAT i
+  NTFS, wysylanie/usuwanie/zmiana nazw/katalogi tylko na FAT (NTFS tylko
+  do odczytu); tryb pasywny (porty danych 50021/50022) i aktywny.
+  Data i godzina z NTP: w prawym gornym rogu konsoli na TV, po czasie pracy
   watchdog [test|off|on]
                        watchdog ukladu: dziala od startu demo; gdy demo stanie
                        na 8 s, tuner sam sie restartuje; test - przestaje go

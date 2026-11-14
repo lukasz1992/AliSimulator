@@ -194,6 +194,20 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   pointed at its new place) and `command > [n:]path` (what any command
   prints, into a file, with Linux line ends; `>>` adds it to the file's
   end) write the FAT volume; `"..."` or `'...'` keep spaces in a word.
+  `rm -r` removes a directory and everything in it (deepest first, through
+  rm's and rmdir's own code; never the current directory's tree, never a
+  damaged entry whose cluster is 0, the root or a directory it is already
+  in), `cp -r` copies a directory with everything in it, from FAT or NTFS
+  onto FAT (into <to> when that is a directory; the directory it makes is
+  never copied into itself: `cp -r A A/B` ends), 16 levels deep at most;
+  `head [-n N]` / `tail [-n N]` show a text file's first / last lines
+  (tail reads only its last 16 KB, from that cluster on), and `df [n:]`
+  each volume's size, free and used space (FAT: free clusters counted in
+  its FAT; NTFS: free bits in its $Bitmap, record 6). Checked in the
+  emulator (a 52 KB file for tail, cp -r into an existing directory and
+  into itself, rm -r of the current directory's tree refused) and on the
+  box's card (cp -r of a tree, its copy's CRC, rm -r of both, df); df of
+  an NTFS volume was not tried on the box (the stick was not plugged in).
   Writing goes by SCSI WRITE(10) through the bulk-only transport's
   data-out stage, every copy of the FAT written, long names with their 8.3
   aliases (`NEWFOL~1`; an 8.3 name in lower case gets Windows' lower-case
@@ -201,9 +215,21 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   before its entry links it in, a directory grown by a cluster when it is
   full, an entry deleted before its clusters are freed, FAT32's FSInfo
   counts made unknown; a write-protected disk (MODE SENSE) is not written.
-  The box has no clock: what is made is dated 2026-11-13 12:00. NTFS and
-  exFAT are listed but not read; only a device's first logical unit is
-  used, and up to four disks.
+  The box has no clock: what is made is dated 2026-11-13 12:00. NTFS is
+  read (never written): `ls`, `cd`, `cat`, `cp` onto a FAT disk, `sum
+  [n:]path` (a file read to its end: size, CRC-32, speed) and the explorer
+  go through its MFT -- records with their fixups, resident and
+  non-resident attributes, data runs (sparse ones as zeros), attribute
+  lists for files in many pieces, directories' B-tree indexes ($INDEX_ROOT
+  and INDX blocks), names as ASCII ('?' for the rest), dates in Polish
+  time; compressed and encrypted files are refused, and every writing
+  command (and write_sectors itself) refuses an NTFS volume. exFAT is
+  listed but not read; only a device's first logical unit is used, and up
+  to four disks. A 64 GB stick (090c:2000) answers no command now and then
+  -- most first commands after a pause, about one READ in ten back to back
+  -- and each at once after a reset recovery: a read waits 100 ms before
+  that (its reads take 2 ms), twice, then 10 s; so its files read at about
+  110 KB/s, the card's FAT at 2 MB/s.
 - **USB serial ports**: a GSM / LTE module's ports (vendor-class interfaces
   with a bulk IN and a bulk OUT endpoint, of the module makers Linux's
   option driver knows: SIMCom, Quectel, Huawei, ZTE, Qualcomm, Telit,
@@ -244,9 +270,73 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   read through endpoint D, which polls by itself, and a mouse through
   endpoint B's turns: frames read through endpoint B every 20 ms lost a
   keyboard's reports there. While that mouse moves (a report in the last
-  half second) the frames are read every 100 ms instead, and only between
+  half second) the frames are read every 250 ms instead, and only between
   its reports, when its IN is not half way through the hub's split
   transaction: the adapter keeps them meanwhile.
+- **TCP and what runs on it** (`tcp.c`, `net.c`): four connections, MSS
+  1460, go-back-N retransmission (400 ms doubling to 3.2 s), FIN and RST
+  both ways; while a connection is busy the frames are read every pass.
+  `netstat` lists them. On it:
+  - `wget [-O n:path] <http://url>`: HTTP/1.0, the body on the console or
+    saved to a disk (example.com in 0.08 s; 1 MB from the internet at
+    760 KB/s onto the card); https:// is refused with a message.
+  - A telnet console on port 23: the command line as on the UART (one
+    client; what the box prints goes to both, what the client types is
+    fed in as if typed, Ctrl-C included).
+  - Netload on port 6464: `python tools/maciej_netload.py <box> [app.bin]`
+    sends a build ("M4LD", length, CRC-32, the image); the box checks it,
+    copies it over itself with a stub in uncached RAM (cache written back
+    and invalidated, `jr.hb`) and runs it -- about a second from the
+    command to the new banner, against 48 s for a flash; the flash keeps
+    the old build. A wrong header, length, CRC or image is refused and the
+    box goes on.
+  - NTP: the clock set after DHCP (pool.ntp.org) and with `ntp [server]`;
+    `date` shows UTC and Polish time (CET / CEST); the TV shows the date
+    and time in the console's title bar after the uptime, and in the test
+    screen's SYSTEM box.
+  - An FTP server on port 21 (`ftp.c`), two clients (FileZilla opens a
+    second connection for transfers; one transfer at a time, another gets
+    450 and is tried again), no password: its root
+    lists every disk's volumes as directories ("4 PHONE CARD", "9 Windows
+    10": the number as `cd` takes it, and the label); files are read from
+    FAT and NTFS, and FAT is written (STOR, APPE, DELE, MKD, RMD, RNFR /
+    RNTO) -- NTFS answers read-only. PASV / EPSV (data ports 50021 and
+    50022, a connection taken from its client's address only) and PORT /
+    EPRT (to the client's address only; Windows' own firewall cuts a
+    connection that uses them, so they were not tried on the box), LIST /
+    NLST / MLSD / MLST, SIZE, MDTM, REST (for the command right after it
+    only). A transfer that moves nothing for a minute ends and a client
+    silent for five minutes is let go (tcp.c has no keepalive); a data
+    connection's TIME_WAIT slot is taken again when every slot is in use
+    (20 downloads in a row). Paths longer than disk.c takes (95
+    characters, names 127) are refused, not cut. A transfer moves in the
+    main loop, eight 4 KB pieces a pass, with
+    a reader and a writer of its own in disk.c (its NTFS runs apart from
+    `cat`'s), so the pointer and the console go on; on the box the card
+    took uploads at 120 - 235 KB/s and sent at 970 KB/s, the slow NTFS stick
+    sent at 30 - 85 KB/s, and every CRC matched `sum`'s. A directory is
+    listed with its first 7000 entries (451 when cut); a STOR over a file
+    empties it first (as most servers do); writing the same disk from the
+    shell while an upload runs is not guarded. The explorer lists a
+    directory again at most once a second while a disk is being written.
+- **File explorer on the TV** (`explorer [n:][path]`, `explorer.c`): the
+  current directory's entries (directories first) under a path bar that
+  follows `cd` both ways -- a `cd` on the UART lists the new directory, a
+  directory opened in the explorer becomes the prompt's. The path bar can
+  be typed into (a click, '/' or Tab; Enter goes there with `cd`'s rules,
+  an error stays in the status line). The USB keyboard's arrows, PgUp /
+  PgDn, Home / End, Enter and Backspace move through it, the mouse clicks,
+  double-clicks and scrolls with its wheel, and a file opened shows its
+  first 2 KB (text or hex) on the TV. Without a current directory it lists
+  the disks' volumes. Esc or `console` returns to the console. On FAT it
+  writes too, with Norton Commander's keys (kbd.c now sends F1-F12, Delete
+  and Insert as a VT220 does; the command line takes Delete as Backspace and
+  passes the others over): F2 renames the selected entry (its new name typed
+  in the path bar), F7 makes a directory, Delete or F8 deletes a file or an
+  empty directory after "y", F5 / F6 mark a file to copy / to move and
+  Insert (or Ctrl-V) pastes it into the directory shown -- copied onto any
+  FAT volume, moved on the same one; on NTFS each says read-only. In the
+  emulator 19 checks of these passed.
 - **USB keyboard**: a keyboard (an interface of class HID, protocol
   keyboard) types into the same command line as the UART -- US layout,
   Enter, Backspace, Up / Down (history), Caps Lock, Escape (as Ctrl-C), Ctrl
@@ -281,7 +371,17 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   transfers disturb neither. `usb mouse` gives the pointer's place, the
   buttons, the wheel and the counts. Limits: one mouse (a second is listed
   and left alone); reports that come while a command runs wait in endpoint
-  D's FIFO and their movement arrives in one step afterwards.
+  D's FIFO and their movement arrives in one step afterwards. When the
+  keyboard has endpoint D the mouse is read through endpoint B, one IN at
+  a time started no sooner than its interval (8 ms for the usual 10 ms):
+  endpoint B asks again every millisecond while the device NAKs, and
+  started again at once after each report it read a PixArt mouse 954
+  times a second -- movements of a count or two that the pointer's
+  acceleration never saw (a slow pointer) and 73 failed split
+  transactions in 1929 reports; at the interval, 107 reports a second and
+  no errors. A failed IN is tried again at once; only the third in a row
+  pauses 200 ms. `usb mouse` also gives the gaps between reports, and
+  `loop` how long the main loop's parts took.
 - **`video init [opticum|comsat] [rev0|rev1]`**: the bootloader never
   touches the display, so on the box the TV stays dark until something
   programs it -- the demo runs its board's set-up by itself as it starts,

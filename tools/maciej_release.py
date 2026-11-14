@@ -34,6 +34,12 @@ COMMANDS = {
         "ping": "answers pong; ping [-c n] <host>: ICMP echo over Ethernet like Linux's ping (names via DNS)",
         "ifconfig": "the Ethernet port (a USB adapter with CDC ECM, an RTL8153's): MAC, address from DHCP, router",
         "dhcp": "ask the DHCP server for an address again", "arp": "the ARP table",
+        "wget": "[-O n:path] <http://url>: a page over Ethernet (TCP, HTTP/1.0): on the console, or saved to a disk",
+        "ntp": "[server]: the clock set over the network (pool.ntp.org; also by itself after DHCP)",
+        "date": "the date and time: UTC and Polish (CET / CEST)",
+        "netstat": "TCP: the ports listened on (21 FTP server, 23 telnet console, 6464 netload), connections, "
+                   "counters, the FTP server's client",
+        "loop": "the main loop since the last look: passes, the slowest, which part took the time",
         "info": "chip, clock, memory layout, uptime", "uptime": "time since start",
         "echo": "prints its arguments", "md": "dump memory", "mr": "read a 32-bit word",
         "mw": "write a 32-bit word (RAM, registers)",
@@ -42,6 +48,12 @@ COMMANDS = {
                       "'console' brings the console back",
         "console": "the console on the TV: everything the UART shows, scrolling, PgUp/PgDn for earlier lines "
                    "(the view after start)",
+        "explorer": "[n:][path]: a file explorer on the TV in the current directory, synced with cd both ways "
+                    "(the disks' volumes when there is none): USB keyboard arrows/PgUp/PgDn/Home/End select, Enter "
+                    "opens (a file: its beginning in a preview), Backspace goes up, '/' or Tab types a path into the "
+                    "path bar; the mouse clicks, double-clicks, scrolls; on FAT F2 renames, F7 makes a directory, "
+                    "Delete / F8 deletes (asks y/n), F5 / F6 mark a file to copy / move, Insert pastes it (another "
+                    "disk too); Esc or 'console' brings the console back",
         "panel": "front panel digits, brightness (boards with the TM1650)",
         "keys": "front panel key state; without a TM1650 (Comsat TE 1050 HD) its two buttons on GPIO 31 / 9",
         "ir": "remote control receiver (raw timing on|off)",
@@ -52,17 +64,21 @@ COMMANDS = {
                "(a control request)",
         "lsusb": "the USB devices, one line each (with the hub and port of those behind a hub)",
         "disks": "USB disks (sticks, card readers): their size, partitions and file systems",
-        "ls": "[n:][path]: a directory on a USB disk's FAT12 / FAT16 / FAT32 volume (n: the disk's device "
-              "number as lsusb lists it; a path without '/' starts in the current directory)",
+        "ls": "[n:][path]: a directory on a USB disk's FAT12 / FAT16 / FAT32 volume, or an NTFS one (read only) "
+              "(n: the disk's device number as lsusb lists it; a path without '/' starts in the current directory)",
+        "sum": "[n:]path: a file read to its end: its size, CRC-32, first bytes, speed",
+        "head": "[-n N] path: a text file's first N lines (10)", "tail": "[-n N] path: its last N lines (10)",
+        "df": "[n:]: the disks' volumes: size, free and used space (FAT: its FAT counted; NTFS: its $Bitmap)",
         "dir": "the same as ls",
         "cd": "[n:][path]: the current directory, shown in the prompt ('..' one up; alone: none)",
         "pwd": "the current directory",
         "cat": "[n:]path: a text file on a USB disk (Ctrl-C stops it)",
         "mkdir": "<path>: make a directory (writes the disk; long names too)",
         "rmdir": "<path>: remove an empty directory (writes the disk)",
-        "rm": "<path>: remove a file (writes the disk)",
+        "rm": "[-r] <path>: remove a file; -r: a directory and everything in it (writes the disk)",
         "touch": "<path>: make an empty file (writes the disk)",
-        "cp": "<from> <to>: copy a file (to a directory: into it; onto another disk too)",
+        "cp": "[-r] <from> <to>: copy a file (to a directory: into it; onto another disk too); -r: a directory "
+              "with everything in it",
         "mv": "<from> <to>: rename a file or directory, or move it into another directory of the same volume",
         "> / >>": "after any command: what it prints goes into a file ('ls > 4:/list.txt'; >> adds to its end); "
                   "\"...\" or '...' keep spaces in a word",
