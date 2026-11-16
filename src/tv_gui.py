@@ -74,6 +74,7 @@ import dump_catalog
 import ir_remote
 from front_panel import SEG_POLYS, make_panel
 from simulator import DUMPS_DIR, AliMipsSimulator, flash_size_for, resolve_dump
+import usb_stick_ui
 
 # Front panel: the dump's LED-driver chip (front_panel.py: a TM1650 on I2C or
 # a TM1628-class 3-wire chip, each on its bit-bang GPIO pins) drives a 4-digit
@@ -178,6 +179,9 @@ class TvGui:
         tk.Checkbutton(bar, text="Signal + TS", variable=self.signal_var, bg="#1b1b1b", fg="#ccc",
                        selectcolor="#333", activebackground="#1b1b1b", activeforeground="white",
                        command=self._on_signal_toggled).pack(side=tk.LEFT, padx=(0, 8))
+        self.usb_var = tk.BooleanVar(value=not os.environ.get("ALISIM_NO_USB_STICK"))
+        tk.Checkbutton(bar, text="USB stick (at restart)", variable=self.usb_var, bg="#1b1b1b", fg="#ccc",
+                       selectcolor="#333", activebackground="#1b1b1b", activeforeground="white").pack(side=tk.LEFT, padx=(0, 8))
 
         tk.Button(bar, text="Restart", bg="#27ae60", fg="white", relief="flat", padx=8,
                   command=self.restart_emulation).pack(side=tk.LEFT)
@@ -485,6 +489,7 @@ class TvGui:
                 sim.attach_mux()
             else:
                 sim.attach_tuner()
+            usb_stick_ui.attach(sim, self.usb_var.get())
         except Exception as e:
             self.status = f"LOAD FAILED ({os.path.basename(dump)}): {e!r}"
             return
