@@ -45,6 +45,7 @@ static u32 base;                        /* the number of the screen's first line
 static int row, col;                    /* the cursor on the screen */
 static int esc;                         /* 1: after ESC, 2: in ESC [ ... */
 static char esc_arg;                    /* its first parameter's first digit */
+static int esc_n;                       /* its first parameter as a number (0: none) */
 static u32 back;                        /* lines looked back (PgUp) */
 
 static char shown_ch[ROWS][COLS];       /* what the picture has */
@@ -88,24 +89,75 @@ static void clear_screen(void)
 
 static void draw(void);
 
+/* the last complete line printed (without escape sequences): what a failed command said, for the TV */
+static char last_line[COLS + 1], line_now[COLS + 1];
+static int line_len, line_esc;
+
+const char *console_last_line(void)
+{
+    return last_line;
+}
+
+static void keep_line(char c)
+{
+    if (line_esc) {                     /* ESC [ ... up to its final letter */
+        if (line_esc == 1 ? c != '[' : (c >= '@' && c <= '~'))
+            line_esc = 0;
+        else
+            line_esc = 2;
+        return;
+    }
+    if (c == 27) {
+        line_esc = 1;
+    } else if (c == '\n') {
+        if (line_len) {
+            for (int i = 0; i <= line_len; i++)
+                last_line[i] = i < line_len ? line_now[i] : 0;
+        }
+        line_len = 0;
+    } else if (c == '\r') {
+        /* (the line goes on) */
+    } else if ((u8)c >= ' ' && line_len < COLS) {
+        line_now[line_len++] = c;
+    }
+}
+
 void console_putc(char c)
 {
+    keep_line(c);
     changed = 1;
     back = 0;                           /* new output: the end shown again */
     if (esc == 1) {
         esc = c == '[' ? 2 : 0;
         esc_arg = 0;
+        esc_n = 0;
         return;
     }
     if (esc == 2) {
         if (c >= '0' && c <= '9') {
             if (!esc_arg)
                 esc_arg = c;
+            if (esc_n < 1000)
+                esc_n = esc_n * 10 + (c - '0');
             return;
         }
-        if (c == ';')
+        if (c == ';') {
+            esc = 3;                    /* (the parameters after the first: not kept) */
             return;
+        }
+    }
+    if (esc == 3) {
+        if ((c >= '0' && c <= '9') || c == ';')
+            return;
+        esc = 2;
+    }
+    if (esc == 2) {
         esc = 0;
+        if (c == 'D' || c == 'C') {     /* the cursor left / right n columns (the command line's editing) */
+            int n = esc_n ? esc_n : 1;
+            col = c == 'D' ? (col > n ? col - n : 0) : (col + n < COLS ? col + n : COLS - 1);
+            return;
+        }
         if (c == 'K') {                 /* erase to the end of the line */
             char *l = line_at(base + (u32)row);
             for (int i = col; i < COLS; i++)

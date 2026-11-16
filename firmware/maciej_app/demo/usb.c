@@ -150,11 +150,15 @@ struct device {
     u8 in_ep, out_ep;                   /* the IN and OUT endpoint whose data toggle is kept (| 0x10; 0: none
                                            used since the configuration, all DATA0; 0xFF: not known) */
     u8 in_toggle, out_toggle;           /* theirs: 0 DATA0, 1 DATA1 */
+    u32 out_at;                         /* now_ms() of its last OUT transfer (OUT_IDLE_MS) */
     u8 msc_if, msc_in, msc_out;         /* a mass-storage interface (bulk-only): its number, its bulk
                                            endpoints (0: none) */
     u16 msc_max;                        /* their packet size */
     u16 kbd_size;
     u16 vid, pid;
+    u8 is_hub;                          /* its device class says hub (its ports: once its descriptor was read) */
+    u8 silent_rounds;                   /* a hub behind a hub: usb_hub_poll's rounds without an answer */
+    u8 revived;                         /* a hub: its ports whose silent hub was set up again once already */
     char mfr[24], product[28];
 };
 static struct device devices[DEVICES];
@@ -413,6 +417,18 @@ static int control_once(const u8 *setup, u8 *data, u16 len, u32 timeout_ms)
         fifo_reset(R_EP0);
         ep0_pid(1);
     } else {
+        last_stage = "OUT data";        /* (a serial chip's line settings: SET_LINE_CODING, a CP210x's baud rate) */
+        while (got < len) {
+            fifo_reset(R_EP0);
+            ep0_pid(1);
+            int n = 0;
+            while (n < ep0_max && got < len) {
+                USB[R_EP0_FIFO] = data[got++];
+                n++;
+            }
+            if (ep0_send(timeout_ms))
+                return -1;
+        }
         last_stage = "status (IN)";
         fifo_reset(R_EP0);
         ep0_pid(2);
@@ -449,7 +465,7 @@ static int no_device(void)
     return -1;
 }
 
-/* a control transfer to a device (IN data, or none), tried three times
+/* a control transfer to a device (data IN or OUT, or none), tried three times
    unless the device stalls it: the bytes received, -1 (usb_error_text says
    why).  Through a hub's translator a stall is tried again too: the
    translator answers a complete-split it has no start-split for with one
@@ -555,6 +571,7 @@ int usb_clear_halt(u8 device, u8 ep)
     if (out) {
         d->out_ep = (u8)((ep & 0x0F) | 0x10);
         d->out_toggle = 0;
+        d->out_at = (u32)now_ms();
     } else {
         d->in_ep = (u8)((ep & 0x0F) | 0x10);
         d->in_toggle = 0;
@@ -563,12 +580,44 @@ int usb_clear_halt(u8 device, u8 ep)
     return 0;
 }
 
+/* An OUT endpoint not used for OUT_IDLE_MS gets its toggles put in step
+   again (CLEAR_FEATURE(ENDPOINT_HALT), the controller's pulsed) before its
+   next transfer, even when the demo believes them in step.  On the box the
+   controller's toggle for endpoint A was sometimes not the one the demo
+   counted after a pause: the device ACKed the packet and dropped it as a
+   repeat, nothing told.  It happened only to devices at addresses 8 and up,
+   at random from one set-up to the next (an RTL8153 at address 10: 1 set-up
+   in 6; addresses 8, 11 and 13 alike, 7 never in 40): every DHCP frame
+   lost (they go 2 s apart), or the first ping after a pause; a 64 GB stick
+   at address 9 or 10 lost its first command block after a pause the same
+   way (its data and status then never came).  Frames sent back to back
+   were not lost, so a busy endpoint goes on without it.  Its IN is put in
+   step again too: a 64 GB stick resets both toggles when one halt is
+   cleared, and with the OUT alone cleared the RTL8153 still lost a ping
+   reply now and then. */
+#define OUT_IDLE_MS 500
+
+static void toggle_unknown(struct device *d, int out);
+
+static int out_idle(const struct device *d)
+{
+    /* (only where the fault was seen, high-speed devices at addresses 8 and up: the 05e3:0751 card reader at
+       address 4 answered no command after such a clear, a CH341A behind a hub's translator no more data) */
+    return d->address >= 8 && d->speed == SPEED_HIGH && d->out_ep && (u32)now_ms() - d->out_at > OUT_IDLE_MS;
+}
+
 /* endpoint A (out = 1) or B is about to serve the device's endpoint `ep`:
    both data toggles in step; -1 when the device does not answer */
 static int toggle_sync(struct device *d, u8 ep, int out)
 {
     u8 *dev_ep = out ? &d->out_ep : &d->in_ep, *toggle = out ? &d->out_toggle : &d->in_toggle;
     u8 tagged = (u8)((ep & 0x0F) | 0x10);   /* (0: no endpoint used since the configuration) */
+    if (out && out_idle(d)) {
+        *dev_ep = 0xFF;                 /* (idle: put in step again, see OUT_IDLE_MS) */
+        d->in_ep = 0xFF;                /* (and its IN: a device may reset both when one's halt is cleared) */
+        if (owner[1] == d->address)
+            owner[1] = 0;
+    }
     if (owner[!out] == d->address && owner_ep[!out] == tagged && *dev_ep == tagged)
         return 0;                       /* in step already */
     if (*dev_ep && (*dev_ep != tagged || *toggle)) {
@@ -1105,6 +1154,8 @@ void usb_epd_counts(u32 *every_us, u32 *reports, u32 *drops)
 static int needs_clear(const struct device *d, u8 ep, int out)
 {
     u8 dev_ep = out ? d->out_ep : d->in_ep, tagged = (u8)((ep & 0x0F) | 0x10);
+    if (out && out_idle(d))
+        return 1;
     if (owner[!out] == d->address && owner_ep[!out] == tagged && dev_ep == tagged)
         return 0;
     return dev_ep && (dev_ep != tagged || (out ? d->out_toggle : d->in_toggle));
@@ -1342,6 +1393,7 @@ int usb_bulk_out(u8 device, u8 ep, u16 maxp, const u8 *data, u32 len, u32 timeou
         return -1;
     }
     toggle_count(d, 1, len, len, maxp);
+    d->out_at = (u32)now_ms();
     return 0;
 }
 
@@ -1351,9 +1403,13 @@ static u8 address_of(const struct device *d)    /* its place's number: the addre
     return (u8)(d - devices + 1);
 }
 
+static u8 high_next;                    /* the next device gets the highest free address (make_room) */
+
+/* a device's place, and so its address: the lowest free one (the highest for a device make_room moves) */
 static struct device *new_device(u8 hub, u8 port, u8 speed)
 {
-    for (int i = 0; i < DEVICES; i++)
+    for (int n = 0; n < DEVICES; n++) {
+        int i = high_next ? DEVICES - 1 - n : n;
         if (!devices[i].used) {
             struct device *d = &devices[i];
             for (unsigned k = 0; k < sizeof(*d); k++)
@@ -1380,6 +1436,7 @@ static struct device *new_device(u8 hub, u8 port, u8 speed)
             }
             return d;
         }
+    }
     return 0;
 }
 
@@ -1612,6 +1669,66 @@ static void port_feature(const struct device *h, u8 port, int set, u8 feature)
    device's speed), then the device set up at the next free address; -1 when
    it does not answer (its port is switched off again: it would answer at
    address 0 together with the next one) */
+static int port_connect(struct device *h, u8 port);
+
+/* A high-speed device (a hub, a disk, an Ethernet adapter, an LTE module) is about to get an address, and the
+   first seven are taken: a low- or full-speed device among them (a keyboard, a mouse, a serial adapter -- not a
+   hub) is moved to the highest free address -- forgotten, its port reset, set up again -- and its place is
+   free.  On the box high-speed devices at addresses 8 and up lose bulk data now and then (see OUT_IDLE_MS; a 64
+   GB stick at address 10 lost 13 commands in 25 minutes and then hung in a write, an RTL8153 at 8 dropped a
+   third of its frames after six hours) and at 7 and below never did; a hub needs one of those anyway (its
+   translator's address has three bits) */
+static struct device *movable(void)      /* the device make_room would move; 0 none, or no need */
+{
+    for (int i = 0; i < HUB_MAX; i++)
+        if (!devices[i].used)
+            return 0;                   /* (one of the first seven is free) */
+    int free_above = 0;
+    for (int i = HUB_MAX; i < DEVICES; i++)
+        free_above += !devices[i].used;
+    if (!free_above)
+        return 0;                       /* (a place for the one moved: the new device's own is among them) */
+    for (int i = HUB_MAX - 1; i >= 0; i--) {
+        struct device *d = &devices[i];
+        if (d->hub && device_at(d->hub) && d->speed != SPEED_HIGH && !d->ports && !d->is_hub)
+            return d;
+    }
+    return 0;
+}
+
+static void make_room(void)
+{
+    struct device *d = movable();
+    if (!d)
+        return;
+    struct device *h = device_at(d->hub);
+    u8 port = d->port;
+    int was_quiet = quiet;
+    SAY("hub %u port %u: its device (address %u, not high speed) moves to a higher address: the first %u are "
+        "kept for high-speed devices\n", h->address, port, address_of(d), HUB_MAX);
+    forget(d);
+    high_next = 1;
+    quiet = 1;
+    int r = -1;
+    for (int tries = 0; tries < 3 && r < 0; tries++) {      /* (a failed try switches the port off: on again) */
+        if (tries)
+            delay_ms(100);
+        h->ignore &= (u8)~(1u << port);
+        r = port_connect(h, port);
+    }
+    quiet = was_quiet;
+    high_next = 0;
+    if (r < 0) {
+        SAY("hub %u port %u: it did not come back from its port's reset\n", h->address, port);
+        const char *text = start_a_keyboard();              /* (it was the keyboard, the mouse: the next one) */
+        if (text)
+            SAY("%s\n", text);
+        text = start_a_mouse();
+        if (text)
+            SAY("%s\n", text);
+    }
+}
+
 static int port_connect(struct device *h, u8 port)
 {
     u16 status = 0, change = 0;
@@ -1629,8 +1746,11 @@ static int port_connect(struct device *h, u8 port)
         h->ignore |= (u8)(1u << port);
         return -1;
     }
-    struct device *d = new_device(h->address, port, (status & 0x0200) ? SPEED_LOW : (status & 0x0400) ? SPEED_HIGH
-                                                                                                    : SPEED_FULL);
+    u8 speed = (status & 0x0200) ? SPEED_LOW : (status & 0x0400) ? SPEED_HIGH : SPEED_FULL;
+    static u8 making;                   /* this call is the new device's second set-up, after make_room */
+    u8 again = making;
+    making = 0;                         /* (what is behind it, if it is a hub, is set up as anything else) */
+    struct device *d = new_device(h->address, port, speed);
     if (!d) {
         SAY("hub %u port %u: a device, but the demo keeps %u at most\n", h->address, port, DEVICES);
         port_feature(h, port, 0, PORT_ENABLE);
@@ -1638,8 +1758,23 @@ static int port_connect(struct device *h, u8 port)
         return -1;
     }
     delay_ms(20);                                       /* reset recovery */
+    int got = request(d, 0x80, 0x06, 0x0100, 0, first, 8, 500);
+    if (got == 8 && (speed == SPEED_HIGH || first[4] == 0x09) && !again) {
+        d->used = 0;
+        if (movable()) {
+            /* (its speed is known only after its reset, and only one that answers is worth a place -- on the
+               box a stick that had hung had a serial adapter moved for it at every start: it leaves the bus
+               again -- two devices must not both answer at address 0 -- while the other one's port is reset,
+               then its own reset once more) */
+            port_feature(h, port, 0, PORT_ENABLE);
+            make_room();
+            making = 1;
+            return port_connect(h, port);
+        }
+        d = new_device(h->address, port, speed);        /* (the place it had) */
+    }
     SAY("hub %u port %u:\n", h->address, port);
-    if (request(d, 0x80, 0x06, 0x0100, 0, first, 8, 500) != 8) {
+    if (got != 8) {
         SAY("  a device (%s) that does not answer: %s\n", speed_name(d->speed), usb_error_text());
         port_feature(h, port, 0, PORT_ENABLE);
         h->ignore |= (u8)(1u << port);
@@ -1722,6 +1857,7 @@ static int set_up_device(struct device *d, const u8 *first)
     print_string(d, "product", dev[15], d->product, sizeof(d->product));
     print_string(d, "serial", dev[16], serial, sizeof(serial));
     int is_hub = dev[4] == 0x09, kbd_if = -1, in_kbd = 0, in_msc = 0, in_mouse = 0;
+    d->is_hub = (u8)is_hub;
     /* serial ports: a GSM / LTE module's vendor-class interfaces with a bulk IN and OUT (its AT, modem,
        diagnostic and GPS ports, as Linux's option driver takes them), or a CDC ACM data interface (class 0x0A
        after a class 2 / subclass 2 one; not RNDIS's, protocol 0xFF) */
@@ -1730,9 +1866,15 @@ static int set_up_device(struct device *d, const u8 *first)
         u16 maxp;
     } ser[8], *cur = 0;
     int nser = 0, acm_control = -1, modem = modem_vendor(d->vid);   /* acm_control: the interface before */
+    int chip = serial_chip(d->vid, d->pid, (u16)(dev[12] | dev[13] << 8));  /* a USB-serial chip's interfaces */
     /* CDC Ethernet (ECM): its communications interface (02/06, an interrupt endpoint, the Ethernet
        descriptor's MAC string), its data interface's setting with a bulk IN and OUT */
     int ecm_ctrl = -1, in_ecm_ctrl = 0, in_ecm_data = 0;
+    /* RNDIS (an LTE module's network function): its control interface (e0/01/03, or Windows' 02/02/ff), its
+       data interface's bulk IN and OUT */
+    int rndis_ctrl = -1, in_rndis_data = 0;
+    u8 rndis_data = 0, rndis_in = 0, rndis_out = 0;
+    u16 rndis_maxp = 0;
     u8 ecm_data = 0, ecm_alt = 0, ecm_in = 0, ecm_out = 0, ecm_int = 0, ecm_mac = 0;
     u16 ecm_maxp = 0;
     int n = read_config(d, 0, cfg, sizeof(cfg));
@@ -1757,6 +1899,12 @@ static int set_up_device(struct device *d, const u8 *first)
             if (in_ecm_ctrl)
                 ecm_ctrl = cfg[i + 2];
             in_ecm_data = ecm_ctrl >= 0 && cfg[i + 5] == 0x0A && cfg[i + 4] >= 2 && !ecm_in;
+            if ((cfg[i + 5] == 0xE0 && cfg[i + 6] == 0x01 && cfg[i + 7] == 0x03)
+                || (cfg[i + 5] == 0x02 && cfg[i + 6] == 0x02 && cfg[i + 7] == 0xFF))
+                rndis_ctrl = cfg[i + 2];
+            in_rndis_data = rndis_ctrl >= 0 && cfg[i + 5] == 0x0A && cfg[i + 4] >= 2 && !rndis_in && ecm_ctrl < 0;
+            if (in_rndis_data)
+                rndis_data = cfg[i + 2];
             if (in_ecm_data) {
                 ecm_data = cfg[i + 2];
                 ecm_alt = cfg[i + 3];
@@ -1776,11 +1924,14 @@ static int set_up_device(struct device *d, const u8 *first)
             if (in_msc)
                 d->msc_if = cfg[i + 2];
             cur = 0;
-            if (((cfg[i + 5] == 0xFF && modem && cfg[i + 6] != 0x42) || (cfg[i + 5] == 0x0A && acm_control >= 0))
-                && !cfg[i + 3] && nser < 8) {
+            if (((cfg[i + 5] == 0xFF && (modem || chip) && cfg[i + 6] != 0x42)
+                 || (cfg[i + 5] == 0x0A && acm_control >= 0)) && !cfg[i + 3] && nser < 8) {
                 cur = &ser[nser++];
                 *cur = (struct serial_ep){.iface = cfg[i + 2], .acm = cfg[i + 5] == 0x0A, .name = cfg[i + 8]};
                 cur->control = cur->acm ? (u8)acm_control : cur->iface;
+                if ((chip == SERIAL_FTDI || chip == SERIAL_FTDI_X || chip == SERIAL_FTDI_H) && !cur->acm)
+                    cur->control = (u8)(d->pid == 0x6010 || d->pid == 0x6011
+                                        ? cur->iface + 1 : 0);      /* (an FT2232 / FT4232's port A = 1) */
             }
             acm_control = cfg[i + 5] == 0x02 && cfg[i + 6] == 0x02 && cfg[i + 7] != 0xFF ? cfg[i + 2] : -1;
         } else if (cfg[i + 1] == 0x05 && i + 6 < n) {
@@ -1807,12 +1958,17 @@ static int set_up_device(struct device *d, const u8 *first)
                 bulk_ep(cfg + i, size, &cur->in, &cur->out, &cur->maxp);
             if (in_ecm_data && (cfg[i + 3] & 3) == 2)
                 bulk_ep(cfg + i, size, &ecm_in, &ecm_out, &ecm_maxp);
+            if (in_rndis_data && (cfg[i + 3] & 3) == 2)
+                bulk_ep(cfg + i, size, &rndis_in, &rndis_out, &rndis_maxp);
             if (in_ecm_ctrl && (cfg[i + 3] & 3) == 3 && (cfg[i + 2] & 0x80))
                 ecm_int = cfg[i + 2] & 0x0F;
         } else if (cfg[i + 1] == 0x24 && i + 3 < n && in_ecm_ctrl && cfg[i + 2] == 0x0F) {
             ecm_mac = cfg[i + 3];                       /* (the Ethernet descriptor: its MAC address string) */
         }
     }
+    if (d->vid == 0x1A86 && d->pid == 0x5512)
+        SAY("  a CH341A in its I2C / SPI / parallel mode (a 24xx / 25xx programmer): not driven here -- in its "
+            "serial mode (1a86:5523) it is a ttyUSB port\n");
     if (request(d, 0x00, 0x09, cfg[5], 0, 0, 0, 500) == 0)        /* SET_CONFIGURATION */
         SAY("  configuration %u set\n", cfg[5]);
     else
@@ -1828,8 +1984,11 @@ static int set_up_device(struct device *d, const u8 *first)
         else
             print_string(d, 0, s->name, names[k], sizeof(names[k]));
         if (s->in && s->out)
-            SAY("  %s\n", serial_attach(a, s->iface, s->control, s->acm, s->in, s->out, s->maxp, names[k]));
+            SAY("  %s\n", serial_attach(a, s->iface, s->control, s->acm ? SERIAL_ACM : chip, s->in, s->out,
+                                        s->maxp, chip && !s->acm ? "" : names[k]));
     }
+    if (rndis_in && rndis_out && !is_hub && !(ecm_in && ecm_out))
+        SAY("  %s\n", eth_attach_rndis(a, (u8)rndis_ctrl, rndis_data, rndis_in, rndis_out, rndis_maxp));
     if (ecm_in && ecm_out && !is_hub)
         SAY("  %s\n", eth_attach(a, (u8)ecm_ctrl, ecm_data, ecm_alt, ecm_in, ecm_out, ecm_maxp, ecm_int, ecm_mac));
     if (d->msc_in && !d->msc_out)
@@ -1993,6 +2152,43 @@ int usb_hub_poll(void (*before)(void))
         if (!usb_connected())
             return 0;
         if (h->hub) {                   /* a hub on a hub's port: unplugged?  That port is looked at next */
+            /* ... unless that port says it is still there, enabled, nothing changed: the hub itself has stopped
+               answering (on the box a dock's 1a40:0801, at full speed behind another hub's translator, did
+               minutes after it was set up).  Going back to its port each time, the poll went round between
+               the two for good and never came to the other hubs: no device plugged in was seen any more.
+               After three such rounds in a row the hub is forgotten and, once, set up again from its port's
+               reset (it may have been reset behind the demo's back); silent a second time, or not answering
+               that set-up, its port stays switched off until it is replugged */
+            struct device *up = device_at(h->hub);
+            u16 s = 0, c = 0;
+            u8 up_port = h->port;
+            if (up && port_status(up, up_port, &s, &c) == 0 && (s & 3) == 3 && !(c & 1)) {
+                if (++h->silent_rounds < 3) {
+                    poll_hub = (u8)(h->address % DEVICES + 1);      /* (the others have their turn meanwhile) */
+                    poll_port = 1;
+                    return 0;
+                }
+                int again = (up->revived >> up_port) & 1;
+                before();
+                uprintf("[usb] hub %u (%04x:%04x, on hub %u port %u) has stopped answering%s: forgotten with what "
+                        "was behind it, its port %s\n", h->address, h->vid, h->pid, up->address, up_port,
+                        again ? " again" : "", again ? "switched off -- replug it" : "reset");
+                forget(h);
+                if (again) {
+                    port_feature(up, up_port, 0, PORT_ENABLE);
+                    up->ignore |= (u8)(1u << up_port);
+                } else {
+                    up->revived |= (u8)(1u << up_port);
+                    port_connect(up, up_port);                      /* (failing, it switches the port off itself) */
+                }
+                const char *text = start_a_keyboard();
+                if (text)
+                    uprintf("[usb] %s\n", text);
+                text = start_a_mouse();
+                if (text)
+                    uprintf("[usb] %s\n", text);
+                return 1;
+            }
             poll_hub = h->hub;
             poll_port = h->port;
             return 0;
@@ -2006,6 +2202,7 @@ int usb_hub_poll(void (*before)(void))
         return 1;
     }
     silent = 0;
+    h->silent_rounds = 0;               /* (it answers: three rounds in a row, not three in a day) */
     if (change & 0x02)
         port_feature(h, port, 0, C_PORT_ENABLE);
     if (change & 0x08)
@@ -2015,6 +2212,7 @@ int usb_hub_poll(void (*before)(void))
     if (change & 0x01) {
         port_feature(h, port, 0, C_PORT_CONNECTION);
         h->ignore &= (u8)~(1u << port);
+        h->revived &= (u8)~(1u << port);
     }
     struct device *d = device_on(h->address, port);
     if (d && (!(status & 1) || (change & 1))) {         /* unplugged (or unplugged and something plugged in) */

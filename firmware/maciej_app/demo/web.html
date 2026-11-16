@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>M3801 box</title>
+<style>
+:root{--bg:#f3f3f0;--panel:#fff;--ink:#1c1c1a;--mute:#6a6a64;--line:#dcdcd6;--accent:#2457b8;--bad:#b3261e;
+--hover:#eef1f7;--term:#121212;--termink:#d8d8d2;--btn:#f7f7f5}
+@media (prefers-color-scheme:dark){:root{--bg:#141414;--panel:#1e1e1e;--ink:#e6e6e1;--mute:#9a9a93;--line:#333330;
+--accent:#86aaff;--bad:#ff8a80;--hover:#262a33;--term:#0c0c0c;--btn:#262626}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{display:flex;flex-wrap:wrap;gap:4px 16px;align-items:baseline;padding:10px 16px;border-bottom:1px solid var(--line);
+background:var(--panel)}
+header b{font-size:15px}
+.mute{color:var(--mute)}
+.bad{color:var(--bad)}
+main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;padding:16px;max-width:1500px;margin:auto}
+section{background:var(--panel);border:1px solid var(--line);border-radius:8px;min-width:0;display:flex;
+flex-direction:column}
+#con{grid-column:1/-1}
+@media (max-width:900px){main{grid-template-columns:minmax(0,1fr);padding:16px 8px}}
+.bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line)}
+.grow{flex:1}
+button{font:inherit;color:var(--ink);background:var(--btn);border:1px solid var(--line);border-radius:6px;
+padding:4px 10px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button:focus-visible,#term:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+#crumbs a,#crumbs span{margin-right:2px}
+.list{overflow:auto;max-height:520px;min-height:200px;position:relative}
+.list.drag{outline:2px dashed var(--accent);outline-offset:-6px}
+table{border-collapse:collapse;width:100%}
+th,td{padding:5px 10px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{position:sticky;top:0;background:var(--panel);font-weight:600;color:var(--mute);font-size:12px}
+td.name{white-space:normal;overflow-wrap:anywhere;min-width:12em}
+td.name small{display:block;color:var(--mute)}
+tr:hover td{background:var(--hover)}
+.r{text-align:right;font-variant-numeric:tabular-nums}
+.acts button{padding:1px 7px;font-size:12px}
+#status{padding:6px 10px;min-height:30px;font-size:13px}
+#shotbox{padding:10px;display:flex;justify-content:center;background:#000;outline:none}
+#shot{width:100%;height:auto;aspect-ratio:16/9;image-rendering:auto;display:block}
+#remote{display:grid;grid-template-columns:repeat(3,48px);gap:6px;justify-content:center;padding:10px}
+#remote button{height:40px;padding:0}
+.keys{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;padding:0 10px 12px}
+#term{margin:0;padding:10px 12px;height:420px;overflow:auto;background:var(--term);color:var(--termink);
+font:13px/1.35 ui-monospace,Consolas,"Cascadia Mono",Menlo,monospace;white-space:pre-wrap;word-break:break-all;
+outline:none}
+#lineform{border-bottom:0;border-top:1px solid var(--line)}
+#line{font:13px ui-monospace,Consolas,Menlo,monospace;color:var(--ink);background:var(--panel);border:1px solid var(--line);
+border-radius:6px;padding:5px 8px;min-width:0}
+#term .cur{background:var(--termink);color:var(--term)}
+#term:not(:focus) .cur{background:none;outline:1px solid var(--termink)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#2e9d4f;margin-right:5px}
+.dot.off{background:var(--bad)}
+</style>
+</head>
+<body>
+<header>
+  <b id="banner">M3801 box</b>
+  <span id="meta" class="mute"></span>
+  <span class="grow"></span>
+  <span id="link" class="mute"><span class="dot"></span>connected</span>
+</header>
+<main>
+  <section id="files" aria-label="Files">
+    <div class="bar">
+      <span id="crumbs"></span><span class="grow"></span>
+      <button id="upload" type="button">Upload</button>
+      <button id="mkdir" type="button">New folder</button>
+      <button id="refresh" type="button">Refresh</button>
+      <input type="file" id="pick" multiple hidden>
+    </div>
+    <div id="drop" class="list">
+      <table>
+        <thead><tr><th>Name</th><th></th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div id="status" class="mute" aria-live="polite"></div>
+  </section>
+  <section id="tv" aria-label="TV">
+    <div class="bar">
+      <b>TV</b><span class="grow"></span>
+      <label><input type="checkbox" id="live" checked> Live</label>
+      <button id="full" type="button">Full size</button>
+    </div>
+    <div id="shotbox" tabindex="0" title="Click here and type: the keys go to the box"><img id="shot" alt="What the TV shows"></div>
+    <div id="remote">
+      <span></span><button data-k="&#27;[A" title="Up">&#9650;</button><span></span>
+      <button data-k="&#27;[D" title="Left">&#9664;</button><button data-k="&#13;" title="Enter">OK</button><button data-k="&#27;[C" title="Right">&#9654;</button>
+      <span></span><button data-k="&#27;[B" title="Down">&#9660;</button><span></span>
+    </div>
+    <div class="keys">
+      <button data-k="&#27;">Esc</button><button data-k="&#9;">Tab</button><button data-k=" ">Space</button>
+      <button data-k="x" title="A in the games">A (x)</button><button data-k="z" title="B in the games">B (z)</button>
+      <button data-k="&#3;">Ctrl-C</button>
+    </div>
+  </section>
+  <section id="con" aria-label="Command line">
+    <div class="bar"><b>Command line</b><span class="grow"></span><span class="mute">click it and type; Ctrl-C stops a command (with text selected: copies)</span></div>
+    <pre id="term" tabindex="0"></pre>
+    <form id="lineform" class="bar" autocomplete="off">
+      <input id="line" class="grow" placeholder="Or type a whole line here and press Enter" aria-label="A line for the box's command line">
+      <button type="submit">Send</button>
+    </form>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const esc = s => s.replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const enc = encodeURIComponent;
+
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  const t = await r.text();
+  let j;
+  try { j = JSON.parse(t); } catch (e) { j = {error: t || r.statusText}; }
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+/* ---- the header ---- */
+function setOnline(on) {
+  $("link").innerHTML = on ? '<span class="dot"></span>connected' : '<span class="dot off"></span>no answer from the box';
+}
+async function info() {
+  try {
+    const j = await api("/api/info");
+    $("banner").textContent = j.banner + " " + j.version;
+    const h = Math.floor(j.uptime / 3600), m = Math.floor(j.uptime / 60) % 60;
+    $("meta").textContent = j.ip + " · up " + (h ? h + " h " : "") + m + " min" +
+      (j.command ? " · a command is running" : "");
+    setOnline(true);
+  } catch (e) { setOnline(false); }
+}
+
+/* ---- files ---- */
+let cwd = "", shown = [];
+function status(text, bad) { const s = $("status"); s.textContent = text || ""; s.className = bad ? "bad" : "mute"; }
+function child(name) { return cwd.endsWith("/") ? cwd + name : cwd + "/" + name; }
+function parentOf(p) {
+  const i = p.lastIndexOf("/");
+  if (i < 0) return "";
+  if (i === p.indexOf("/") && p.length > i + 1) return p.slice(0, i + 1);
+  return i === p.length - 1 ? "" : p.slice(0, i);
+}
+function human(n) {
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return (n < 10 ? n.toFixed(1) : Math.round(n)) + " " + u[i];
+}
+const isImage = n => /\.(jpe?g|png|gif|bmp)$/i.test(n);
+const isText = n => /\.(txt|log|md|c|h|py|ini|csv|json)$/i.test(n);
+
+function crumbs() {
+  const c = $("crumbs");
+  let html = '<a href="#" data-p="">Disks</a>';
+  if (cwd) {
+    const vol = cwd.slice(0, cwd.indexOf(":") + 1);
+    html += ' / <a href="#" data-p="' + esc(vol + "/") + '">' + esc(vol) + "</a>";
+    let at = vol + "/";
+    for (const part of cwd.slice(vol.length + 1).split("/").filter(Boolean)) {
+      at = at.endsWith("/") ? at + part : at + "/" + part;
+      html += ' / <a href="#" data-p="' + esc(at) + '">' + esc(part) + "</a>";
+    }
+  }
+  c.innerHTML = html;
+}
+
+function render(j) {
+  const rows = $("rows");
+  shown = j.entries;
+  let html = "";
+  if (cwd) html += '<tr><td class="name" colspan="2"><a href="#" data-p="' + esc(parentOf(cwd)) + '">.. (up)</a></td></tr>';
+  if (!cwd) {
+    for (const e of j.entries)
+      html += '<tr><td class="name" colspan="2"><a href="#" data-p="' + esc(e.n + "/") + '"><b>' + esc(e.n) + "</b> " +
+        esc(e.l) + "</a><small>" + esc(e.i) + "</small></td></tr>";
+    if (!j.entries.length) html += '<tr><td colspan="2" class="mute">No disk with a volume the box reads.</td></tr>';
+  } else {
+    const list = j.entries.slice().sort((a, b) => b.d - a.d || a.n.localeCompare(b.n, undefined, {sensitivity: "base"}));
+    for (const e of list) {
+      const p = child(e.n);
+      let name;
+      if (e.d) name = '<a href="#" data-p="' + esc(p) + '">' + esc(e.n) + "/</a>";
+      else if (isImage(e.n) || isText(e.n)) name = '<a href="/api/get?inline=1&p=' + enc(p) + '" target="_blank" rel="noopener">' + esc(e.n) + "</a>";
+      else name = '<a href="/api/get?p=' + enc(p) + '" download>' + esc(e.n) + "</a>";
+      html += '<tr><td class="name">' + name + "<small>" + (e.d ? "folder" : human(e.s)) + " \u00b7 " + esc(e.t) +
+        '</small></td><td class="acts r">' +
+        (e.d ? "" : '<a href="/api/get?p=' + enc(p) + '" download><button type="button" tabindex="-1">Save</button></a> ') +
+        '<button type="button" data-mv="' + esc(e.n) + '">Rename</button> <button type="button" data-rm="' + esc(e.n) +
+        '" data-dir="' + e.d + '">Delete</button></td></tr>';
+    }
+    if (!list.length) html += '<tr><td colspan="2" class="mute">Empty. Drop files here to upload them.</td></tr>';
+  }
+  rows.innerHTML = html;
+  crumbs();
+  $("upload").disabled = $("mkdir").disabled = !cwd;
+}
+
+async function go(p) {
+  status("Reading…");
+  try {
+    const j = await api("/api/ls?p=" + enc(p));
+    cwd = p;
+    render(j);
+    status(j.cut ? "The listing was cut: the box lists a directory's first 7000 entries." : "");
+  } catch (e) { status(e.message, true); }
+}
+
+document.addEventListener("click", ev => {
+  const a = ev.target.closest("[data-p]");
+  if (a) { ev.preventDefault(); go(a.dataset.p); return; }
+  const mv = ev.target.closest("[data-mv]");
+  if (mv) { rename(mv.dataset.mv); return; }
+  const rm = ev.target.closest("[data-rm]");
+  if (rm) remove(rm.dataset.rm, rm.dataset.dir === "1");
+});
+
+async function rename(name) {
+  const to = prompt("New name for " + name, name);
+  if (!to || to === name) return;
+  if (/[\/\\:]/.test(to)) { status("A name without / \\ or :", true); return; }
+  try { await api("/api/mv?p=" + enc(child(name)) + "&to=" + enc(child(to)), {method: "POST"}); go(cwd); }
+  catch (e) { status(e.message, true); }
+}
+async function remove(name, dir) {
+  if (!confirm("Delete " + name + (dir ? " (an empty folder)" : "") + " from the box? This cannot be undone.")) return;
+  try { await api("/api/" + (dir ? "rmdir" : "rm") + "?p=" + enc(child(name)), {method: "POST"}); go(cwd); }
+  catch (e) { status(e.message, true); }
+}
+$("mkdir").onclick = async () => {
+  const name = prompt("Name of the new folder");
+  if (!name) return;
+  try { await api("/api/mkdir?p=" + enc(child(name)), {method: "POST"}); go(cwd); }
+  catch (e) { status(e.message, true); }
+};
+$("refresh").onclick = () => go(cwd);
+
+/* uploads: one at a time (the box moves one file at a time) */
+function put(file, path) {
+  return new Promise((ok, bad) => {
+    const x = new XMLHttpRequest();
+    x.open("PUT", "/api/put?p=" + enc(path));
+    x.upload.onprogress = e => {
+      if (e.lengthComputable) status("Uploading " + file.name + ": " + Math.floor(100 * e.loaded / e.total) + "% of " + human(e.total));
+    };
+    x.onload = () => {
+      if (x.status === 200) ok();
+      else { let m = x.statusText; try { m = JSON.parse(x.responseText).error; } catch (e) {} bad(new Error(m)); }
+    };
+    x.onerror = () => bad(new Error("The connection broke"));
+    x.send(file);
+  });
+}
+async function uploadAll(files) {
+  if (!cwd) { status("Open a disk first.", true); return; }
+  const names = new Set(shown.map(e => e.n.toLowerCase()));
+  let done = 0;
+  for (const f of files) {
+    if (names.has(f.name.toLowerCase()) && !confirm(f.name + " is there already. Replace it?")) continue;
+    try { await put(f, child(f.name)); done++; }
+    catch (e) { status(f.name + ": " + e.message, true); go(cwd); return; }
+  }
+  await go(cwd);
+  status(done + " file" + (done === 1 ? "" : "s") + " uploaded.");
+}
+$("upload").onclick = () => $("pick").click();
+$("pick").onchange = () => { uploadAll([...$("pick").files]); $("pick").value = ""; };
+const drop = $("drop");
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("drag"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("drag"));
+drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("drag"); uploadAll([...e.dataTransfer.files]); });
+
+/* ---- what the box is sent: typed keys, the remote's buttons ---- */
+let pending = "", sending = false;
+function send(s) { pending += s.replace(/[^\x00-\x7f]/g, "?"); flush(); }
+async function flush() {
+  if (sending || !pending) return;
+  sending = true;
+  const s = pending.slice(0, 200);
+  pending = pending.slice(s.length);
+  try { await fetch("/api/in", {method: "POST", body: s}); } catch (e) {}
+  sending = false;
+  if (pending) flush();
+}
+const keymap = {Enter: "\r", Backspace: "\x7f", Tab: "\t", Escape: "\x1b", ArrowUp: "\x1b[A", ArrowDown: "\x1b[B",
+  ArrowRight: "\x1b[C", ArrowLeft: "\x1b[D", Home: "\x1b[H", End: "\x1b[F", Delete: "\x1b[3~"};
+function keys(e) {
+  if (e.altKey || e.metaKey) return;
+  let s = null;
+  if (e.ctrlKey) {
+    const k = e.key.toLowerCase();
+    if (k === "c" && String(window.getSelection())) return;       /* (copying) */
+    if (k === "v") return;                                        /* (pasting: the paste event) */
+    if (k.length === 1 && k >= "a" && k <= "z") s = String.fromCharCode(k.charCodeAt(0) - 96);
+  } else if (keymap[e.key]) s = keymap[e.key];
+  else if (e.key.length === 1) s = e.key;
+  if (s !== null) { e.preventDefault(); send(s); }
+}
+for (const el of [$("term"), $("shotbox")]) {
+  el.addEventListener("keydown", keys);
+  el.addEventListener("paste", e => { e.preventDefault(); send(e.clipboardData.getData("text").replace(/\r?\n/g, "\r")); });
+}
+for (const b of document.querySelectorAll("[data-k]")) b.onclick = () => send(b.dataset.k);
+$("lineform").onsubmit = e => { e.preventDefault(); send($("line").value + "\r"); $("line").value = ""; };
+
+/* ---- the command line's output: a small terminal (CR, LF, BS, tab, ESC [ K / C / D / A / B / J) ---- */
+const T = {lines: [""], row: 0, col: 0, esc: ""};
+const MAX_LINES = 3000;
+function feed(text) {
+  for (const ch of text) {
+    if (T.esc) {
+      T.esc += ch;
+      if (T.esc.length === 2 && ch !== "[") { T.esc = ""; continue; }
+      if (T.esc.length > 2 && /[@-~]/.test(ch)) { csi(T.esc.slice(2, -1), ch); T.esc = ""; }
+      else if (T.esc.length > 16) T.esc = "";
+      continue;
+    }
+    if (ch === "\x1b") { T.esc = ch; continue; }
+    if (ch === "\r") { T.col = 0; continue; }
+    if (ch === "\n") { T.row++; T.col = 0; if (T.row >= T.lines.length) T.lines.push(""); continue; }
+    if (ch === "\b") { if (T.col > 0) T.col--; continue; }
+    if (ch === "\t") { const n = 8 - T.col % 8; for (let i = 0; i < n; i++) write(" "); continue; }
+    if (ch < " ") continue;
+    write(ch);
+  }
+  if (T.lines.length > MAX_LINES) { const cut = T.lines.length - MAX_LINES; T.lines.splice(0, cut); T.row -= cut; }
+}
+function write(ch) {
+  let l = T.lines[T.row];
+  if (l.length < T.col) l = l.padEnd(T.col);
+  T.lines[T.row] = l.slice(0, T.col) + ch + l.slice(T.col + 1);
+  T.col++;
+}
+function csi(params, f) {
+  const n = parseInt(params, 10) || 1;
+  if (f === "K") T.lines[T.row] = params === "2" ? "" : params === "1" ? " ".repeat(T.col) + T.lines[T.row].slice(T.col) : T.lines[T.row].slice(0, T.col);
+  else if (f === "C") T.col += n;
+  else if (f === "D") T.col = Math.max(0, T.col - n);
+  else if (f === "A") T.row = Math.max(0, T.row - n);
+  else if (f === "B") { T.row += n; while (T.row >= T.lines.length) T.lines.push(""); }
+  else if (f === "J" && params === "2") { T.lines = [""]; T.row = T.col = 0; }
+}
+function draw() {
+  const term = $("term");
+  const atEnd = term.scrollTop + term.clientHeight >= term.scrollHeight - 30;
+  const l = T.lines[T.row].padEnd(T.col + 1);
+  term.innerHTML = esc(T.lines.slice(0, T.row).join("\n") + (T.row ? "\n" : "") + l.slice(0, T.col)) +
+    '<span class="cur">' + esc(l[T.col]) + "</span>" + esc(l.slice(T.col + 1)) +
+    (T.row < T.lines.length - 1 ? "\n" + esc(T.lines.slice(T.row + 1).join("\n")) : "");
+  if (atEnd) term.scrollTop = term.scrollHeight;
+}
+async function output() {
+  let next = null;
+  for (;;) {
+    try {
+      const r = await fetch("/api/out" + (next === null ? "" : "?from=" + next), {cache: "no-store"});
+      const t = await r.text();
+      const n = r.headers.get("X-Next");
+      if (n !== null) next = +n;
+      if (t) { feed(t); draw(); }
+      setOnline(true);
+    } catch (e) { setOnline(false); await sleep(2000); }
+  }
+}
+$("term").addEventListener("click", () => { if (!String(window.getSelection())) $("term").focus(); });
+
+/* ---- the TV's picture ---- */
+const shot = $("shot");
+let shotTimer = 0;
+function reshoot(ms) { clearTimeout(shotTimer); shotTimer = setTimeout(() => { shot.src = "/api/screen.bmp?half=1&t=" + Date.now(); }, ms); }
+shot.onload = () => { if ($("live").checked) reshoot(700); };
+shot.onerror = () => { if ($("live").checked) reshoot(3000); };
+$("live").onchange = () => { if ($("live").checked) reshoot(0); };
+$("full").onclick = () => window.open("/api/screen.bmp?t=" + Date.now(), "_blank", "noopener");
+$("shotbox").addEventListener("click", () => $("shotbox").focus());
+
+info();
+setInterval(info, 10000);
+go("");
+output();
+reshoot(0);
+</script>
+</body>
+</html>

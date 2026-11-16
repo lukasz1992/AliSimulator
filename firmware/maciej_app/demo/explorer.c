@@ -24,6 +24,7 @@
    them (the explorer calls the disk only from the main loop, never inside
    a command whose output is going into a file). */
 #include "hw.h"
+#include "av.h"
 
 #define CELL        12                  /* the font's cells (gfx_cell): 12 x 16 */
 #define TITLE_H     44
@@ -715,6 +716,55 @@ static void close_preview(void)
     draw_status();
 }
 
+static int ends_nes(const char *s)
+{
+    int n = 0;
+    while (s[n])
+        n++;
+    return n > 4 && s[n - 4] == '.' && (s[n - 3] | 32) == 'n' && (s[n - 2] | 32) == 'e' && (s[n - 1] | 32) == 's';
+}
+
+static int ends_gb(const char *s)        /* .gb, and .gbc (the Game Boy Color's) */
+{
+    int n = 0;
+    while (s[n])
+        n++;
+    if (n > 4 && s[n - 4] == '.' && (s[n - 3] | 32) == 'g' && (s[n - 2] | 32) == 'b' && (s[n - 1] | 32) == 'c')
+        return 1;
+    return n > 3 && s[n - 3] == '.' && (s[n - 2] | 32) == 'g' && (s[n - 1] | 32) == 'b';
+}
+
+/* a Master System / Game Gear / Spectrum / Atari 2600 / C64 / Amiga / DOS file: which player (0: none) */
+static int (*z80_player(const char *s))(const char *, u32, const char *)
+{
+    int n = 0, dot = -1;
+    for (; s[n]; n++)
+        if (s[n] == '.')
+            dot = n;
+    if (dot < 0 || n - dot > 4)
+        return 0;
+    char e[4] = {0, 0, 0, 0};
+    for (int i = 0; dot + 1 + i < n; i++)
+        e[i] = (char)(s[dot + 1 + i] | 32);
+    if (e[0] == 's' && e[1] == 'm' && e[2] == 's' && !e[3])
+        return sms_play;
+    if (e[0] == 'g' && e[1] == 'g' && !e[2])
+        return gg_play;
+    if (e[0] == 'a' && e[1] == '2' && e[2] == '6' && !e[3])
+        return a26_play;
+    if ((e[0] == 's' && e[1] == 'n' && e[2] == 'a') || (e[0] == 'z' && e[1] == '8' && e[2] == '0') ||
+        (e[0] == 't' && e[1] == 'a' && e[2] == 'p') || (e[0] == 't' && e[1] == 'z' && e[2] == 'x'))
+        return e[3] ? 0 : zx_play;
+    if ((e[0] == 'p' && e[1] == 'r' && e[2] == 'g') || (e[0] == 't' && e[1] == '6' && e[2] == '4') ||
+        (e[0] == 'd' && e[1] == '6' && e[2] == '4') || (e[0] == 'p' && e[1] == '0' && e[2] == '0'))
+        return e[3] ? 0 : c64_play;
+    if (e[0] == 'a' && e[1] == 'd' && e[2] == 'f' && !e[3])
+        return amiga_play;
+    if (((e[0] == 'e' && e[1] == 'x' && e[2] == 'e') || (e[0] == 'c' && e[1] == 'o' && e[2] == 'm')) && !e[3])
+        return dos_play;
+    return 0;
+}
+
 static void open_row(int i)
 {
     if (i < 0 || i >= rows)
@@ -734,6 +784,31 @@ static void open_row(int i)
         go(name);
     } else if (e->kind == DISK_DIR) {
         go(e->name);
+    } else if (view_is_picture(e->name) || ends_nes(e->name) || ends_gb(e->name) || z80_player(e->name) ||
+               av_is_video(e->name)) {
+        char name[DISK_ENTRY_NAME];                     /* a picture, a game or a video: on the whole TV, then back */
+        scopy(name, e->name, sizeof(name));
+        on = 0;
+        if (av_is_video(name)) {
+            char *argv[2] = {"play", name};
+            (void)av_play(2, argv);
+        } else if (ends_nes(name)) {
+            (void)nes_play(name, 0, "");
+        } else if (ends_gb(name)) {
+            (void)gb_play(name, 0, "");
+        } else if (z80_player(name)) {
+            (void)z80_player(name)(name, 0, "");
+        } else {
+            view_file(name, 0);
+            const char *last = view_last(), *b = last;          /* (the picture it ended on: selected) */
+            for (const char *q = last; *q; q++)
+                if (*q == '/' || *q == '\\' || *q == ':')
+                    b = q + 1;
+            if (*b)
+                scopy(name, b, sizeof(name));
+        }
+        explorer_show();
+        scopy(want_sel, name, sizeof(want_sel));
     } else {
         open_preview(e);
     }

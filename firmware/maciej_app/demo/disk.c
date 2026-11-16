@@ -88,6 +88,14 @@ struct disk {
     u32 lost;                           /* commands it did not answer in time, sent again */
     u32 lost_reads;                     /* of them READs and the like (data in): QUICK_AFTER of them -> short waits */
     u8 wp;                              /* MODE SENSE's word: 0 not asked, 1 writable, 2 write-protected */
+    u8 wrote;                           /* its last command was a WRITE: the next one waits as long as a write
+                                           (the device may still be busy with its flash) */
+    u8 resent;                          /* a command was sent again since the medium was last looked at: the
+                                           next WRITE first compares its first sectors (medium_same) */
+    u32 gen;                            /* its generation: new when it is plugged in, taken out, or its medium
+                                           changes (FTP's reader and writer stop on their own disk's change) */
+    u32 sig, sig_lba;                   /* what probe read: a hash of sector 0 and of sector sig_lba (its first
+                                           volume's boot sector; 0 none) */
     char name[32];                      /* INQUIRY's vendor, product, revision */
     const char *problem;                /* why it is not ready */
     struct volume vol[VOLUMES];
@@ -160,7 +168,7 @@ u64 __lshrdi3(u64 a, int b)
 
 static struct disk disks[DISKS];
 static u32 changes;                     /* disks come and go, sectors written: the explorer looks again */
-static u32 plugs;                       /* disks come and go: ftp.c's reader and writer stop on a change */
+static u32 gens;                        /* the last disk generation given out (struct disk's gen) */
 
 /* the current directory ('cd') */
 static struct {
@@ -271,7 +279,7 @@ static int command_once(struct disk *k, const u8 *cb, u8 cb_len, u8 *data, u32 l
     cbw[14] = cb_len;
     for (int i = 0; i < cb_len; i++)
         cbw[15 + i] = cb[i];
-    if (usb_bulk_out(k->device, k->out_ep, k->maxp, cbw, 31, 2000) < 0) {
+    if (usb_bulk_out(k->device, k->out_ep, k->maxp, cbw, 31, wait_ms > 2000 ? wait_ms : 2000) < 0) {
         u8 e = usb_last_error();
         return (e & 0x20) ? -1 : -3;    /* no answer: gone; a stall or no end: stuck */
     }
@@ -358,36 +366,47 @@ static void io_sense(u8 key, u8 asc)
    the command block is still in some command of before: a reset recovery,
    and the command once more; one that does not answer a command in time (or
    answers nonsense) gets it once more after the reset recovery, too.  A
-   command with data out (a WRITE) that got no answer twice is sent a third
-   time: the same sectors with the same bytes, so one the device did carry
-   out before its answer was lost is only written again -- and a write that
-   fails for good is costly (an NTFS volume is read-only from then on, until
-   'ntfs' looked at it again) on a stick that loses a command in ten */
+   command with data out (a WRITE) is sent up to three times, whichever way
+   the tries before went: the same sectors with the same bytes, so one the
+   device did carry out before its answer was lost is only written again --
+   and a write that fails for good is costly (an NTFS volume is read-only from
+   then on, until 'ntfs' looked at it again) on a stick that loses a command
+   in ten.  Before a command is sent again the device is asked why the try
+   before went unanswered (REQUEST SENSE): a card reader whose card was
+   changed answers the next command CHECK CONDITION, 6/28 -- when that answer
+   is the one lost, sending the command again would run it on the new card
+   with what was known of the old one */
+static int lost_answer_sense(struct disk *k);
+
 static int transfer(struct disk *k, const u8 *cb, u8 cb_len, u8 *data, u32 len, int out)
 {
     io_said = 0;
     int quick = len && !out && k->lost_reads >= QUICK_AFTER;   /* (a disk known to lose reads: short waits --
                                                                    lost writes, a card busy, do not count) */
-    int r = command_once(k, cb, cb_len, data, len, out, quick ? FIRST_READ_WAIT_MS : FIRST_WAIT_MS);
-    if (r == -3) {
-        reset_recovery(k);
-        r = command_once(k, cb, cb_len, data, len, out, WAIT_MS);
-    } else if (r == -4) {
-        k->lost++;
-        k->lost_reads += len && !out;
-        if (quick) {                    /* (a second short try first) */
-            r = command_once(k, cb, cb_len, data, len, out, FIRST_READ_WAIT_MS);
-            if (r == -4) {
-                k->lost++;
-                k->lost_reads++;
-            }
+    int sends = (len && out) || quick ? 3 : 2;
+    /* (a write's first try waits as long as a slow device may need: a stick busy writing its flash is not to
+       be reset after 2 s -- on the box a 64 GB stick stopped answering for good, until unplugged, when a write
+       that had not answered in 2 s was followed by the reset recovery) */
+    /* (and so does what follows a write -- SYNCHRONIZE CACHE, the next command whatever it is: the device
+       may be busy with that write still, and a command block not taken in 2 s was followed by the reset too) */
+    int slow = (len && out) || cb[0] == 0x35 || k->wrote;
+    k->wrote = len && out;
+    int r = command_once(k, cb, cb_len, data, len, out,
+                         slow ? WAIT_MS : quick ? FIRST_READ_WAIT_MS : FIRST_WAIT_MS);
+    for (int n = 1; (r == -3 || r == -4) && n < sends; n++) {
+        u32 wait = WAIT_MS;
+        if (r == -3) {
+            reset_recovery(k);          /* (still in a command of before) */
+        } else {
+            k->lost++;
+            k->lost_reads += len && !out;
+            if (quick && n == 1)
+                wait = FIRST_READ_WAIT_MS;      /* (a second short try first) */
         }
-        if (r == -4)
-            r = command_once(k, cb, cb_len, data, len, out, WAIT_MS);
-    }
-    if (r == -4 && len && out) {        /* (a WRITE, twice without an answer: once more) */
-        k->lost++;
-        r = command_once(k, cb, cb_len, data, len, out, WAIT_MS);
+        k->resent = 1;
+        if (lost_answer_sense(k))
+            return -1;                  /* (the answer lost was "another medium") */
+        r = command_once(k, cb, cb_len, data, len, out, wait);
     }
     return r == -3 || r == -4 ? -1 : r;
 }
@@ -416,24 +435,98 @@ static void nw_forget(const struct disk *k);
    everything the demo knew of it is forgotten -- its size, its volumes, what was cached of them, the current
    directory on it, an NTFS volume's write gate and layout -- and nothing more is read or written until the
    next command looks at the disk again (where -> probe).  Said, once: 1.  Any other sense: 0 */
-static int medium_changed(struct disk *k, u8 key, u8 asc)
+static void medium_forget(struct disk *k, const char *why)
 {
-    if (!((key == 6 && asc == 0x28) || (key == 2 && asc == 0x3A)))
-        return 0;
     k->ready = 0;
     k->volumes = 0;
     k->wp = 0;
+    k->resent = 0;
     k->problem = "its medium was changed";
-    plugs++;                            /* (FTP's reader and writer stop) */
+    k->gen = ++gens;                    /* (FTP's reader and writer of it stop) */
     changes++;                          /* (the explorer lists again) */
     if (fat_cache_disk == k)
         fat_cache_disk = 0;
     if (cwd.k == k)
         cwd.k = 0;
     nw_forget(k);
-    uprintf("device %u: the medium was changed (or taken out)\n", k->device);
+    uprintf("device %u: %s\n", k->device, why);
     io_said = "its medium was changed";
+}
+
+static int medium_changed(struct disk *k, u8 key, u8 asc)
+{
+    if (!((key == 6 && asc == 0x28) || (key == 2 && asc == 0x3A)))
+        return 0;
+    medium_forget(k, "the medium was changed (or taken out)");
     return 1;
+}
+
+/* a command whose try went unanswered is about to be sent again: why did the device not answer -- was it
+   "another medium" (6/28, the answer that was lost)?  Then that: 1.  0 send it again (REQUEST SENSE itself
+   is not asked about) */
+static int lost_answer_sense(struct disk *k)
+{
+    static int asking;
+    u8 key, asc;
+    if (asking || !k->ready)
+        return 0;
+    asking = 1;
+    int r = sense(k, &key, &asc) == 0 && medium_changed(k, key, asc);
+    asking = 0;
+    return r;
+}
+
+/* a READ or WRITE answered CHECK CONDITION: its sense into key, asc -- 0; -1 the medium is taken as another
+   one: it is ("medium changed") or why the command failed was lost (REQUEST SENSE not answered, or answered
+   "nothing": the reader's 6/28 may have been the answer lost) -- said, the disk looked at again by the next
+   command */
+static int check_condition(struct disk *k, u8 *key, u8 *asc)
+{
+    *key = *asc = 0;
+    if (sense(k, key, asc) < 0 || (!*key && !*asc)) {
+        medium_forget(k, "a command failed and its reason was lost -- the disk is looked at again (its medium may "
+                         "have been changed)");
+        return -1;
+    }
+    return medium_changed(k, *key, *asc) ? -1 : 0;
+}
+
+/* a hash of the medium's sector 0 and of sector sig_lba (its first volume's boot sector): what tells one card
+   from another of the same size (a disk signature, a volume serial number).  0, -1 not read */
+static u8 sig_buf[SECTOR];
+
+static int read_sectors(struct disk *k, u32 lba, u32 count, u8 *buf);
+
+static int medium_sig(struct disk *k, u32 *h)
+{
+    u32 x = 2166136261u;
+    for (int i = 0; i < 2; i++) {
+        if (i && !k->sig_lba)
+            break;
+        if (read_sectors(k, i ? k->sig_lba : 0, 1, sig_buf) < 0)
+            return -1;
+        for (u32 j = 0; j < SECTOR; j++)
+            x = (x ^ sig_buf[j]) * 16777619u;
+    }
+    *h = x;
+    return 0;
+}
+
+/* before a WRITE, when a command was sent again since the medium was last looked at (its answer lost: it may
+   have been the reader's "another medium" -- and a reader may forget that once its reset recovery is done):
+   is it the medium probe read?  0; -1 not (said: looked at again), or it does not read */
+static int medium_same(struct disk *k)
+{
+    u32 h;
+    k->resent = 0;
+    if (medium_sig(k, &h) < 0)
+        return -1;
+    k->resent = 0;
+    if (h != k->sig) {
+        medium_forget(k, "its first sectors are not what they were: another medium -- the disk is looked at again");
+        return -1;
+    }
+    return 0;
 }
 
 /* READ(10): `count` sectors (8 at most) from `lba` into buf; 0, -1 */
@@ -461,9 +554,10 @@ static int read_sectors(struct disk *k, u32 lba, u32 count, u8 *buf)
         if (n == -1)
             return -1;
         u8 key, asc;
-        if (sense(k, &key, &asc) < 0 || medium_changed(k, key, asc))
+        if (check_condition(k, &key, &asc) < 0)
             return -1;
         io_sense(key, asc);
+        k->resent = 1;
         if (key != 6)
             return -1;                  /* (a unit attention that is not a new medium -- a reset: once more) */
     }
@@ -698,6 +792,11 @@ static int probe(struct disk *k)
     k->ready = 1;
     k->problem = 0;
     find_volumes(k);
+    k->sig_lba = k->volumes ? k->vol[0].start : 0;
+    if (medium_sig(k, &k->sig) < 0)
+        k->resent = 1;                  /* (not read now: compared before the first WRITE) */
+    else
+        k->resent = 0;
     return 0;
 }
 
@@ -754,10 +853,10 @@ const char *disk_attach(u8 device, u8 iface, u8 in_ep, u8 out_ep, u16 maxp)
     if (!k)
         return "a disk, but the demo keeps 4 at most";
     changes++;
-    plugs++;
     for (unsigned i = 0; i < sizeof(*k); i++)
         ((u8 *)k)[i] = 0;
     k->used = 1;
+    k->gen = ++gens;
     k->device = device;
     k->iface = iface;
     k->in_ep = in_ep;
@@ -808,8 +907,8 @@ void disk_detach(u8 device)
     for (int i = 0; i < DISKS; i++)
         if (disks[i].used && disks[i].device == device) {
             disks[i].used = 0;
+            disks[i].gen = ++gens;
             changes++;
-            plugs++;
             if (fat_cache_disk == &disks[i])
                 fat_cache_disk = 0;
             if (cwd.k == &disks[i])
@@ -1576,7 +1675,7 @@ static int ntfs_parent(struct disk *k, const struct volume *v, u32 dir, u32 *up)
    seq_of the entry the directory was found through (NTFS compares it) */
 static const u8 lfn_at[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};   /* a long-name part's 13 characters */
 
-static int dir_walk(struct disk *k, const struct volume *v, u32 cluster, u32 seq, entry_fn fn, void *ctx)
+static int dir_walk(struct disk *k, const struct volume *v, u32 cluster, u32 dir_seq, entry_fn fn, void *ctx)
 {
     static struct entry e;
     const u8 *parts = lfn_at;
@@ -1584,7 +1683,7 @@ static int dir_walk(struct disk *k, const struct volume *v, u32 cluster, u32 seq
     u32 index = 0, steps = 0;
     fail_why = 0;
     if (v->fs == FS_NTFS)
-        return ntfs_dir_walk(k, v, cluster, seq, fn, ctx);
+        return ntfs_dir_walk(k, v, cluster, dir_seq, fn, ctx);
     e.size_hi = 0;
     if (!cluster && v->fat == 32)
         cluster = v->root_cluster;
@@ -1765,6 +1864,17 @@ static int find_in(struct disk *k, const struct volume *v, u32 dir, u32 seq, con
    there (said why) */
 static int quiet;                       /* walk_path says nothing (a path only tried) */
 
+/* entry_ok without a word: 0, -1 (fail_why) */
+static int entry_check(struct disk *k, const struct volume *v, const struct entry *e)
+{
+    if (v->fs != FS_NTFS || seq_of(e) == NO_SEQ)
+        return 0;
+    fail_why = 0;
+    if (mft_read(k, v, e->cluster, nrec) < 0 || (le16(nrec + 0x10) != seq_of(e) && stale(v)))
+        return -1;
+    return 0;
+}
+
 static int walk_path(struct disk *k, const struct volume *v, u32 dir, const char *from, const char *path,
                      struct entry *out, char *out_path)
 {
@@ -1810,8 +1920,8 @@ static int walk_path(struct disk *k, const struct volume *v, u32 dir, const char
         }
         int r;
         if (up && v->fs == FS_NTFS) {   /* (NTFS has no '..' entries: the parent its $FILE_NAME names) */
-            u32 parent = 0;
-            r = ntfs_parent(k, v, out->cluster, &parent) < 0 ? -1 : 1;
+            u32 parent = 0;             /* (the parent its record names: that record the entry's first) */
+            r = entry_check(k, v, out) < 0 || ntfs_parent(k, v, out->cluster, &parent) < 0 ? -1 : 1;
             f.found = *out;
             f.found.name[0] = f.found.name[1] = '.';
             f.found.name[2] = 0;
@@ -1956,14 +2066,11 @@ static const char *locate(const char *arg, struct disk **pk, struct volume **pv,
 }
 
 /* NTFS: the record entry e names is still that file's or directory's (its sequence number is the entry's)?
-   Asked where a command is about to go by the record alone -- the current directory -- or to make
+   Asked where a command is about to go by the record alone -- the current directory, '..' --, or to make
    something before it reads through the entry (cp -r): 0, -1 (said why, after `verb`) */
 static int entry_ok(struct disk *k, const struct volume *v, const struct entry *e, const char *verb)
 {
-    if (v->fs != FS_NTFS || seq_of(e) == NO_SEQ)
-        return 0;
-    fail_why = 0;
-    if (mft_read(k, v, e->cluster, nrec) < 0 || (le16(nrec + 0x10) != seq_of(e) && stale(v))) {
+    if (entry_check(k, v, e) < 0) {
         say_why(verb);
         return -1;
     }
@@ -2406,6 +2513,8 @@ static int write_sectors(struct disk *k, u32 lba, u32 count, const u8 *buf)
                     fs_name(&k->vol[i]));
             return -1;
         }
+    if (k->resent && medium_same(k) < 0)
+        return -1;                      /* (a command's answer was lost since: the medium compared first) */
     changes++;
     for (int attempt = 0; attempt < 2; attempt++) {
         int n = transfer(k, cb, 10, (u8 *)buf, count * SECTOR, 1);
@@ -2414,9 +2523,10 @@ static int write_sectors(struct disk *k, u32 lba, u32 count, const u8 *buf)
         if (n == -1)
             return -1;
         u8 key = 0, asc = 0;
-        if (sense(k, &key, &asc) < 0 || medium_changed(k, key, asc))
+        if (check_condition(k, &key, &asc) < 0)
             return -1;                  /* (a new medium is never written with what was known of the old one) */
         io_sense(key, asc);
+        k->resent = 1;
         if (key != 6) {
             if (key == 7)
                 k->wp = 2;              /* data protect: write-protected after all */
@@ -4650,6 +4760,43 @@ static u32 nw_node_put(const struct volume *v, u8 *o, u32 at, u32 limit, u32 lev
                                              write that puts it in the old one's place -- is kept for
                                              nw_index_commit (or let go: nw_index_drop) */
 
+/* the clusters a directory's index let go (it fits its record again), freed only when the whole change is
+   written -- the file's record last: a give-back that fails (a write) in between would leave the change
+   half made, and the volume read-only before its last write.  Two at most (a move: both directories) */
+static struct nrun nw_later_run[2][DIR_RUNS];
+static u32 nw_later_n[2], nw_later_count;
+
+static void nw_later_add(struct disk *k, struct volume *v, const struct runs *r)
+{
+    if (nw_later_count >= 2) {          /* (not so: freed now) */
+        struct runs now = {(struct nrun *)r->r, r->n, r->max};
+        nw_leaked(v, runs_trim(k, v, &now, 0));
+        return;
+    }
+    for (u32 i = 0; i < r->n; i++)
+        nw_later_run[nw_later_count][i] = r->r[i];
+    nw_later_n[nw_later_count++] = r->n;
+}
+
+/* the change is written: what its indexes let go, freed (a failure: said, a leak) */
+static void nw_later_free(struct disk *k, struct volume *v)
+{
+    for (u32 i = 0; i < nw_later_count; i++) {
+        struct runs r = {nw_later_run[i], nw_later_n[i], DIR_RUNS};
+        nw_leaked(v, runs_trim(k, v, &r, 0));
+    }
+    nw_later_count = 0;
+}
+
+/* the change failed after an index was written: what that index let go stays marked in use (said) */
+static void nw_later_drop(void)
+{
+    if (nw_later_count)
+        uprintf("%s: the clusters a directory's old index had stay marked in use (chkdsk /f in Windows frees "
+                "them)\n", nw_verb);
+    nw_later_count = 0;
+}
+
 /* an index prepared (NW_PREPARE): the directory's record as it will be (nw_pdir), its blocks' runs.  Kept
    apart from every work buffer: the caller changes another directory, or writes a file's record, before
    it commits this one */
@@ -4855,8 +5002,9 @@ static int nw_index(struct disk *k, struct volume *v, u32 dir, const struct idx_
     }
     if (nw_mft_put(k, v, dir, d) < 0)
         goto undo;
-    if (!p.level && had_ia)             /* a small index again: its blocks' clusters are free */
-        nw_leaked(v, runs_trim(k, v, &dir_runs, 0));
+    if (!p.level && had_ia)             /* a small index again: its blocks' clusters are free -- when the whole
+                                           change is written (nw_later_free) */
+        nw_later_add(k, v, &dir_runs);
     return 0;
 no_room:
     nw_err("NTFS: the directory's new index does not fit its record after all (nothing changed)");
@@ -4881,7 +5029,7 @@ static int nw_index_commit(struct disk *k, struct volume *v)
     if (nw_mft_put(k, v, dir, nw_pdir) < 0)
         return -1;
     if (nw_pend.shrunk)
-        nw_leaked(v, runs_trim(k, v, &runs, 0));
+        nw_later_add(k, v, &runs);
     return 0;
 }
 
@@ -4945,6 +5093,7 @@ static int nw_new(struct disk *k, struct volume *v, u32 dir, const char *name, i
     u64 now = nw_now(), alloc = runs ? (u64)(nruns ? runs[nruns - 1].vcn + runs[nruns - 1].len : 0) << (9 + v->csh)
                                      : (len + 7) & ~7u;
     struct idx_op op = {0, nw_ent, 0, 0};
+    nw_later_count = 0;
     if (nw_parent(k, v, dir, name, &dir_seq, &sec) < 0)
         return -1;
     for (int i = 0; i < 4; i++)
@@ -5014,6 +5163,7 @@ static int nw_new(struct disk *k, struct volume *v, u32 dir, const char *name, i
         nw_why = why;
         return -1;
     }
+    nw_later_free(k, v);
     return 0;
 }
 
@@ -5045,6 +5195,7 @@ static int nw_remove(struct disk *k, struct volume *v, const struct entry *e, in
         if (n)
             return nw_err("the directory is not empty (it has entries the demo does not list)");
     }
+    nw_later_count = 0;
     if (nw_index(k, v, parent, &op, NW_DO) < 0)
         return -1;
     /* it is out of its directory: gone.  What follows gives back what it had; where that fails it stays
@@ -5059,6 +5210,10 @@ static int nw_remove(struct disk *k, struct volume *v, const struct entry *e, in
     if (x == 0)
         x = nw_rec_free_runs(k, v, r, 1);
     nw_leaked(v, x);
+    if (x == 0)
+        nw_later_free(k, v);
+    else
+        nw_later_drop();
     return 0;
 }
 
@@ -5096,22 +5251,44 @@ static int nw_move(struct disk *k, struct volume *v, const struct entry *e, u32 
     if (!fn || !rec_put_resident(v, r, fn, 0x30, "", nw_key, klen, 1, 0))
         return nw_err("no room in its record for the longer name (the demo makes no attribute lists)");
     nw_entry_make(nw_ent, rec, le16(r + 0x10), nw_key, klen);
+    nw_later_count = 0;
     if (from == to) {                                   /* renamed where it is: one change of the index */
         struct idx_op op = {rec, nw_ent, 0, 0};
         if (nw_index(k, v, to, &op, NW_DO) < 0)
             return -1;
-        return nw_mft_put(k, v, rec, r);
+        if (nw_mft_put(k, v, rec, r) < 0) {
+            nw_later_drop();
+            return nw_err("a write failed: the file has its new name in the directory, but its record was not "
+                          "told so -- chkdsk /f in Windows puts that right; the volume is read-only from now on");
+        }
+        nw_later_free(k, v);
+        return 0;
     }
     struct idx_op in = {0, nw_ent, 0, 0}, out = {rec, 0, 0, 0};
     if (nw_index(k, v, to, &in, NW_PREPARE) < 0)
         return -1;
     if (nw_index(k, v, from, &out, NW_DO) < 0) {        /* (it stays where it is) */
+        int cut = v->nw_state == NW_REFUSED && v->nw_why == nw_failed;
         nw_index_drop(k, v);
+        if (cut)                        /* (the failed write may have been the old directory's record: done) */
+            return nw_err("a write failed while the file was taken out of its directory: it is still there -- "
+                          "or, when 'ls' shows it in neither directory, in none (its record and bytes are kept: "
+                          "chkdsk /f in Windows puts it back, in found.000); the volume is read-only from now on");
         return -1;
     }
-    if (nw_index_commit(k, v) < 0)
-        return -1;                                      /* (a write failed: it is in no directory now) */
-    return nw_mft_put(k, v, rec, r);
+    if (nw_index_commit(k, v) < 0) {
+        nw_later_drop();
+        return nw_err("a write failed after the file had left its directory: it is in no directory now (or "
+                      "already in the new one) -- its record and bytes are kept: chkdsk /f in Windows puts it "
+                      "back, in found.000; the volume is read-only from now on");
+    }
+    if (nw_mft_put(k, v, rec, r) < 0) {
+        nw_later_drop();
+        return nw_err("a write failed: the file is in its new directory, but its record was not told so -- "
+                      "chkdsk /f in Windows puts that right; the volume is read-only from now on");
+    }
+    nw_later_free(k, v);
+    return 0;
 }
 
 /* -- 'ntfs' -- */
@@ -5848,6 +6025,7 @@ static int nw_set_data(struct wfile *f)
     for (u32 at = 0; (at = attr_next(v, r, at));)
         if (le32(r + at) == 0x30)
             copy(r + at + le16(r + at + 0x14) + 8, dup, 0x34);
+    nw_later_count = 0;
     if (nw_index(k, v, f->nt_dir, &op, NW_PREPARE) < 0)
         return -1;
     if (nw_mft_put(k, v, rec, r) < 0) {
@@ -5855,10 +6033,13 @@ static int nw_set_data(struct wfile *f)
         return -1;
     }
     f->nkeep = f->nalloc;               /* (the record names the new clusters: they are the file's from here) */
-    if (nw_index_commit(k, v) < 0)
+    if (nw_index_commit(k, v) < 0) {
+        nw_later_drop();
         return -1;                      /* (a write failed: the entry still shows the old size) */
+    }
     if (had)
         nw_leaked(v, nw_attr_free(k, v, nw_had, 1));
+    nw_later_free(k, v);
     return 0;
 }
 
@@ -5899,8 +6080,15 @@ static int nw_close(struct wfile *f)
 static void nw_abort(struct wfile *f)
 {
     struct runs runs = {f->nrun, f->nruns, WF_RUNS};
-    if (f->nt == 2 && nw_use(f->k, f->v) == 0)
-        nw_back(f->v, runs_trim(f->k, f->v, &runs, f->nkeep));
+    u32 taken = runs_clusters(&runs);
+    if (f->nt == 2 && taken > f->nkeep) {
+        if (nw_use(f->k, f->v) == 0)
+            nw_back(f->v, runs_trim(f->k, f->v, &runs, f->nkeep));
+        else if (f->k->ready)           /* (read-only now -- something found wrong, a write that failed: what the
+                                           write had taken cannot be given back) */
+            uprintf("%s: the %u clusters it had taken stay marked in use (the volume is read-only now: chkdsk "
+                    "/f in Windows frees them)\n", f->nverb, taken - f->nkeep);
+    }
     f->nt = 0;
 }
 
@@ -6546,15 +6734,36 @@ int disk_read_head(const char *arg, u8 *buf, u32 max, u32 *size)
 static struct runs stream_runs = {(struct nrun *)KSEG0(NTFS_RUNS2_PHYS), 0, FILE_RUNS};
 static u8 stream_res[REC_MAX];
 static struct reader stream;
-static u32 stream_plugs;
+static u32 stream_gen;
 static struct wfile up;
 static int up_open;
-static u32 up_plugs;
+static u32 up_gen;
+
+/* the disk is the one it was when generation `gen` was noted (plugged in, its medium the same)? */
+static int disk_same(const struct disk *k, u32 gen)
+{
+    return k && k->used && k->gen == gen;
+}
 
 /* is an FTP upload under way on that volume?  (read_only: every other writer of it waits) */
 static int upload_on(const struct disk *k, const struct volume *v)
 {
-    return up_open && plugs == up_plugs && up.k == k && up.v == v;
+    return up_open && disk_same(up.k, up_gen) && up.k == k && up.v == v;
+}
+
+/* is there a file at `arg`?  Nothing is said when there is none (a path only tried: a game's save file) */
+int disk_exists(const char *arg)
+{
+    struct disk *k;
+    struct volume *v;
+    static struct entry e;
+    u32 dir;
+    const char *from;
+    quiet = 1;
+    const char *path = locate(arg, &k, &v, &dir, &from);
+    int found = path && walk_path(k, v, dir, from, path, &e, 0) == 0 && !(e.attr & 0x10);
+    quiet = 0;
+    return found;
 }
 
 /* the entry at `arg` (a file, a directory, a volume's root) into *o: 0, -1 (said why) */
@@ -6603,7 +6812,7 @@ int disk_stream_open(const char *arg, u64 *size)
         stream.k = 0;
         return -1;
     }
-    stream_plugs = plugs;
+    stream_gen = k->gen;
     *size = stream.size;
     return 0;
 }
@@ -6613,7 +6822,7 @@ int disk_stream_read(u8 *buf, u32 max)
 {
     if (!stream.k)
         return 0;
-    if (plugs != stream_plugs) {
+    if (!disk_same(stream.k, stream_gen)) {
         stream.k = 0;
         uprintf("its disk went away\n");
         return -1;
@@ -6635,13 +6844,13 @@ void disk_stream_close(void)
 /* `arg` opened for writing (made, emptied, or added to with `append`): 0, -1 (said why) */
 int disk_upload_open(const char *arg, int append)
 {
-    if (up_open && up.nt && plugs == up_plugs)
+    if (up_open && up.nt && disk_same(up.k, up_gen))
         wf_abort(&up);                  /* (an NTFS upload never closed: the clusters it took given back) */
     up_open = 0;
     if (wf_open(&up, arg, append, append ? "APPE" : "STOR") < 0)
         return -1;
     up_open = 1;
-    up_plugs = plugs;
+    up_gen = up.k->gen;
     return 0;
 }
 
@@ -6650,7 +6859,7 @@ int disk_upload_put(const u8 *data, u32 n)
 {
     if (!up_open)
         return -1;
-    if (plugs != up_plugs) {
+    if (!disk_same(up.k, up_gen)) {    /* (its own disk went, or its medium: nothing of it is written) */
         up_open = 0;
         uprintf("its disk went away\n");
         return -1;
@@ -6678,7 +6887,7 @@ int disk_upload_close(void)
     if (!up_open)
         return -1;
     up_open = 0;
-    if (plugs != up_plugs) {
+    if (!disk_same(up.k, up_gen)) {
         uprintf("its disk went away\n");
         return -1;
     }

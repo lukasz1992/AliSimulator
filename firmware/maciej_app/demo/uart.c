@@ -87,6 +87,7 @@ void uart_putc(char c)
     UART[0] = (u8)c;
     console_putc(c);                    /* the TV's console shows the same */
     telnet_putc(c);                     /* and a telnet client (net.c) */
+    http_putc(c);                       /* and the web page's console (http.c) */
 }
 
 void uart_puts(const char *s)

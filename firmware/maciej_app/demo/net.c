@@ -8,7 +8,8 @@
      - network loading on port 6464: a new build into RAM and run, instead
        of a flash (tools/maciej_netload.py);
      - the time of day from NTP: once after DHCP, and with 'ntp [server]';
-       'date' shows it in UTC and in Polish time (CET / CEST).
+       'date' shows it in UTC and in Polish time (CET / CEST);
+     - the FTP server (ftp.c) and the web page (http.c).
    eth_poll calls net_poll on its passes (the main loop): the servers run
    there; a command's waits call eth_service.
    On the box: a telnet client's typed character is echoed in 2 ms; a
@@ -255,11 +256,14 @@ static void tn_input(void)
    come back to the main loop) the network is polled here too, every 10 ms */
 void net_uart_poll(void)
 {
-    if (tn < 0)
+    int web = started && http_clients();        /* (the web page's requests go on while a command runs too) */
+    if (tn < 0 && !web)
         return;
     if (in_command && !eth_inside() && !tn_flushing && now_ms() - tn_polled >= 10) {
         tn_polled = now_ms();
         eth_service();
+        if (web && !eth_inside())
+            (void)http_poll(1);
     }
     if (tn >= 0)
         tn_input();
@@ -339,9 +343,13 @@ static const char *tn_poll(void)
    answers one line, "OK ..." or "ERR ...", and closes; after OK it runs the image as the bootloader would: copied
    to 0x80000200, the caches made to agree, a jump to its start.  The copy overwrites the running demo, so a
    small position-independent stub does it from NETLOAD_STUB_PHYS, uncached (KSEG1: no I-cache lines to worry
-   about), then writes the D-cache's lines of the new image back to RAM and drops the I-cache's (16-byte steps:
-   the S3811's lines are 16 bytes or more), then jumps.  The watchdog keeps running: the new image starts it
-   again; one that hangs is reset by it, into the flashed demo. */
+   about), then writes back and drops EVERY line of the D-cache and drops every line of the I-cache, by index,
+   then jumps.  (Only the new image's own lines is not enough: the old demo's dirty lines elsewhere -- its BSS,
+   buffers the USB controller reads or fills by DMA -- stayed in the cache and were written back over the new
+   demo's data later, or read instead of what a DMA had put in RAM: web uploads right after a netload of a
+   build laid out differently came out with runs of a few hundred wrong bytes.  A boot from flash never had
+   it: the bootloader starts the caches afresh.)  The watchdog keeps running: the new image starts it again;
+   one that hangs is reset by it, into the flashed demo. */
 __asm__(".section .text\n"
         ".align 2\n"
         ".set push\n"
@@ -358,8 +366,10 @@ __asm__(".section .text\n"
         "    sw    $t0, 0($a0)\n"
         "    bnez  $a2, 1b\n"
         "    addiu $a0, $a0, 4\n"
-        "2:  cache 0x15, 0($t1)\n"              /* Hit_Writeback_Inv_D */
-        "    cache 0x10, 0($t1)\n"              /* Hit_Invalidate_I */
+        "    lui   $t1, 0x8000\n"               /* every line of both caches, by index: KSEG0 0x80000000.. */
+        "    lui   $t3, 0x8001\n"               /* ..0x80010000 (64 KB, 16-byte steps: at least any cache's size */
+        "2:  cache 0x01, 0($t1)\n"              /* and ways, at most its line) -- Index_Writeback_Inv_D */
+        "    cache 0x00, 0($t1)\n"              /* Index_Invalidate_I */
         "    addiu $t1, $t1, 16\n"
         "    sltu  $t0, $t1, $t3\n"
         "    bnez  $t0, 2b\n"
@@ -1062,6 +1072,9 @@ const char *net_poll(void)
     s = ftp_poll();
     if (s)
         return s;
+    s = http_poll(0);
+    if (s)
+        return s;
     return ntp_auto();
 }
 
@@ -1077,4 +1090,5 @@ void cmd_netstat(int argc, char **argv)
         uprintf("telnet console (port %u): no client\n", TELNET_PORT);
     uprintf("netload (port %u): python tools/maciej_netload.py <this box's address> [app.bin]\n", NETLOAD_PORT);
     ftp_status();
+    http_status();
 }

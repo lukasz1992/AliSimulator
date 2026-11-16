@@ -16,8 +16,8 @@
    A key going down becomes what the UART would deliver for it (US layout;
    Enter = CR, Backspace = BS, Escape = Ctrl-C, Up / Down = ESC [ A / B,
    PgUp / PgDn = ESC [ 5 ~ / ESC [ 6 ~ (the TV's console looks back),
-   Right / Left / Home / End = ESC [ C / D / H / F (the explorer's; the
-   command line ignores them), Ctrl with a letter = its control code); a
+   Right / Left / Home / End = ESC [ C / D / H / F (the command line's
+   cursor, the explorer's), Ctrl with a letter = its control code); a
    held key repeats after 500 ms,
    25 times a second.  Caps Lock is kept here (the keyboard's LED stays as it
    is: the demo sends no output reports).  'usb kbd raw on' prints every
@@ -123,11 +123,11 @@ static int key_down(u8 k, u8 mods)
     case 0x51: push(0x1b); push('['); push('B'); return 1;   /* Down */
     case 0x4B: push(0x1b); push('['); push('5'); push('~'); return 1;   /* PgUp: the console looks back */
     case 0x4E: push(0x1b); push('['); push('6'); push('~'); return 1;   /* PgDn */
-    case 0x4F: push(0x1b); push('['); push('C'); return 1;   /* Right, Left, Home, End: the explorer's (the */
-    case 0x50: push(0x1b); push('['); push('D'); return 1;   /* command line passes them over) */
+    case 0x4F: push(0x1b); push('['); push('C'); return 1;   /* Right, Left, Home, End: the cursor (the */
+    case 0x50: push(0x1b); push('['); push('D'); return 1;   /* command line's, the explorer's) */
     case 0x4A: push(0x1b); push('['); push('H'); return 0;
     case 0x4D: push(0x1b); push('['); push('F'); return 0;
-    case 0x4C: push(0x1b); push('['); push('3'); push('~'); return 1;   /* Delete (the command line: as Backspace) */
+    case 0x4C: push(0x1b); push('['); push('3'); push('~'); return 1;   /* Delete (the character at the cursor) */
     case 0x49: push(0x1b); push('['); push('2'); push('~'); return 0;   /* Insert (the explorer pastes) */
     case 0x54: push('/'); return 1;                       /* keypad / * - + Enter . */
     case 0x55: push('*'); return 1;
@@ -153,8 +153,18 @@ static void on_report(const u8 *r, int n)
     for (int i = 0; i < n && i < 8; i++)
         now[i] = r[i];
     reports++;
-    if (now[2] == 0x01)
-        return;                                           /* ErrorRollOver: too many keys at once */
+    /* Not a report: shorter than the endpoint's packets (a boot keyboard's are 8 bytes), or a key code that
+       is none (1 to 3: ErrorRollOver -- too many keys at once -- and two more errors).  On the box endpoint D
+       once handed over 4 bytes, 29 86 30 01, while a serial adapter behind the same hub's translator was set
+       up again at a new address: taken as a report they were Shift + ] held for good -- a '}' repeated until
+       the next real report, the command line unusable */
+    if (n < (ep_size < 8 ? ep_size : 8)) {
+        errors++;
+        return;
+    }
+    for (int i = 2; i < 8; i++)
+        if (now[i] >= 0x01 && now[i] <= 0x03)
+            return;
     for (int i = 2; i < 8; i++) {
         u8 k = now[i];
         if (k < 0x04 || held_key(held, k))
@@ -421,4 +431,32 @@ const char *kbd_poll(void)
         repeat_at = now + REPEAT_PERIOD_MS;
     }
     return say;
+}
+
+/* is the key with that HID usage among the keys of the last report? (play.c: a game's buttons are held,
+   not typed) */
+int kbd_held(u8 usage)
+{
+    if (!active)
+        return 0;
+    for (int i = 2; i < 8; i++)
+        if (held[i] == usage)
+            return 1;
+    return 0;
+}
+
+/* the keys held now as HID usages, the modifiers too (0xE0..0xE7 for their bits: a computer's keyboard in a
+   game, the Spectrum's); how many */
+int kbd_held_all(u8 *usages, int max)
+{
+    int n = 0;
+    if (!active)
+        return 0;
+    for (int b = 0; b < 8 && n < max; b++)
+        if (held[0] & (1u << b))
+            usages[n++] = (u8)(0xE0 + b);
+    for (int i = 2; i < 8 && n < max; i++)
+        if (held[i] > 3)                                  /* (1..3: the keyboard's error codes) */
+            usages[n++] = held[i];
+    return n;
 }

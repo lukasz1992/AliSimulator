@@ -83,7 +83,16 @@ most of it the four recorded display set-ups; no SDK, no RTOS, interrupts
 masked, everything polled) for the same bootloader. It prints the same banner and `Version: v4`, then:
 
 - **Command line** on the UART (115200 8E1): whole lines ended by Enter,
-  echo, Backspace, Ctrl-C / Ctrl-U, Up/Down history (8 lines), prompt
+  echo, a line editor (Left / Right, Home / End, Ctrl- or Alt-arrows by a
+  word, Backspace, Delete, Ctrl-W / Ctrl-U / Ctrl-K cut and Ctrl-Y puts
+  back, Ctrl-L clears the screen, Ctrl-C drops the line; the TV's console
+  follows the cursor through ESC [ n C / D), a history of 64 commands
+  (repeats moved to its end, a line typed with a space first not kept;
+  Up / Down recall the ones starting with what is typed, Ctrl-R searches,
+  `!!`, `!n`, `!-n`, `!text`; `history [n | -c]`), Tab completion of a
+  command's name, its first word's choices as its help names them
+  (`rf <init|tune|...>`) and a disk's file or directory names (the
+  candidates listed when several fit), prompt
   `m3801> ` (with a current directory: `m3801 3:/Docs> `). `help` lists the
   commands: `version`, `ping` (`pong v4`),
   `info` (chip ID 0x3811 = S3811 and its revision byte, CPU clock from the
@@ -178,7 +187,7 @@ masked, everything polled) for the same bootloader. It prints the same banner an
 - **USB disks**: a stick, a card reader or a USB disk (mass storage with
   SCSI commands over the bulk-only transport) is found as it is set up --
   its name, size, partitions (MBR or GPT) and file systems -- and `disks`
-  lists them. On FAT12, FAT16 and FAT32 (long file names too; read only)
+  lists them. On FAT12, FAT16, FAT32 and NTFS (long file names too)
   `ls [n:][/path]` lists a directory -- dates, sizes, names -- and `cat
   [n:]/path` shows a text file (a binary one: its first 256 bytes in hex;
   Ctrl-C on the UART stops it); `sector [n:]<number>` shows any sector in
@@ -216,25 +225,55 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   full, an entry deleted before its clusters are freed, FAT32's FSInfo
   counts made unknown; a write-protected disk (MODE SENSE) is not written.
   The box has no clock: what is made is dated 2026-11-13 12:00. NTFS is
-  read (never written): `ls`, `cd`, `cat`, `cp` onto a FAT disk, `sum
+  read: `ls`, `cd`, `cat`, `cp` onto a FAT disk, `sum
   [n:]path` (a file read to its end: size, CRC-32, speed) and the explorer
   go through its MFT -- records with their fixups, resident and
   non-resident attributes, data runs (sparse ones as zeros), attribute
   lists for files in many pieces, directories' B-tree indexes ($INDEX_ROOT
   and INDX blocks), names as ASCII ('?' for the rest), dates in Polish
-  time; compressed and encrypted files are refused, and every writing
-  command (and write_sectors itself) refuses an NTFS volume. exFAT is
+  time; compressed and encrypted files are refused. NTFS is written too
+  (`disk.c`, "NTFS, written"), by the same commands as FAT -- `mkdir`,
+  `rmdir`, `rm [-r]`, `touch`, `cp [-r]`, `mv`, `> file`, the explorer's keys
+  and FTP uploads -- but only a volume Windows closed cleanly: its journal
+  ($LogFile) empty or clean, none of the volume's dirty / upgrade / chkdsk
+  flags, NTFS 3.x, file records of 1 KB or more, $MFTMirr agreeing with
+  $MFT, no hibernation file in use. `ntfs [n:]` shows the volume's geometry,
+  its journal's state and that verdict; `ntfs n: reset-journal` empties the
+  journal as ntfs-3g does (a volume Windows left mounted, e.g. fast start-up,
+  is refused). Every NTFS write goes through one function: records and
+  INDX blocks are written with their update-sequence fixups, $MFTMirr with
+  record 0..3, clusters taken from $Bitmap, records from $MFT's bitmap
+  ($MFT grown when it is full), a directory's index rebuilt into spare
+  blocks and switched over by one record write; a move takes the entry out
+  of the old directory first, a crash between writes leaves at worst a file
+  in no directory (chkdsk puts it in found.000), never two entries. Names get
+  a Win32 name (and a DOS one is kept with it), case-insensitive clashes
+  are refused, as are hard links, files with $OBJECT_ID (rm), compressed,
+  encrypted or sparse files. A write that fails makes the volume read-only
+  until `ntfs n:` looks at it again; a card changed in its reader (sense
+  6/28) is looked at anew before anything is written to it. exFAT is
   listed but not read; only a device's first logical unit is used, and up
-  to four disks. A 64 GB stick (090c:2000) answers no command now and then
-  -- most first commands after a pause, about one READ in ten back to back
-  -- and each at once after a reset recovery: a read waits 100 ms before
-  that (its reads take 2 ms), twice, then 10 s; so its files read at about
-  110 KB/s, the card's FAT at 2 MB/s.
+  to four disks. The 64 GB stick (090c:2000) used to lose its first command
+  after a pause: the cause was the controller (see "USB" below, devices at
+  addresses 8 and up), not the stick.
 - **USB serial ports**: a GSM / LTE module's ports (vendor-class interfaces
   with a bulk IN and a bulk OUT endpoint, of the module makers Linux's
   option driver knows: SIMCom, Quectel, Huawei, ZTE, Qualcomm, Telit,
-  Sierra Wireless, Fibocom) and CDC ACM devices become `ttyUSB<n>` /
-  `ttyACM<n>` as they are set up (DTR and RTS on); `tty` lists them. `at
+  Sierra Wireless, Fibocom), CDC ACM devices and USB-serial chips -- WCH
+  CH340 / CH341 in serial mode (1a86:7523, 5523), Silicon Labs CP210x,
+  FTDI FT232R / FT-X / FT2232 / FT4232 / FT232H, Prolific PL2303 (HX) --
+  become `ttyUSB<n>` / `ttyACM<n>` as they are set up (DTR and RTS on); a
+  chip is set up as Linux's driver for it does (CH34x: version, SERIAL_INIT,
+  divisor and prescaler registers; CP210x: IFC_ENABLE, SET_BAUDRATE,
+  SET_LINE_CTL, SET_MHS; FTDI: RESET, the fractional baud divisor,
+  SET_DATA, SET_MODEM_CTRL, its two status bytes stripped from every IN
+  packet; PL2303: the vendor start-up sequence, then CDC's SET_LINE_CODING)
+  at 115200 8N1, and `stty [n] [baud]` shows or sets the rate (CDC ACM gets
+  SET_LINE_CODING). On the box a CH340 (1a86:7523) took 300 to 2000000
+  baud; its data was not tried (nothing on its pins). A CH341A in its I2C /
+  SPI mode (1a86:5512, a 24xx / 25xx programmer) is only named. Control
+  transfers now carry OUT data too (written into the RTL8153's multicast
+  register and read back on the box). `tty` lists the ports. `at
   <command>` sends one AT command to the first port named "... AT ..." --
   `AT` put in front when it is missing (`at +csq`, `at i`), the rest as
   typed, quotes kept (`at +cpin="1234"`) -- and shows the answer up to its
@@ -273,6 +312,20 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   half second) the frames are read every 250 ms instead, and only between
   its reports, when its IN is not half way through the hub's split
   transaction: the adapter keeps them meanwhile.
+- **The LTE module's network link (RNDIS)**: a GSM / LTE module's RNDIS
+  function (the A7670E's interfaces 0 and 1: control e0/01/03 or 02/02/ff,
+  data 0a with a bulk IN and OUT) is set up as Linux's rndis_host does --
+  INITIALIZE (transfers of 1600 bytes, one frame each), QUERY of its MAC
+  address, SET of the packet filter, each over endpoint 0
+  (SEND_ENCAPSULATED_COMMAND, then GET_ENCAPSULATED_RESPONSE asked until
+  the answer is there) -- and carries Ethernet frames in RNDIS packet
+  messages. One link carries the network at a time: the Ethernet adapter's
+  when there is one; the module's when there is none, when the adapter is
+  unplugged, or when it gets no DHCP answer -- so `ping`, `wget`, NTP,
+  telnet, FTP and netload go through whichever is there; `ifconfig` says
+  which and names the other. Checked in the emulator (its VirtualModem's
+  RNDIS function with a small network behind it: DHCP, ARP, ping); the real
+  module was not plugged in.
 - **TCP and what runs on it** (`tcp.c`, `net.c`): four connections, MSS
   1460, go-back-N retransmission (400 ms doubling to 3.2 s), FIN and RST
   both ways; while a connection is busy the frames are read every pass.
@@ -299,8 +352,8 @@ masked, everything polled) for the same bootloader. It prints the same banner an
     450 and is tried again), no password: its root
     lists every disk's volumes as directories ("4 PHONE CARD", "9 Windows
     10": the number as `cd` takes it, and the label); files are read from
-    FAT and NTFS, and FAT is written (STOR, APPE, DELE, MKD, RMD, RNFR /
-    RNTO) -- NTFS answers read-only. PASV / EPSV (data ports 50021 and
+    FAT and NTFS, and written (STOR, APPE, DELE, MKD, RMD, RNFR / RNTO; NTFS
+    when the demo writes it, see USB disks). PASV / EPSV (data ports 50021 and
     50022, a connection taken from its client's address only) and PORT /
     EPRT (to the client's address only; Windows' own firewall cuts a
     connection that uses them, so they were not tried on the box), LIST /
@@ -319,6 +372,207 @@ masked, everything polled) for the same bootloader. It prints the same banner an
     empties it first (as most servers do); writing the same disk from the
     shell while an upload runs is not guarded. The explorer lists a
     directory again at most once a second while a disk is being written.
+  - A web page on port 80 (`http.c`, the page itself `web.html`, built in
+    by `web.S`'s `.incbin`), no password, for any browser on the network
+    (a phone's too: the layout narrows to one column): the disks' files
+    (listed, downloaded, uploaded by a button or by dropping files on the
+    list, renamed, deleted, new folders; pictures and text files opened in
+    the browser), the TV's picture (a BMP of what the display shows -- the
+    test screen or the console -- 640 x 360 about once a second, or the
+    whole 1280 x 720), a remote on the page (arrows, OK, Esc, Tab, Space,
+    A / B for the games, Ctrl-C) and the command line (a small terminal fed
+    from a 64 KB copy of everything printed -- `uart_putc` -> `http_putc`
+    -- by a long poll, typed into through uart.c's injection queue as the
+    telnet console is; a line box under it for phones' keyboards). Its API:
+    `GET /api/info`, `/api/ls?p=`, `/api/get?p=[&inline=1]`,
+    `PUT /api/put?p=` (Content-Length), `POST /api/rm|rmdir|mkdir?p=`,
+    `/api/mv?p=&to=`, `GET /api/screen.bmp[?half=1]`, `/api/out?from=`
+    (waits up to 15 s for new output), `POST /api/in` -- errors as JSON
+    `{"error": ...}` with the disk.c message. HTTP/1.1 with keep-alive
+    (a connection a request would leave tcp.c's connections in TIME_WAIT),
+    six connections (a browser's per host; tcp.c has 12 now, and 8
+    listening ports). It runs in the main loop and, while a command runs,
+    from `net_uart_poll` (as the telnet console's input), where everything
+    but the disks goes on -- the picture, the keys, the output -- and the
+    disks answer 503 ("a command is running") or, for a transfer under
+    way, wait. One file moves at a time between it and FTP (disk.c's one
+    reader and one writer): the other gets 503 / 450. An upload is written
+    in whole 4 KB pieces (the bytes that came with the request's header
+    put every piece after them across sectors: 0.08 MB/s, then 0.11 - 0.14
+    as FTP's 0.13 - 0.16 on the card the same day); one cut short is
+    deleted. On the box, from a PC (a Python test of every request, not in
+    the repository): downloads 0.74 - 0.99 MB/s, the 640 x 360 picture in
+    0.7 - 1.4 s, 1280 x 720 in 2.1 s; typed `version` answered through the
+    page; a game started from the page's command line, its picture taken
+    while it ran, the disks refused meanwhile, Ctrl-C from the page ended
+    it. The emulator has no network adapter, so the suite does not reach
+    it.
+  - More game players, each a machine in its own file that knows nothing of
+    the box (play.c hosts them, as the NES and the Game Boy): `z80.c`, a Z80
+    core (every opcode incl. the undocumented ones and MEMPTR; zexdoc and
+    zexall pass completely on a PC, and Patrik Rak's z80test 1.2a z80full /
+    z80doc / z80flags / z80docflags / z80ccf / z80memptr on the emulated
+    Spectrum), shared by `sms.c` -- the Sega Master System and Game Gear
+    (mode 4 picture chip, line interrupts, H / V counters, Sega and
+    Codemasters mappers, cartridge RAM; FluBBa's VDPTEST: all data-port and
+    misc tests, 18 of 20 sprite tests) -- and `zx.c`, the ZX Spectrum 48K
+    (the ULA's picture with its border, contended memory, the keyboard
+    matrix from a USB keyboard's held keys, Kempston joystick; .sna, .z80
+    v1-3, .tap and .tzx loaded at once through a trap on the ROM's LD-BYTES
+    with LOAD "" typed by itself; the ROM is the user's 48.rom file, not in
+    the demo); `a26.c`, the Atari 2600 (6507 with decimal mode and the
+    stable undocumented opcodes -- Klaus Dormann's functional and decimal
+    tests pass --, the TIA per colour clock caught up lazily, the RIOT, the
+    bank-switching boards 2K / 4K / F8 / F6 / F4 / Superchip / FE / E0 /
+    3F / E7 / FA; pixel-exact against Stella 7.0 on 17 homebrew title
+    screens and hand-made TIA timing / board carts). play.c gained separate
+    horizontal and vertical enlargement (the 2600: 5 x 3), a picture whose
+    size a game changes (the Master System's 224-line mode) and a computer's
+    keyboard (every held key of the USB keyboard to the Spectrum,
+    characters typed on the UART typed on it). On the box: a Master System
+    or Game Gear frame 3.5 - 5.5 ms to run + 1 - 2 ms to draw, a Spectrum
+    frame 4 ms + 2.5 ms (of 20 ms), a 2600 frame 3.5 - 5.5 ms + 1 ms. The
+    suite checks each with a program made in the test (a stand-in for the
+    Spectrum's ROM).
+  - The RF front end of the Comsat TE 1050 HD (`rf.c`, command `rf`): the
+    MaxLinear MxL603 tuner on SCB0 (I2C 0x60; found as MaxLinear's
+    MxLWare603 compiled into dump.bin, its tables at 0x8073282C /
+    0x80732908; 16 MHz crystal, IF 4.57 MHz) and the S3811's own COFDM
+    demodulator at 0xB803E000 (about 20 writes, no firmware: the IF word
+    frac(IF / 1.6875 MHz) x 2^24 at 0x14..0x16, the bandwidth in 0x13,
+    acquisition through 0x00, lock bits in 0x1D, the IF AGC level at
+    0x30 / 0x31, error counters 0x09..0x0D), the stream routed through the
+    TSI into DMX0's ring -- all as dump.bin's own driver writes them, its
+    I2C transactions and demodulator writes checked byte for byte against
+    dump.bin's in the emulator. `rf scan`, `rf services` (PAT / SDT / PMT)
+    and `rf ts` (a PID table, or a .ts file) work in the emulator. On the
+    box the tuner answers (chip id 2, version 2) and locks, the demodulator
+    searches -- but Poland's multiplexes are DVB-T2 now and the S3811 is
+    DVB-T only, so nothing locks there. `rf spectrum` draws the aerial's
+    level across 174 - 862 MHz on the TV (the tuner stepped every 4 MHz,
+    the demodulator's IF AGC read after 160 ms; shorter waits read the AGC
+    before it settles): on the box it shows two multiplexes (UHF 45/46 and
+    55) and the LTE-800 band.
+  - A Commodore 64 (PAL) player (`c64.c`, command `c64`, the explorer's .prg /
+    .t64 / .d64 / .p00): the 6510 (a26.c's 6507 grown into it -- the $00/$01
+    port, every undocumented opcode; Klaus Dormann's tests pass), the PLA's
+    banking, the VIC-II line by line (bad lines taking 40 cycles, raster
+    interrupts, every graphics mode, scrolling, 38 / 24 columns, the 8
+    sprites with their collisions; a line drawn at cycle 36), both CIAs
+    (timers worked out from elapsed cycles when the program touches them,
+    TOD, keyboard, joysticks, the VIC bank, NMI / RESTORE), SID voice 3's
+    oscillator and envelope (read for random numbers; no sound). LOAD is
+    trapped in the KERNAL and done at once from the .t64 or .d64, with a
+    simulated 1541 at the KERNAL's serial-bus routines (OPEN / CHKIN /
+    CHRIN, channel 15); the traps only switch on for the three standard
+    KERNAL revisions. A program is typed in as LOAD"*",8,1 and RUN (or
+    SYS) once BASIC waits for keys. The ROMs are the user's files
+    kernal.rom / basic.rom / chargen.rom, not in the demo. Wolfgang Lorenz's
+    suite: 245 of 264 (the 19 failing test cycle-exact CIA and interrupt
+    timing). On the box a frame takes 3 - 4 ms to run + 3 - 5 ms to draw
+    (the 352 x 240 picture three times as large); Magicland Dizzy (a .t64)
+    plays through its crack intro and trainer menu into the game, Hessian
+    loads from its .d64. The suite checks it with stand-in ROMs made in the
+    test.
+  - An Amiga 500 (OCS, PAL) player (`amiga.c`, command `amiga`, the
+    explorer's .adf): a 68000 interpreter (a 64K opcode table built at
+    start, every instruction, exceptions, the 7 interrupt levels, the
+    manual's cycle counts; all 260,664 SingleStepTests m68000 cases pass
+    on a PC), 512 KB of chip RAM + 512 KB at 0xC00000, Agnus (copper
+    interleaved with the 68000, blitter with every minterm, fill and line
+    mode, bitplane and sprite DMA, beam counters), Denise (1 - 6 planes,
+    low / high resolution, dual playfield, HAM, EHB, scroll, priorities, 8
+    sprites; colour changes from the copper where they fall in the line),
+    Paula (interrupts, floppy DMA from MFM tracks built from the .adf as
+    AmigaDOS writes them, the sound's interrupts without the sound), both
+    CIAs (timers, TOD, keyboard handshake, drive lines). The picture is
+    352 x 272 (PAL's 320 x 256 with overscan) shown twice as large. The
+    Kickstart is the user's kick.rom, or AROS's free aros-rom.bin +
+    aros-ext.bin. On the box a frame takes 5.5 - 9 ms to run + 3 - 4 ms to
+    draw; Magicland Dizzy (the TRSi crack) boots with AROS into the game.
+    The suite checks it with a stand-in Kickstart made in the test.
+  - A DOS PC player (`dos.c`, command `dos`, the explorer's .exe / .com): an
+    80286 in real mode (lazy flags), 640 KB, the 8259, the 8253 (a new count
+    in modes 2 / 3 taking effect at the period's end, as the chip does:
+    Magicland Dizzy's sound driver times its delays with it), the keyboard
+    controller and its interrupt, a VGA (text modes with a 5 x 7 font in 8 x 8
+    cells, CGA 4 / 5 / 6, the planar EGA modes with latches and every write /
+    read mode, 13h and mode X); the BIOS and DOS are C behind a stub per
+    vector (so programs that chain to the old handler work): an MZ .exe
+    loaded with its relocations and a PSP, memory blocks, file reads of its
+    own file. 14.3 MHz worth of instructions, a 70 Hz frame, loops that only
+    wait for an interrupt skipped. Magicland Dizzy (DOS, 1993: PKLITE-packed,
+    EGA mode 0Dh in VGA colours, 50 Hz timer) plays on the box: a frame
+    2.5 - 4 ms to run + 2 - 2.5 ms to draw (960 x 600). The suite checks it
+    with a .com program made in the test.
+  - Sound (a prototype nobody has heard yet: the user's HDMI-to-VGA converter
+    drops it). `snd.c`, command `snd` (`init`, `beep [Hz] [ms]`, `vol`,
+    `status`, `stop`): the S3811's sound engine at 0xB8002000 set up as
+    dump.bin's "SND_S3601" driver does (ALi's snd_m36 with its S3811 branches,
+    found byte for byte in dump.bin against libcore_hd.a's symbols): a PCM
+    ring of 8 frames of 960 samples (16-byte units of two stereo 24-bit
+    samples, a 2-unit header n / 2 + 2) read by DMA at 48 kHz, its I2S out
+    taken by the HDMI transmitter (audio on, N 6144 / CTS from the hardware),
+    the chip's own DAC on the SCART powered up and GPIO 14 (the Comsat's mute)
+    raised. On the box its DMA index moves 48001 samples a second, a frame
+    interrupt each 960, the HDMI transmitter measures CTS 74247. `play.c`
+    feeds each frame's samples of a machine that makes sound (not in `-f`
+    runs); the NES's sound chip is in `nes.c` (both pulses, triangle, noise,
+    DMC, the standard mixer, the console's filters, all integer, made lazily;
+    off it costs nothing and every test result is as before): a game's 994
+    frames of sound in 19.8 s all played, none dropped, the game still 8.2 ms
+    a frame.
+  - Video files on the chip's own MPEG-2 decoder (`av.c`, `mp2.c`; commands
+    `play [-n frames] [-x] [-k] [-v] [-1] <file>` and `av <status|shot|show|
+    off|reset>`; Enter on a .ts / .mpg / .m2v / .vob in the explorer).
+    dump.bin runs every A/V driver on the one MIPS (no second core on the
+    S3811): DECV_S3601 for MPEG-1/2, DECV_AVC for H.264 (a separate engine,
+    not used here), DECA = ALi's libmpg on the CPU, SND (`snd.c`). The
+    decoder ("VE", 0xB8004200, interrupt 9, reset 0xB8000080 bit 1) decodes
+    slices from a buffer at a bit offset / length the CPU gives it and stops
+    at the first start code that is not a slice's; the CPU parses the
+    sequence / picture headers and sets the per-picture registers as dump.bin
+    does (0x803247BC, the S3811 branches of libcore_hd.a's
+    vdec_config_hw_new_picture). Its frames (five buffers, luma in 32 x 16
+    tiles of 512 bytes, chroma 16 Cb/Cr pairs x 16 lines) must lie in one
+    32 MB window (+0x78). It reads ahead: given exactly one picture it stops
+    one macroblock short, so 2 KB of zeros follow the data. The main picture
+    layer of the display engine (0xB8006000: +0x164..+0x170 the frame's
+    addresses, +0x178 / +0x17C source layout / size, +0x180 / +0x184 where
+    on the screen, +0x190 bit 21 on) shows it under the OSD. Its scaler
+    takes its filters from RAM: +0x1E4 holds the address of a parameter
+    block the engine reads by itself (16-bit signed coefficients, a row of
+    taps for each of 32 phases, a row's sum 256: +0x000 vertical luma, 4
+    taps; +0x100 vertical chroma, 4; +0x200 horizontal luma, 8; +0x400
+    horizontal chroma, 4; +0x500.. other tables). dump.bin computes them
+    for each source / screen ratio (0x802D3B5C); `av.c` carries what that
+    generator gives for seven ratios (run on the PC from dump.bin's RAM
+    image) and picks the nearest. The demo's video set-up had left the
+    pointer at dump.bin's own address, so the first version filtered the
+    picture with whatever lay there: broken on the TV although every frame
+    in RAM was right. With the block go the rest of what dump.bin's scale
+    function (0x802C3D4C) writes: the steps (+0x110..+0x11C), where the
+    picture starts (+0x100..+0x10C, +0x1C8 / +0x1CC), the last column
+    (+0x134 / +0x138), +0x144 / +0x148 = 1. The layer's fetch mode
+    (+0x190 bits 17-18) must be 1, the frame's lines in turn: as 0, one
+    field, the screen showed the picture at half its height and below it
+    what lies after the frame in RAM. Files are taken
+    apart in software (transport streams via PAT / PMT, program streams,
+    plain .m2v); MPEG audio Layer II is decoded in `mp2.c` (checked against
+    ffmpeg on the PC: 65.8 dB) and mixed to mono for `snd`. On the box:
+    a 720 x 576 25 frames/s 6 Mbit/s .ts plays in real time (500 pictures
+    I / P / B in 20.31 s, 1 late, 0 errors, all its sound decoded and
+    played); frames read back from RAM (`av shot`) match ffmpeg's to 70 -
+    76 dB for I, P and B pictures, interlaced field-DCT, MPEG-1 and
+    1920 x 1080 (11 ms a picture on average, 24 at most); Esc ends it in
+    0.22 s and gives the OSD back. Not done: H.264, field pictures (each
+    field into its own frame). The box cannot read its own TV output back
+    (VCAP at 0xB800E400 reads all zeros on the S3811), so what the TV shows
+    is checked by eye: seen right (the whole 720 x 576 test picture, its
+    colours, the time code readable) through a phone's camera after the two
+    fixes above, each of which was needed (the old filter address again: a
+    green mesh). The suite
+    checks only how files are taken apart (the emulator has no decoder).
 - **File explorer on the TV** (`explorer [n:][path]`, `explorer.c`): the
   current directory's entries (directories first) under a path bar that
   follows `cd` both ways -- a `cd` on the UART lists the new directory, a
@@ -327,19 +581,131 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   an error stays in the status line). The USB keyboard's arrows, PgUp /
   PgDn, Home / End, Enter and Backspace move through it, the mouse clicks,
   double-clicks and scrolls with its wheel, and a file opened shows its
-  first 2 KB (text or hex) on the TV. Without a current directory it lists
-  the disks' volumes. Esc or `console` returns to the console. On FAT it
-  writes too, with Norton Commander's keys (kbd.c now sends F1-F12, Delete
+  first 2 KB (text or hex) on the TV -- a picture opens in the viewer, a
+  `.nes` file in the NES player, and the explorer comes back after them.
+  Without a current directory it lists the disks' volumes. Esc or `console`
+  returns to the console. It writes too, with Norton Commander's keys (kbd.c now sends F1-F12, Delete
   and Insert as a VT220 does; the command line takes Delete as Backspace and
   passes the others over): F2 renames the selected entry (its new name typed
   in the path bar), F7 makes a directory, Delete or F8 deletes a file or an
   empty directory after "y", F5 / F6 mark a file to copy / to move and
   Insert (or Ctrl-V) pastes it into the directory shown -- copied onto any
-  FAT volume, moved on the same one; on NTFS each says read-only. In the
+  FAT or NTFS volume, moved on the same one. In the
   emulator 19 checks of these passed.
+- **Picture viewer** (`view [-1] <file>`, `image.c`, `view.c`): JPEG
+  (baseline and progressive, 4:4:4 / 4:2:2 / 4:2:0 / gray, restart
+  intervals, the EXIF orientation), PNG (every colour type and bit depth,
+  palette transparency, Adam7 interlacing; its own inflate), GIF (the first
+  picture, interlaced or not, transparency) and BMP (1 / 4 / 8 / 16 / 24 /
+  32 bits) decoded a row at a time into the picture as it is shown: made
+  smaller by averaging, larger only by whole times, in the middle of the
+  TV's 1280 x 720, turned as a phone photo says. A baseline JPEG of any size
+  needs only a few rows of blocks; a progressive one keeps its coefficients
+  (22 MB of work memory at 0x06900000: about 7 megapixels). Right / Space
+  shows the next picture of the directory, Left the one before (the remote's
+  arrows, PAGE+ / PAGE- too), `i` the details, Esc or `q` ends. The decoders
+  were checked on a PC against Pillow (28 test pictures equal, a JPEG within
+  1.6 of 255 on average), in the emulator and on the box: a 1999 x 1333 JPEG
+  in 1.5 s (progressive 1.8 s), small files in 0.1 s. As soon as a picture or a game
+  starts loading the TV says "Opening NAME ..." (the next picture in the viewer: a strip at the top
+  over the one shown); one that cannot be opened says "Could not open NAME" and why (the last line
+  printed) for 4 s or until a key.
+- **NES player** (`nes [-f frames] [-k script] <file.nes>`, `nes.c`,
+  `play.c`): a NES machine -- the 6502 with the unofficial instructions,
+  the picture chip drawn a scanline at a time (the sprite-0 hit at its dot,
+  8 sprites a line), controllers, the sound chip's length counters and frame
+  / DMC interrupts (no sound) -- and the boards most games came on: mappers
+  0, 1 (MMC1), 2, 3, 4 (MMC3, its scanline counter), 7, 11, 34, 66 and 71.
+  The picture is shown three times as large (768 x 720) in the middle of the
+  TV, only its changed lines drawn; frames come every 16.64 ms. Buttons: a
+  USB keyboard's keys while held (arrows / W A S D, X = A, Z = B, Enter =
+  Start, Tab = Select), the UART's and telnet's keys as short presses, the
+  remote (arrows, OK = A, 0 = B, MENU = Start, INFO = Select, EXIT ends),
+  the Comsat's two front buttons (Start, A); Ctrl-C or Esc ends. A game with
+  a battery keeps its RAM in `game.sav` beside it. `-f` runs that many
+  frames as fast as they go and prints the picture's CRC-32 (`-k` gives
+  their buttons: `frame:hex,...`). Checked on a PC: nestest's 8991
+  instructions with their cycle counts as its log, every sprite-hit test,
+  vbl / NMI tests 1, 3, 4, MMC3 tests 1, 2, 5 (the cycle-exact ones fail,
+  as a scanline renderer must); four GPL homebrew games (Nova the Squirrel,
+  Thwaite, Concentration Room, the 240p test suite) give on the box the
+  same picture CRCs as on the PC, a scripted 900 frames too. On the box a
+  frame takes 7.7 to 9.6 ms to run and 1.5 ms to draw: a full 60 frames a
+  second. No commercial game is shipped with it. The 6502 runs whole
+  instructions and the vertical blank flag rises between two of them, its
+  NMI taken first: a game that waits for the flag with `LDA $2002 / BPL`
+  while its NMI handler reads `$2002` too (Solomon's Key, black screen for
+  ever) never saw it -- so with the NMI on, a `$2002` read in the last
+  cycle of an instruction that began before the flag rose sees it set, as
+  on the console; with the NMI off nothing changed (every test result above
+  and the four games' pictures are as before).
+- **Game Boy player** (`gb [-f frames] [-k script] <file.gb>`, `gb.c`,
+  `play.c` -- the NES player's front end, shared): the first Game Boy (DMG)
+  -- its CPU (Sharp SM83) a memory access per machine cycle with the timer,
+  the link port and the picture chip moved on before each, the halt bug,
+  the timer's reload corner cases, the sprite table's DMA a byte a cycle;
+  the picture chip a line at a time (background, window, ten sprites a
+  line in their order), its STAT interrupts; cartridges with plain ROM,
+  MBC1, MBC2, MBC3 (its clock runs while the game does, from zero) and
+  MBC5, battery RAM in a `.sav` file beside the game. No sound (its
+  registers read as written). The picture is shown five times as large
+  (800 x 720) in the middle of the TV; frames every 16.74 ms (59.7 a
+  second); the buttons as the NES player's; Enter on a `.gb` / `.gbc` file
+  in the explorer starts it. Checked on a PC (a harness that prints what
+  the test cartridges send through the link port): Blargg's cpu_instrs (all
+  eleven), instr_timing, mem_timing, mem_timing-2 and halt_bug pass;
+  dmg-acid2's picture is its reference to the pixel; 84 of 94 mooneye tests
+  for the first Game Boy pass (left: three on the picture chip's switch-on
+  timing, four on its interrupt timing with sprites or SCX, the boot
+  registers' exact values, the link port's clock at boot, the timer toggled
+  fast, and an 8 Mbit MBC1 multicart). On the box six of those cartridges
+  give the same picture CRC-32 after the same frames as on the PC
+  (cpu_instrs after 3300: all passed); a frame takes 5.7 to 6.9 ms to run
+  and 0.6 to 0.9 ms to draw. In the emulator suite a cartridge made by the
+  test (a few bytes of program) is played from a stick: its picture's place
+  and shade, its CRC-32 with and without A held.
+- **Game Boy Color** (the same player): a cartridge whose header asks for
+  the Color (0x143 bit 7) runs as on one -- the second bank of picture
+  memory (each tile number's attributes: palette, bank, flips, priority
+  over the sprites), work RAM in eight 4 KB banks, eight background and
+  eight sprite palettes of four 15-bit colours (written through
+  BCPS/BCPD, OCPS/OCPD), sprites in front of each other by their place in
+  the sprite table, LCDC bit 0 as "sprites in front of everything", the
+  copies into picture memory (HDMA: all at once with the CPU waiting, or
+  16 bytes in each line's waiting time -- one at once when started in it or
+  with the picture off, none while the CPU is halted, the addresses
+  counting on from one copy to the next), the double speed (STOP with
+  KEY1 bit 0: the CPU, the timer and the copies twice as fast, the picture
+  chip not; DIV from 0, then the CPU halted for 0x20000 clock ticks), the
+  link port's fast clock, the start-up registers the Color's own program
+  leaves (A = 0x11). An older game still runs as on the first Game Boy, in
+  its four shades. The picture is passed on as 15-bit colours (the
+  Color's own, 0bbbbbgggggrrrrr) for both, not corrected for the Color's
+  screen. Checked on a PC: cgb-acid2's picture is its reference to the
+  pixel; SameSuite's four DMA tests (gbc_dma_cont, gdma_addr_mask,
+  hdma_lcd_off, hdma_mode0), blocking_bgpi_increase and ei_delay_halt pass,
+  AGE's spsw-div, spsw-stop-prefetch, ei-halt and halt-prefetch pass (10 of
+  35 Color tests; the rest are the picture chip's modes to the machine
+  cycle -- they fail run as first-Game-Boy cartridges too -- and the
+  speed switch's sub-cycle details). Two fixes for both Game Boys came out
+  of it: EI then HALT with an interrupt waiting takes the interrupt with
+  the HALT as its return address (it runs again after), and a line ends
+  when its dot count passes 456, not only on it (after a switch back from
+  double speed it can be 2 off a multiple of 4: the frame never ended). On
+  the box cgb-acid2 and the homebrew city builder uCity (MBC5, 128 KB RAM,
+  double speed) give the PC's CRC-32: uCity scripted from its title into a
+  new city's map, 2100 frames, 12.2 ms to run and 1.5 ms to draw a frame on
+  average. A frame whose whole picture changed takes 9 to 10 ms to draw
+  (800 x 720 written uncached; through the cache with its lines written
+  back is no faster), so frames with fades and scrolling run long (131 of
+  uCity's first 300, a few in play) and the next ones catch up. The
+  summary line now names the slowest frame and how many ran long; the
+  command line takes 159 characters (was 95), for such a test's script.
+  The emulator suite's cartridge has a Color version: its palette 0 colour
+  1 set to red, red on the TV, the PC's CRC-32.
 - **USB keyboard**: a keyboard (an interface of class HID, protocol
   keyboard) types into the same command line as the UART -- US layout,
-  Enter, Backspace, Up / Down (history), Caps Lock, Escape (as Ctrl-C), Ctrl
+  Enter, Backspace, the arrows, Home / End, Delete, Tab, Caps Lock, Escape (as Ctrl-C), Ctrl
   with a letter; a held key repeats after 500 ms -- and the line being typed
   shows on the TV too, in the command line box. Its reports are read from
   its interrupt endpoint, as a PC reads a keyboard: an IN transfer that
@@ -1154,6 +1520,93 @@ left the controller answering nothing until `usb` set it up again. The 64
 GB stick (090c:2000, NTFS) lost no command in the first measurement; after
 that 64 KB try it lost about a third of them, at any FIFO reset wait (10 us
 to 1 ms), even after a bus reset, so it needs to be plugged in again.
+
+On 2026-11-15 the real cause of such losses was found: devices at USB
+addresses 8 and up. Forcing the RTL8153 to one address after another
+(a test build choosing its address), at 8, 9, 10, 11, 12 and 13 about one
+set-up in three lost bulk OUT data -- every DHCP frame (they go 2 s
+apart), or the first ping after a pause -- while at 7 none did in 40
+set-ups. The controller said each OUT was done (in 20 us, no token error,
+endpoint A's FIFO empty: waiting for that, as the SDK's
+hcd_make_txfifo_is_empty does, changed nothing), so the device must have
+taken the packet as a repeat -- a data toggle out of step -- and dropped it.
+The 64 GB stick, always at 9 or 10 then, lost its first command block after
+a pause the same way. Now an OUT endpoint of a high-speed device at
+address 8 or more that has been idle for 500 ms gets both its toggles
+(OUT and IN: the RTL8153 still lost a ping reply now and then with the OUT
+alone) put in step again -- CLEAR_FEATURE(ENDPOINT_HALT) and the
+controller's toggle pulsed -- before its next transfer: 12 forced set-ups
+at 8, 10, 11 and 13 all got their address and every ping through. It is
+kept to those devices: the card reader (address 4) answered no command
+after such clears, and WCH's chips ignore the toggle reset a clear
+should do. Not tried yet on other high-speed devices at those
+addresses (an LTE module behind a hub would get the same clears).
+
+That did not cover everything. With a keyboard plugged in the 64 GB stick got address 10, lost 13
+commands in 25 minutes and then, in a copy onto it, stopped answering for good: no SETUP at its address,
+none after its hub port's reset either, while the hub still called the port connected and enabled, with
+no over-current -- the stick's own controller hung, and only unplugging it brings it back. The write had
+waited 2 s for the stick and then sent the reset recovery; whether that reset hung it or it had hung
+already is not known. And an RTL8153 at address 8 dropped a third of its frames after six hours up. So
+two things changed. When a high-speed device is about to get an address and the first seven are taken,
+a low- or full-speed device among them (not a hub) is moved to the highest free address -- forgotten,
+its port reset, set up again -- and the high-speed one takes its place (its own port is switched off
+meanwhile and reset once more: its speed is known only after its reset, and two devices must not both
+answer at address 0). Only a device that answers is worth a place: the first 8 bytes of its device
+descriptor are read before anything is moved. That keeps hubs, disks and network adapters at 7 and
+below while there are no more than seven of them. And a write's first try waits 10 s, not 2 s, before
+the reset recovery. The fault at addresses 8 and up itself is not understood.
+
+The stick came back replugged and still did not answer: its port's reset ends with the port enabled at
+high speed (status 0x0503), and then no SETUP at address 0 gets a handshake -- not 20 ms after the
+reset, not after 100, 200, 500, 1000 and 2000 ms more, not after a second reset, not after its hub
+port's power was switched off and on (CLEAR_FEATURE / SET_FEATURE PORT_POWER: the hub reports the
+disconnection and the connection, and the hot-plug poll sets the device up as if it had been
+plugged in -- a way to test that without anyone at the box), not after the controller was set up from
+scratch. Every other high-speed device behind the same hubs answers. So it is the stick, and it has to
+be looked at in a PC. Moving a device for it at every start was pointless, hence the descriptor read
+first; the move itself was then tried on the box with a disk that works (the keyboard's port switched
+off and on so that it took address 4, then the card reader's: the CH341A went from 6 to 15, the reader
+got 6, a file on its card read with the right CRC-32).
+
+Three more things turned up while the box was tested alone for a few hours (2026-11-15):
+
+- A '}' typed itself without end. Endpoint D's first packet after it is opened on the keyboard is now
+  and then not a report: 4 bytes, 29 86 30 01 (the same ones after a cold start, after `usb`, after
+  `usb kbd report` and back). Taken as a report they were Shift + ] held, and since a keyboard sends
+  nothing until a key changes the repeat went on until somebody pressed a real key -- the command line
+  was unusable over UART meanwhile. A report shorter than the endpoint's packets (8 bytes), or one with
+  a key code of 1 to 3 (the error codes) in any place, is now counted as an error and ignored. Where
+  the 4 bytes come from is not known: ordinary control transfers to a device behind the same
+  translator, port resets and devices set up on the same hub did not produce them.
+- A hub that stops answering stopped the hot-plug poll. The dock's 1a40:0801 hub sits at full speed
+  behind the 05e3:0610 hub's translator and now and then answers long enough to be set up (two devices
+  behind it never do) and then stalls every request, while its port still says connected and enabled.
+  The poll, getting no port status from it, went back to that port ("unplugged?"), found nothing
+  changed, came to the silent hub again, and so on: the hubs with lower addresses never had their turn
+  and nothing plugged in or pulled out was noticed any more. Now the other hubs have their turn in
+  between, and after three such rounds the silent hub is forgotten with what was behind it and its
+  port switched off, with a line saying so; replugging it brings it back.
+- Then an independent review of all that found, and these were fixed: the guard against moving a
+  second device kept every device behind a new hub from the same rule (a disk behind it could land at 8
+  and up); a full-speed hub (the dock's) never made room; a moved device that did not come back took the
+  keyboard with it (now three tries, then the next keyboard or mouse takes over); one count of silent
+  rounds for all hubs (two silent hubs kept resetting each other's -- now each hub has its own); a hub
+  given up stayed so even when it had only been reset behind the demo's back (now it is set up once more
+  from its port's reset first, and only switched off when silent a second time); the resync after an
+  idle pause went to full-speed devices too (now high speed only); and the long wait after a write
+  covered the WRITE alone -- SYNCHRONIZE CACHE and the next command's block (taken by a stick still
+  writing its flash only after it) had 2 s, now 10. On the TV the "Could not open" message left the
+  rest of an arrow key's bytes for the command line, and a reason starting with '.' was dropped.
+- `battery.py` (not in the repository: a test from the PC over UART and FTP) -- nine files read with
+  `sum` and fetched through FTP, the CRC-32s compared; 1.5 MB of random bytes stored through FTP, read
+  back both ways, copied and moved on the card, the directory removed, the free space as before; ping
+  both ways; 300 frames of two cartridges with the picture's CRC-32 compared; a picture decoded; the
+  serial port's baud rate set; no key held -- is what the stability figures mean by a round. The flashed
+  build of 2026-11-15 ran 14 rounds with 3 idle minutes between them, then the next one 15 (an hour):
+  the first lost one ping of 140, the second's only failures came from one moment when the USB keyboard
+  reported 8 keys and F2 held for some minutes, which nobody at the PC had typed (a person at the box,
+  or reports that pass the junk filter: not known; raw reports are logged since).
 
 A USB 3.0 hub with a network port (Genesys Logic 05e3:0610, behind it a
 Realtek RTL8153 0bda:8153) put a third hub on the bus. The RTL8153 has two

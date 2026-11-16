@@ -163,6 +163,7 @@ u32 gfx_console_head_phys(void);
 
 /* console.c: the console on the TV (what the UART shows, scrolling) */
 void console_putc(char c);              /* uart.c: every character sent */
+const char *console_last_line(void);    /* the last complete line printed ("" none yet) */
 void console_start(void);               /* the picture is set up: draw from now on */
 void console_service(void);             /* every main loop pass: the screen kept current */
 void console_redraw(void);              /* everything drawn again (after the view switched to it) */
@@ -217,7 +218,7 @@ u8 usb_last_error(void);        /* the token error register after the last failu
 void usb_lsusb(void);           /* the controller and every device, one line each */
 const char *usb_summary(void);  /* "vvvv:pppp product" of the keyboard in use or the device on the port, "" */
 int usb_request(u8 device, u8 rtype, u8 request, u16 value, u16 index, u8 *data, u16 len, u32 timeout_ms);
-                                /* a control transfer to the device with that address (IN data or none):
+                                /* a control transfer to the device with that address (data IN or OUT):
                                    bytes received, -1 */
 const char *usb_error_text(void);       /* why the last transfer failed */
 int usb_in_start(u8 device, u8 ep, u16 size);   /* an IN to the device's endpoint (the controller's endpoint
@@ -302,6 +303,7 @@ int disk_dir_read(const char *path, struct disk_entry *out, int max, u32 *total)
 int disk_volumes(struct disk_entry *out, int max);      /* every disk's volumes, named as 'cd' takes them */
 void disk_cwd_volume(char *out, int size);              /* "disk 4: FAT32 'STICK', 39 MB", "" */
 int disk_read_head(const char *path, u8 *buf, u32 max, u32 *size);       /* a file's first bytes, -1 */
+int disk_exists(const char *path);      /* is there a file at that path? (nothing said when there is none) */
 u32 disk_changes(void);                 /* changes when a disk comes or goes or a sector is written */
 /* disk.c for ftp.c: a reader and a writer of its own (they last across main loop passes), -1 said why */
 int disk_stat(const char *path, struct disk_entry *o);  /* a file, a directory, a volume's root: 0, -1 */
@@ -314,6 +316,13 @@ int disk_upload_close(void);                            /* its entry set: 0, -1 
 /* ftp.c: an FTP server on port 21 (the disks' volumes at its root, all of them, no password) */
 const char *ftp_poll(void);             /* net_poll (the main loop only): a line to show, or 0 */
 void ftp_status(void);                  /* 'netstat' */
+int ftp_disk_busy(void);                /* a file moves (disk.c's reader / writer are FTP's now) */
+/* http.c: the web page on port 80 (files, the TV's picture, the command line; no password) */
+const char *http_poll(int in_cmd);      /* net_poll (0), net_uart_poll while a command runs (1): a line, or 0 */
+void http_putc(char c);                 /* uart_putc: every character printed (the page's console) */
+int http_clients(void);                 /* connections open now */
+int http_disk_busy(void);               /* a file moves (disk.c's reader / writer are the page's now) */
+void http_status(void);                 /* 'netstat' */
 
 /* explorer.c: a file explorer on the TV (the test screen's picture), synced to the current directory */
 void explorer_show(void);               /* 'explorer': on the TV (the listing follows on the next poll) */
@@ -325,9 +334,19 @@ int explorer_poll(void);                /* every main loop pass: 1 when it chang
 
 /* serial.c: USB serial ports (a GSM / LTE module's AT, modem and diagnostic ports; CDC ACM) */
 #define SERIAL_PORTS 8
-const char *serial_attach(u8 device, u8 iface, u8 control, int acm, u8 in_ep, u8 out_ep, u16 maxp,
+#define SERIAL_ACM    1                 /* serial_attach's kinds: CDC ACM, the USB-serial chips (0: a module's own) */
+#define SERIAL_CH34X  2
+#define SERIAL_CP210X 3
+#define SERIAL_FTDI   4
+#define SERIAL_FTDI_H 5                 /* FT2232H / FT4232H / FT232H: another clock */
+#define SERIAL_PL2303 6
+#define SERIAL_FTDI_X 7                 /* FT-X / FT2232C/D: 48 MHz, the divisor's high bits as the H chips' */
+int serial_chip(u16 vid, u16 pid, u16 bcd);     /* the USB-serial chip it is: SERIAL_*, 0 (bcd: bcdDevice) */
+const char *serial_attach(u8 device, u8 iface, u8 control, int kind, u8 in_ep, u8 out_ep, u16 maxp,
                           const char *name);   /* control: the interface with the modem control (ACM's
-                                                  communications interface); a line about the port */
+                                                  communications interface; an FTDI's port number, 0 for a
+                                                  chip with one); a line about the port */
+void serial_stty(int port, u32 baud);   /* 'stty [n] [baud]' (port -1: all, baud 0: show) */
 void serial_detach(u8 device);          /* 0: all */
 int serial_count(void);
 void serial_list(void);                 /* 'tty' */
@@ -339,6 +358,8 @@ int at_prefixed(const char *s);         /* "AT..." in any case */
 /* eth.c: wired Ethernet through a USB adapter's CDC ECM function (an RTL8153's), DHCP, ARP, ping */
 const char *eth_attach(u8 device, u8 ctrl_if, u8 data_if, u8 data_alt, u8 in_ep, u8 out_ep, u16 maxp, u8 int_ep,
                        u8 mac_string);  /* a line about the port */
+const char *eth_attach_rndis(u8 device, u8 ctrl_if, u8 data_if, u8 in_ep, u8 out_ep, u16 maxp);
+                                        /* an LTE module's RNDIS function: the link when there is no Ethernet */
 void eth_detach(u8 device);             /* 0: all */
 const char *eth_poll(void);             /* every main loop pass: frames, DHCP; a line to show, or 0 */
 void eth_show(void);                    /* 'ifconfig' */
@@ -362,6 +383,11 @@ int eth_parse_ip(const char *s, u8 ip[4]);
 #define NTFS_RUNS2_PHYS  0x04100000u      /* the same for the file the FTP server sends (NTFS_RUNS_SIZE bytes) */
 #define FTP_ENTRIES_PHYS 0x04200000u      /* ftp.c: a directory's entries for a listing (1 MB) */
 #define FTP_TEXT_PHYS    0x04300000u      /* ftp.c: the listing's text (1 MB) */
+#define HTTP_ENTRIES_PHYS 0x04900000u     /* http.c: a directory's entries for a listing */
+#define HTTP_ENTRIES_SIZE 0x00100000u
+#define HTTP_TEXT_PHYS   0x04A00000u      /* http.c: each of its six connections' response text (a listing's
+                                             JSON, the console's output), up to WGET_PHYS */
+#define HTTP_TEXT_SIZE   0x00100000u
 #define NTFS_UPCASE_PHYS 0x04400000u      /* disk.c, writing NTFS: the volume's $UpCase table (128 KB) */
 #define NTFS_WORK_PHYS   0x04420000u      /* a directory's index being rebuilt: where its entries are, the plan of
                                              its new blocks (0x20000 bytes) */
@@ -426,7 +452,38 @@ int kbd_getc(void);             /* the next character typed, -1: none */
 void kbd_set_mode(int interrupt);       /* 0: GET_REPORT over endpoint 0, 1: the interrupt endpoint */
 void kbd_set_raw(int on);               /* print every report that differs from the one before */
 int kbd_lost(void);                     /* it stopped answering: set the device up again */
+int kbd_held(u8 usage);                 /* is the key with that HID usage held now? (a game's buttons) */
+int kbd_held_all(u8 *usages, int max);  /* every key held now as HID usages, modifiers as 0xE0..0xE7: how many */
 void kbd_show_status(void);
+
+/* play.c: the NES and Game Boy players (nes.c, gb.c are the machines) */
+#define MEDIA_PHYS       0x02400000u      /* a cartridge file, a picture file: read whole into RAM (cached) */
+#define MEDIA_MAX        0x01000000u      /* 16 MB */
+int nes_play(const char *path, u32 frames, const char *script);    /* 'nes': 0, -1 it could not start */
+int gb_play(const char *path, u32 frames, const char *script);     /* 'gb': the same for a Game Boy game */
+int sms_play(const char *path, u32 frames, const char *script);    /* 'sms': a Master System game */
+int gg_play(const char *path, u32 frames, const char *script);     /* 'gg': a Game Gear game */
+int zx_play(const char *path, u32 frames, const char *script);     /* 'zx': a ZX Spectrum program ("": BASIC) */
+int a26_play(const char *path, u32 frames, const char *script);    /* 'a26': an Atari 2600 game */
+int c64_play(const char *path, u32 frames, const char *script);    /* 'c64': a C64 program ("": BASIC) */
+int amiga_play(const char *path, u32 frames, const char *script);  /* 'amiga': an .adf ("": no disk) */
+int dos_play(const char *path, u32 frames, const char *script);    /* 'dos': a DOS program (.exe, .com) */
+
+/* view.c: the picture viewer (image.c decodes JPEG, PNG, GIF, BMP) */
+#define IMAGE_WORK_PHYS  0x06900000u      /* the picture as shown, and the decoder's memory (a progressive JPEG's */
+#define IMAGE_WORK_SIZE  0x01600000u      /* coefficients: about 3 bytes a pixel) -- up to 0x07F00000 */
+#define VIEW_LIST_PHYS   0x07F00000u      /* the picture's directory, for the next / the one before (1 MB) */
+#define VIEW_LIST_SIZE   0x00100000u
+/* av.c (the video player, av.h): its decoder's buffers in IMAGE_WORK (0x06900000..0x07F00000: the viewer's,
+   never used at the same time), the streams read in 0x05800000..0x05E00000 (between WGET_PHYS's 8 MB and
+   NETLOAD_PHYS) */
+void view_file(const char *path, int once);     /* 'view': the picture on the TV; once: shown, not waited on */
+int view_is_picture(const char *name);  /* .jpg .jpeg .png .gif .bmp */
+const char *view_last(void);            /* the path of the picture it showed last (the explorer selects it) */
+void tv_opening(const char *path, int bar);     /* "Opening NAME ..." on the TV at once (bar: a strip at the top,
+                                                   over the picture shown now) */
+void tv_failed(const char *path, int bar, int wait);    /* "Could not open NAME" and why (the last line printed);
+                                                           wait: up to 4 s, a key ends it */
 
 /* start.S: back through the original bootloader */
 void platform_restart(void) __attribute__((noreturn));

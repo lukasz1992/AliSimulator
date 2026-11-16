@@ -347,7 +347,7 @@ def check_console(box):
     check(lines[-1] == "m3801>" and not any("Commands (whole lines" in line for line in lines),
           "help's lines scroll the console: its end is on the screen")
     pages = 0
-    while pages < 4 and not any("Commands (whole lines" in line for line in lines):
+    while pages < 8 and not any("Commands (whole lines" in line for line in lines):
         send_keys(box, b"\x1b[5~")
         pages += 1
         rgb = console_rgb(box)
@@ -673,7 +673,7 @@ def check_disks(box):
     out = (box.command("ls 9:", timeout=30) + box.command("cat /nothing.txt", timeout=60)
            + box.command("ls 3.2:", timeout=30) + box.command("cat /Docs", timeout=60))
     check("device 9 is not a USB disk ('disks' lists them)" in out and "not found: nothing.txt" in out
-          and "device 3: no FAT volume there ('disks' lists it)" in out and "a directory: 'ls' lists it" in out,
+          and "device 3: no FAT or NTFS volume there ('disks' lists it)" in out and "a directory: 'ls' lists it" in out,
           "errors: a device that is no disk, a missing file, a missing partition, cat of a directory")
     out = type_on(box, kbd, "ping\r")
     out += box.command("ls 4:", timeout=60) + type_on(box, kbd, "ping\r")
@@ -688,7 +688,7 @@ def check_disks(box):
     box.usb.attach("high", reader)
     out = box.run(4.0) + box.command("disks", timeout=30) + box.command("ls", timeout=30)
     check("disk 1: Generic STORAGE DEVICE 1404: no medium" in out and "device 1: Generic STORAGE DEVICE 1404: no medium"
-          in out and "no FAT volume on a USB disk ('disks')" in out,
+          in out and "no FAT or NTFS volume on a USB disk ('disks')" in out,
           "a card reader without a card: 'no medium' (sense 2/3A), nothing to list")
     box.usb.detach()
     box.run(0.6)
@@ -861,7 +861,9 @@ def check_many_devices(box):
     """More than seven devices, as the real box got (two hub chips, a CH341, a card reader, two sticks, a
     keyboard -- and the mouse as the eighth, which an earlier build refused): fifteen are kept (the
     endpoints' address registers hold four bits of an address), a hub only among the first seven (the
-    split registers hold three bits of its address)."""
+    split registers hold three bits of its address) -- and the first seven are kept for high-speed devices
+    (on the real box they lose bulk data at addresses 8 and up): a hub that comes when they are taken gets
+    the place of a low- or full-speed device, which moves to the highest free address."""
     import fat_image
     hub, hub2, hub3 = VirtualHub(4), VirtualHub(4), VirtualHub(4)
     sticks = [VirtualStick(fat_image.build({f"S{i}.TXT": b"%d\n" % i}, fat=12, size_mb=1, partition=False))
@@ -875,27 +877,479 @@ def check_many_devices(box):
     hub.plug(2, sticks[2], "high")
     hub.plug(3, mouse, "low")
     hub.plug(4, hub3, "high")
-    hub3.plug(1, VirtualKeyboard(), "full")                  # behind the hub that gets no address
+    kbd3 = VirtualKeyboard()
+    hub3.plug(1, kbd3, "full")                               # behind the hub that comes ninth
     wmark = len(box.usb.writes)
     box.usb.attach("high", hub)
     out = box.run(18.0)
-    kept = (hub, hub2, sticks[0], kbd2, kbd, sticks[1], sticks[2], mouse)
+    kept = (hub, hub2, sticks[0], kbd2, sticks[1], sticks[2], mouse)
     listing = box.command("lsusb")
-    check([d.address for d in kept] == list(range(1, 9)) and all(d.configuration == 1 for d in kept)
+    check([d.address for d in kept] == [1, 2, 3, 4, 6, 7, 8] and all(d.configuration == 1 for d in kept)
           and "Bus 001 Device 008: ID 1209:0004 AliSimulator Virtual USB mouse, low speed (1.5 Mbit/s), hub 1 port 3"
           in listing and all(f"disk {n}: " in out for n in (3, 6, 7)),
-          "eight devices behind two hubs: addresses 1 to 8, each configured, the mouse as device 8 (lsusb), the "
-          "three sticks' disks")
-    check("hub 1 port 4:\r\n  a hub, but the first 7 addresses are taken: a hub needs one of them" in out
-          and hub3.address == 0 and "Device 009" not in listing,
-          "a third hub as the ninth device: refused -- a hub needs one of the first seven addresses (three bits of "
-          "it in the split registers) -- and its port switched off")
+          "eight devices behind two hubs: each configured at the address it got as it came, the mouse as device 8 "
+          f"(lsusb), the three sticks' disks{[d.address for d in kept]}")
+    check("hub 2 port 3: its device (address 5, not high speed) moves to a higher address: the first 7 are kept "
+          "for high-speed devices" in out and kbd.address == 15 and kbd.configuration == 1
+          and hub3.address == 5 and hub3.configuration == 1 and kbd3.address == 9 and kbd3.configuration == 1
+          and "a hub, but the first 7 addresses are taken" not in out and "Device 015: ID" in listing,
+          "a third hub as the ninth device, the first seven addresses taken: the low-speed keyboard among them "
+          "moves to address 15 (its port reset, set up again), the hub gets its address 5 and the keyboard behind "
+          f"it address 9{[kbd.address, hub3.address, kbd3.address]}")
     box.run(mouse.move(30, 0, over=0.3) + 0.5)
     writes = [(o, v) for _t, o, _s, v in box.usb.writes[wmark:]]
     out = type_on(box, kbd2, "ping\r")
     check((0x88, 0x11) in writes and pointer_at(box) == (670, 360) and "ping\r\npong v4" in out,
           "the mouse at address 8 is polled by endpoint D (+0x88 = 8 << 1 | 1) and moves the pointer; the first "
           "keyboard types")
+    box.usb.detach()
+    box.run(0.6)
+
+
+class JunkFirstKeyboard(VirtualKeyboard):
+    """A keyboard whose interrupt endpoint's first packet is not a report: the 4 bytes endpoint D handed
+    over on the real box now and then, right after it was opened."""
+
+    def interrupt_in(self, endpoint):
+        if endpoint == 1 and self.interrupt and self.configuration and not getattr(self, "junk_sent", False):
+            self.junk_sent = True
+            return getattr(self, "junk", bytes.fromhex("29863001"))
+        return super().interrupt_in(endpoint)
+
+
+def check_usb_faults(box):
+    """Two things the real box did when it was left alone with its devices (2026-11-15).  The keyboard's
+    endpoint gave 4 bytes that are no report (29 86 30 01): taken as one they were Shift + ] held for good
+    -- a '}' repeated on the command line until a real key was pressed.  And a hub behind two others
+    stopped answering while its port still called it connected: the hot-plug poll went back to that port,
+    found nothing changed, came to the silent hub again, and never looked at the first hub's ports any
+    more -- nothing plugged in was seen."""
+    hub, hub2, hub3 = VirtualHub(4), VirtualHub(4), VirtualHub(4)
+    kbd, mouse = JunkFirstKeyboard(), VirtualMouse()
+    hub.plug(1, hub2, "high")
+    hub2.plug(1, hub3, "high")
+    hub.plug(2, kbd, "low")
+    box.usb.attach("high", hub)
+    out = box.run(9.0)
+    state = box.command("usb kbd")
+    check([d.address for d in (hub, hub2, hub3, kbd)] == [1, 2, 3, 4] and kbd.junk_sent and "}" not in out
+          and "1 reports, 0 keys, 1 errors" in state and "keys held now: none" in state,
+          "a keyboard whose endpoint first gives 4 bytes that are no report (29 86 30 01, as on the real box): "
+          "counted as an error, no key held, nothing typed")
+    out = type_on(box, kbd, "ping\r")
+    check("ping\r\npong v4" in out, "and its real reports type")
+    kbd.junk_sent = False
+    kbd.junk = bytes.fromhex("0200010000000000")          # a whole report, an error code (1) among its keys
+    box.command("usb kbd interrupt")
+    out = box.run(1.0)
+    state = box.command("usb kbd")
+    check(kbd.junk_sent and "keys held now: none" in state and "\x1b" not in out,
+          "a whole 8-byte report with an error code among its keys: no key held")
+    hub3.setup = lambda packet: None                         # every request stalled, its port as it was
+    out = box.run(14.0)
+    listing = box.command("lsusb")
+    check("[usb] hub 3 (1209:0003, on hub 2 port 1) has stopped answering: forgotten with what was behind it, "
+          "its port reset" in out and out.count("has stopped answering") == 1
+          and "Device 003" not in listing and "Device 002" in listing,
+          "a hub behind two others stops answering, its port still connected and enabled: after three rounds of "
+          "the hot-plug poll it is forgotten and set up again once from its port's reset (which fails: the port is "
+          "switched off), said once")
+    hub.plug(3, mouse, "low")
+    out = box.run(4.0)
+    check("[usb] hub 1 port 3: device connected" in out and mouse.configuration == 1,
+          "and the poll goes on: a mouse plugged into the first hub afterwards is set up")
+    del hub3.setup
+    hub2.unplug(1)
+    box.run(1.0)
+    hub2.plug(1, hub3, "high")
+    out = box.run(4.0)
+    check("[usb] hub 2 port 1: device connected" in out and hub3.configuration == 1 and hub3.address == 5,
+          "the hub replugged: set up again (the mouse has its address 3 now: it gets 5)")
+    box.usb.detach()
+    box.run(0.6)
+
+
+def tiny_gb_cartridge(colour_only=False):
+    """A 32 KB Game Boy cartridge made here: it switches the picture off, fills tile 0 with colour 1, sets the
+    palette, switches the picture on, and then shows colour 1 as shade 1 -- or as shade 2 while A is held. The
+    Game Boy Color one (colour_only) sets the Color's background palette 0's colour 1 to red first (its BGP
+    writes then change nothing)."""
+    colour = "3E82 E068 3E1F E069 3E00 E069" if colour_only else ""    # BCPS = 82; BCPD = 1F, 00: red
+    code = bytes.fromhex(
+        "F3 31FEFF AF E040" + colour + "210080 0608"    # di; ld sp,FFFE; xor a; ldh (LCDC),a; ld hl,8000; ld b,8
+        "3EFF 22 AF 22 05 20F8"                   # (lo FF, hi 00) eight times: colour 1 everywhere
+        "3EE4 E047 3E91 E040"                     # BGP = E4; LCDC = 91: picture on, tile 0 everywhere
+        "3E10 E000 F000 E601 2004 3E1B 1802 3EE4 E047 18EC")    # the buttons: A held -> BGP 1B (shade 2)
+    rom = bytearray(32768)
+    rom[0x100:0x104] = bytes.fromhex("00C35001")             # nop; jp 0150
+    rom[0x134:0x13B] = b"ALITEST"
+    rom[0x143] = 0xC0 if colour_only else 0x00
+    rom[0x150:0x150 + len(code)] = code
+    rom[0x14D] = (-sum(rom[0x134:0x14D]) - (0x14D - 0x134)) & 0xFF
+    return bytes(rom)
+
+
+def check_gameboy(box):
+    """The Game Boy player ('gb'): a cartridge made here (tiny_gb_cartridge) run 60 frames on a stick -- its
+    160 x 144 picture five times as large, 800 x 720 in the middle of the screen, in the Game Boy's shades; A
+    held by a test script changes the palette; a cartridge for the Game Boy Color alone in its colours."""
+    import fat_image
+    stick = VirtualStick(fat_image.build({"T.GB": tiny_gb_cartridge(), "C.GB": tiny_gb_cartridge(True)}, fat=12,
+                                         size_mb=1, partition=False))
+    box.usb.attach("high", stick)
+    box.run(4.0)
+    # (looked at while it plays: when it ends the picture behind it is put back) -- A held from frame 90 on
+    out = box.keys(b"gb -k 0:0,90:1 1:/T.GB\r", until=b"Ctrl-C or Esc ends", timeout=30)
+    box.run(1.0)
+    shade1, shade2, black = rgb555(0x88, 0xC0, 0x70), rgb555(0x34, 0x68, 0x56), rgb555(0, 0, 0)
+    sim = box.sim
+    picture = [fb_pixel(sim, x, y) for x, y in ((240, 0), (640, 360), (1039, 719))]
+    sides = [fb_pixel(sim, x, y) for x, y in ((239, 360), (1040, 360))]
+    box.screen("v4_gameboy_screen.png", "gb: a cartridge made in the test (tile 0 in colour 1 everywhere), 160 x 144 five "
+               "times as large in the middle of the screen")
+    check("1:/T.GB: ALITEST: ROM only, ROM 32 KB" in out and picture == [shade1] * 3 and sides == [black] * 2,
+          "gb: a cartridge made here plays; its picture fills 800 x 720 in the middle (x 240 to 1039) in the Game "
+          f"Boy's second shade, black at its sides{[hex(v) for v in picture + sides]}")
+    out = box.keys(b"\x03", timeout=10)
+    check("frames in" in out, "Ctrl-C ends it")
+    # the same frames as the PC's gb.c (the picture's CRC-32): without buttons, and with A held from the start
+    runs = [box.command(f"gb -f 60 {k}1:/T.GB", timeout=120) for k in ("", "-k 0:1 ")]
+    check("picture CRC-32 76250edf" in runs[0] and "picture CRC-32 d0288f62" in runs[1],
+          "gb -f 60: the picture's CRC-32 as gb.c's on a PC after 60 frames (76250edf), and with A held -- the "
+          "program changes its palette -- d0288f62")
+    # a cartridge for the Color alone: looked at while it plays, then its CRC-32 after 60 frames
+    out = box.keys(b"gb 1:/C.GB\r", until=b"Ctrl-C or Esc ends", timeout=30)
+    box.run(1.0)
+    red = rgb555(0xF8, 0, 0)
+    colours = [fb_pixel(sim, x, y) for x, y in ((240, 0), (640, 360), (1039, 719))]
+    box.keys(b"\x03", timeout=10)
+    out += box.command("gb -f 60 1:/C.GB", timeout=120)
+    check("ALITEST: ROM only, ROM 32 KB, Game Boy Color only" in out and "picture CRC-32 f31b3bd0" in out
+          and colours == [red] * 3,
+          "a cartridge for the Game Boy Color alone runs as on one: its palette's colour 1 set to red is red on the "
+          f"TV, the picture's CRC-32 as gb.c's on a PC (f31b3bd0){[hex(v) for v in colours]}")
+    box.usb.detach()
+    box.run(0.6)
+
+
+def tiny_sega_cartridge(game_gear=False):
+    """A 32 KB Master System (or Game Gear) cartridge made here: the picture chip in mode 4 with the picture on,
+    colour 0 of both palettes red (every tile is tile 0, all colour 0: the whole picture red), then, once button
+    1 (Z, the pad's B) is held, blue for good.  The Game Gear's colours are two bytes each (----BBBB GGGGRRRR,
+    the low byte first), the Master System's one (--BBGGRR)."""
+    red, blue = ("0F00", "000F") if game_gear else ("0300", "3000")
+    code = bytes.fromhex(
+        "F3 ED56 31F0DF 213000 0608 0EBF EDB3"   # di; im 1; ld sp,DFF0; ld hl,regs; ld b,8; ld c,BF; otir
+        "06" + red[:2] + "16" + red[2:] + "CD4000"              # ld b,lo; ld d,hi; call set
+        "DBDC CB67 20FA"                                        # wait: in a,(DC); bit 4,a; jr nz,wait
+        "06" + blue[:2] + "16" + blue[2:] + "CD4000 18FE")      # blue; jr $
+    regs = bytes.fromhex("0480 FF82 0087 4081")                 # mode 4, names at 3800, backdrop 0, picture on
+    # set: colour 0 and colour 16 (the sprites' 0) to b (the Game Gear: b, d); colour addresses x2 on the GG
+    one = "78D3BE 7AD3BE" if game_gear else "78D3BE"
+    put = bytes.fromhex("3E00D3BF 3EC0D3BF" + one + "3E" + ("20" if game_gear else "10") + "D3BF 3EC0D3BF" + one
+                        + "C9")
+    rom = bytearray(32768)
+    rom[:len(code)] = code
+    rom[0x30:0x38] = regs
+    rom[0x40:0x40 + len(put)] = put
+    return bytes(rom)
+
+
+def tiny_zx_files():
+    """A stand-in for the Spectrum's ROM (the real one is Amstrad's: not in the repository) and a snapshot that
+    starts it: the ROM sets the border red, clears the picture, makes every cell's paper red, then waits for
+    SPACE (port 7FFE bit 0) and turns the border blue.  The .sna's stack holds 0000: its RETN goes there."""
+    rom = bytearray(16384)
+    code = bytes.fromhex(
+        "F3 AF 3100FF 3E02 D3FE"                 # di; xor a (zx.c knows a 48K ROM by these two); ld sp,FF00;
+                                                 # ld a,2; out (FE),a: a red border
+        "210040 110140 01FF17 3600 EDB0"         # the pixels 0
+        "210058 110158 01FF02 3610 EDB0"         # the attributes 10: paper red, ink black
+        "01FE7F ED78 E601 20FA"                  # wait: ld bc,7FFE; in a,(c); and 1; jr nz,wait
+        "3E01 D3FE 18FE")                        # the border blue; jr $
+    rom[:len(code)] = code
+    header = bytearray(27)
+    header[0] = 0x3F                             # I
+    header[23:25] = (0x8000).to_bytes(2, "little")   # SP: the word 0000 there is the PC
+    header[25] = 1                               # IM 1
+    header[26] = 7
+    return bytes(rom), bytes(header) + bytes(49152)
+
+
+def red_or_blue(v):
+    """'red' / 'blue' / '' for an ARGB1555 word: that channel strong, the other two dark."""
+    r, g, b = (v >> 10) & 31, (v >> 5) & 31, v & 31
+    return "red" if r >= 20 and g < 4 and b < 4 else "blue" if b >= 20 and r < 4 and g < 4 else ""
+
+
+def check_sega_and_spectrum(box):
+    """The Master System, Game Gear and ZX Spectrum players ('sms', 'gg', 'zx'): programs made here
+    (tiny_sega_cartridge, tiny_zx_files) on a stick -- the Master System's 256 x 192 three times as large (768 x
+    576) in the middle of the screen, the Game Gear's 160 x 144 five times (800 x 720), the Spectrum's 320 x 240
+    with its border three times (960 x 720); the pad's button 1 held by a test script, SPACE typed on the UART."""
+    import fat_image
+    rom, sna = tiny_zx_files()
+    stick = VirtualStick(fat_image.build({"T.SMS": tiny_sega_cartridge(), "T.GG": tiny_sega_cartridge(True),
+                                          "ZX/48.ROM": rom, "ZX/T.SNA": sna}, fat=12, size_mb=1, partition=False))
+    box.usb.attach("high", stick)
+    box.run(4.0)
+    sim = box.sim
+    for cmd, name, inside, outside in (
+            ("sms", "1:/T.SMS", ((256, 72), (640, 360), (1023, 647)), ((255, 360), (640, 71), (640, 648))),
+            ("gg", "1:/T.GG", ((240, 0), (640, 360), (1039, 719)), ((239, 360), (1040, 360)))):
+        seen = []
+        for script in ("", "-k 0:02 "):          # (no buttons; button 1 held from the start)
+            out = box.keys(f"{cmd} {script}{name}\r".encode(), until=b"Esc ends", timeout=30)
+            box.run(1.0)
+            seen.append(([red_or_blue(fb_pixel(sim, x, y)) for x, y in inside],
+                         [fb_pixel(sim, x, y) for x, y in outside], out))
+            box.keys(b"\x03", timeout=10)
+        (plain, sides, out), (held, _, _) = seen
+        check(plain == ["red"] * 3 and held == ["blue"] * 3 and set(sides) == {rgb555(0, 0, 0)}
+              and "ROM 32 KB" in out,
+              f"{cmd}: a cartridge made here plays: its picture red in the middle of the screen, black around it; "
+              f"with button 1 held, blue {plain} {held} {[hex(v) for v in sides]}")
+    out = box.keys(b"zx 1:/ZX/T.SNA\r", until=b"Esc ends", timeout=30)
+    box.run(1.0)
+    before = [red_or_blue(fb_pixel(sim, x, y)) for x, y in ((170, 360), (640, 360), (1110, 10))]
+    box.t.write(b" ")                            # (the Spectrum echoes nothing: no waiting for output)
+    box.run(1.0)
+    after = [red_or_blue(fb_pixel(sim, x, y)) for x, y in ((170, 360), (640, 360), (1110, 10))]
+    out += box.keys(b"\x03", timeout=10)
+    check("ROM: 1:/ZX/48.rom" in out and before == ["red"] * 3 and after == ["blue", "red", "blue"]
+          and "frames in" in out,
+          "zx: a snapshot made here with a stand-in ROM beside it runs: border and paper red over 960 x 720; SPACE "
+          f"typed on the UART is the Spectrum's SPACE: the border blue, the paper still red {before} {after}")
+    box.usb.detach()
+    box.run(0.6)
+
+
+def tiny_atari_cartridge():
+    """A 4 KB Atari 2600 cartridge made here: each frame three lines of vertical sync, then 250 lines of the
+    background colour -- 0x44 (a red) or, while the joystick's button is held (INPT4 bit 7 low), 0x84 (a blue)."""
+    code = bytes.fromhex(
+        "78 D8 A2FF 9A"                          # sei; cld; ldx #FF; txs
+        "A902 8500 8502 8502 8502 A900 8500 8501"   # frame: VSYNC on, 3 x WSYNC, VSYNC and VBLANK off
+        "A944 240C 3002 A984 8509"               # lda #44; bit INPT4; bmi +2; lda #84; sta COLUBK
+        "A2FA 8502 CA D0FB 4C05F0")              # ldx #250; WSYNC x 250; jmp frame
+    rom = bytearray(4096)
+    rom[:len(code)] = code
+    rom[0xFFC:0xFFE] = (0xF000).to_bytes(2, "little")     # the reset vector
+    return bytes(rom)
+
+
+def check_atari(box):
+    """The Atari 2600 player ('a26'): a cartridge made here (tiny_atari_cartridge) -- its 160 x 228 picture five
+    times as wide and three times as high (800 x 684) in the middle of the screen, red; blue with the button
+    held by a test script."""
+    import fat_image
+    stick = VirtualStick(fat_image.build({"T.A26": tiny_atari_cartridge()}, fat=12, size_mb=1, partition=False))
+    box.usb.attach("high", stick)
+    box.run(4.0)
+    sim = box.sim
+    seen = []
+    for script in ("", "-k 0:01 "):
+        out = box.keys(f"a26 {script}1:/T.A26\r".encode(), until=b"Esc ends", timeout=30)
+        box.run(1.0)
+        inside = [fb_pixel(sim, x, y) for x, y in ((240, 18), (640, 360), (1039, 701))]
+        outside = [fb_pixel(sim, x, y) for x, y in ((239, 360), (1040, 360), (640, 17), (640, 702))]
+        seen.append((inside, outside, out))
+        box.keys(b"\x03", timeout=10)
+
+    def hue(v):
+        r, b = (v >> 10) & 31, v & 31
+        return "red" if r > b + 8 else "blue" if b > r + 8 else ""
+    (plain, sides, out), (held, _, _) = seen
+    check("4K: 4 KB" in out and len(set(plain)) == 1 and hue(plain[0]) == "red" and len(set(held)) == 1
+          and hue(held[0]) == "blue" and set(sides) == {rgb555(0, 0, 0)},
+          "a26: a cartridge made here plays: its background red over 800 x 684 in the middle of the screen, black "
+          f"around it; blue while the button is held {[hex(v) for v in plain + held + sides]}")
+    box.usb.detach()
+    box.run(0.6)
+
+
+def tiny_c64_roms():
+    """Stand-ins for the C64's ROMs (the real ones are Commodore's: not in the repository).  The KERNAL's reset
+    goes to its own $E000: the border and background red (colour 2), the picture left off ($D011 0: all
+    border), then it waits for joystick 2's fire (CIA 1 port A bit 4 low) and makes the border blue (6).
+    BASIC is only "CBM" where c64.c looks for it; the characters are blank."""
+    code = bytes.fromhex(
+        "78 D8 A2FF 9A"                          # sei; cld; ldx #FF; txs
+        "A900 8D11D0 A902 8D20D0 8D21D0"         # $D011 = 0 (no picture); border, background red
+        "AD00DC 2910 D0F9"                       # wait: lda $DC00; and #$10; bne wait
+        "A906 8D20D0 4C1EE0")                    # border blue; jmp $E01E (itself)
+    kernal = bytearray(8192)
+    kernal[:len(code)] = code
+    kernal[0x1FFC:0x1FFE] = (0xE000).to_bytes(2, "little")     # the reset vector
+    basic = bytearray(8192)
+    basic[4:7] = b"CBM"
+    return bytes(kernal), bytes(basic), bytes(4096)
+
+
+def check_c64(box):
+    """The C64 player ('c64'): stand-in ROMs made here (tiny_c64_roms) in C64/ and a program file -- its 352 x
+    240 picture three times as large (1056 x 720) in the middle of the screen, red; blue with fire held by a
+    test script."""
+    import fat_image
+    kernal, basic, chargen = tiny_c64_roms()
+    prg = (0x0801).to_bytes(2, "little") + bytes(4)
+    stick = VirtualStick(fat_image.build({"C64/KERNAL.ROM": kernal, "C64/BASIC.ROM": basic,
+                                          "C64/CHARGEN.ROM": chargen, "C64/T.PRG": prg},
+                                         fat=12, size_mb=1, partition=False))
+    box.usb.attach("high", stick)
+    box.run(4.0)
+    sim = box.sim
+    seen = []
+    for script in ("", "-k 0:01 "):
+        out = box.keys(f"c64 {script}1:/C64/T.PRG\r".encode(), until=b"Esc ends", timeout=30)
+        box.run(1.0)
+        inside = [fb_pixel(sim, x, y) for x, y in ((112, 0), (640, 360), (1167, 719))]
+        outside = [fb_pixel(sim, x, y) for x, y in ((111, 360), (1168, 360))]
+        seen.append((inside, outside, out))
+        box.keys(b"\x03", timeout=10)
+
+    def hue(v):
+        r, b = (v >> 10) & 31, v & 31
+        return "red" if r > b + 8 else "blue" if b > r + 8 else ""
+    (plain, sides, out), (held, _, _) = seen
+    check("ROM: 1:/C64/kernal.rom" in out and "a .prg file" in out and len(set(plain)) == 1
+          and hue(plain[0]) == "red" and len(set(held)) == 1 and hue(held[0]) == "blue"
+          and set(sides) == {rgb555(0, 0, 0)},
+          "c64: stand-in ROMs made here run: the picture red over 1056 x 720 in the middle of the screen, black "
+          f"around it; blue while fire is held {[hex(v) for v in plain + held + sides]}")
+    box.usb.detach()
+    box.run(0.6)
+
+
+def tiny_kickstart():
+    """A stand-in for the Amiga's Kickstart (the real ones are sold: not in the repository): 256 KB starting 11 11
+    as amiga.c wants, its reset going to its own code -- COLOR00 red (the whole picture: no bitplanes), then it
+    waits for the joystick's fire (CIA-A port A bit 7 low) and makes it blue."""
+    rom = bytearray(0x40000)
+    rom[0:8] = bytes.fromhex("1111 4EF9 00F80010")    # the reset's stack word (unused) and PC: 0xF80010
+    rom[12:16] = bytes.fromhex("0022 0005")           # "Kickstart 34.5"
+    code = bytes.fromhex(
+        "33FC 0F00 00DFF180"                    # move.w #$0F00,COLOR00
+        "0839 0007 00BFE001 66F6"               # wait: btst #7,$BFE001; bne wait
+        "33FC 000F 00DFF180 60FE")              # move.w #$000F,COLOR00; bra *
+    rom[0x10:0x10 + len(code)] = code
+    return bytes(rom)
+
+
+def check_amiga(box):
+    """The Amiga player ('amiga'): a stand-in Kickstart made here (tiny_kickstart) as AMIGA/KICK.ROM and an empty
+    floppy image -- its 352 x 272 picture twice as large (704 x 544) in the middle of the screen, red; blue with
+    fire held by a test script."""
+    import fat_image
+    stick = VirtualStick(fat_image.build({"AMIGA/KICK.ROM": tiny_kickstart(), "AMIGA/T.ADF": bytes(901120)},
+                                         fat=16, size_mb=16, partition=False))
+    box.usb.attach("high", stick)
+    box.run(4.0)
+    sim = box.sim
+    seen = []
+    for script in ("", "-k 0:01 "):
+        out = box.keys(f"amiga {script}1:/AMIGA/T.ADF\r".encode(), until=b"Esc ends", timeout=30)
+        box.run(1.0)
+        inside = [fb_pixel(sim, x, y) for x, y in ((288, 88), (640, 360), (991, 631))]
+        outside = [fb_pixel(sim, x, y) for x, y in ((287, 360), (992, 360), (640, 87), (640, 632))]
+        seen.append((inside, outside, out))
+        box.keys(b"\x03", timeout=10)
+
+    def hue(v):
+        r, b = (v >> 10) & 31, v & 31
+        return "red" if r > b + 8 else "blue" if b > r + 8 else ""
+    (plain, sides, out), (held, _, _) = seen
+    check("ROM: 1:/AMIGA/kick.rom" in out and "Kickstart 34.5, a floppy in DF0:" in out and len(set(plain)) == 1
+          and hue(plain[0]) == "red" and len(set(held)) == 1 and hue(held[0]) == "blue"
+          and set(sides) == {rgb555(0, 0, 0)},
+          "amiga: a stand-in Kickstart made here runs: the picture red over 704 x 544 in the middle of the screen, "
+          f"black around it; blue while fire is held {[hex(v) for v in plain + held + sides]}")
+    box.usb.detach()
+    box.run(0.6)
+
+
+def tiny_dos_program():
+    """A DOS .com program made here: VGA mode 13h, the whole screen colour 4 (red), then it polls the keyboard
+    controller's port 0x60 for Space's make code (0x39) and fills it with colour 1 (blue)."""
+    return bytes.fromhex(
+        "B81300 CD10"                            # mov ax,13h; int 10h
+        "B800A0 8EC0 31FF B900FA B004 F3AA"      # es = A000; di = 0; cx = 64000; al = 4; rep stosb
+        "E460 3C39 75FA"                         # wait: in al,60h; cmp al,39h; jne wait
+        "31FF B900FA B001 F3AA EBFE")            # di = 0; cx = 64000; al = 1; rep stosb; jmp $
+
+
+def check_dos(box):
+    """The DOS player ('dos'): a .com made here (tiny_dos_program) -- its 320 x 200 picture three times as large
+    (960 x 600) in the middle of the screen, red; blue with the pad's B (Space) held by a test script."""
+    import fat_image
+    stick = VirtualStick(fat_image.build({"DOS/T.COM": tiny_dos_program()}, fat=12, size_mb=1, partition=False))
+    box.usb.attach("high", stick)
+    box.run(4.0)
+    sim = box.sim
+    seen = []
+    for script in ("", "-k 0:02 "):
+        out = box.keys(f"dos {script}1:/DOS/T.COM\r".encode(), until=b"typed on it", timeout=30)
+        box.run(1.0)
+        inside = [fb_pixel(sim, x, y) for x, y in ((160, 60), (640, 360), (1119, 659))]
+        outside = [fb_pixel(sim, x, y) for x, y in ((159, 360), (1120, 360), (640, 59), (640, 660))]
+        seen.append((inside, outside, out))
+        box.keys(b"\x03", timeout=10)
+
+    def hue(v):
+        r, b = (v >> 10) & 31, v & 31
+        return "red" if r > b + 8 else "blue" if b > r + 8 else ""
+    (plain, sides, out), (held, _, _) = seen
+    check("T.COM" in out.upper() and len(set(plain)) == 1 and hue(plain[0]) == "red" and len(set(held)) == 1
+          and hue(held[0]) == "blue" and set(sides) == {rgb555(0, 0, 0)},
+          "dos: a .com made here runs: the picture red over 960 x 600 in the middle of the screen, black around "
+          f"it; blue while Space (the pad's B) is held {[hex(v) for v in plain + held + sides]}")
+    box.usb.detach()
+    box.run(0.6)
+
+
+def tiny_ts(stream_type):
+    """A transport stream of a PAT, a PMT (program 1 at PID 0x100: one video stream of that type at PID 0x101) and
+    ten packets of that stream (a PES header, zeros)."""
+    def crc32_mpeg(b):
+        c = 0xFFFFFFFF
+        for x in b:
+            c ^= x << 24
+            for _ in range(8):
+                c = (c << 1) ^ 0x04C11DB7 if c & 0x80000000 else c << 1
+            c &= 0xFFFFFFFF
+        return c
+
+    def section(table_id, ext, body):
+        s = bytes([table_id]) + (0xB000 | (len(body) + 9)).to_bytes(2, "big") + ext.to_bytes(2, "big") + \
+            bytes([0xC1, 0, 0]) + body
+        return s + crc32_mpeg(s).to_bytes(4, "big")
+
+    def packet(pid, payload, start, cc):
+        p = bytes([0x47, (0x40 if start else 0) | pid >> 8, pid & 0xFF, 0x10 | cc & 15]) + payload
+        return p + b"\xff" * (188 - len(p))
+    pat = section(0x00, 1, bytes([0, 1, 0xE1, 0x00]))
+    pmt = section(0x02, 1, bytes([0xE1, 0x01, 0xF0, 0x00, stream_type, 0xE1, 0x01, 0xF0, 0x00]))
+    out = packet(0, b"\x00" + pat, True, 0) + packet(0x100, b"\x00" + pmt, True, 0)
+    pes = b"\x00\x00\x01\xe0\x00\x00\x80\x00\x00"
+    for i in range(10):
+        out += packet(0x101, (pes if not i else b"") + bytes(184 - (len(pes) if not i else 0)), not i, i)
+    return out
+
+
+def check_play(box):
+    """The video player ('play'): the emulator has no MPEG decoder, so only how a file is taken apart -- an H.264
+    stream is named and not played, a file of no stream refused; 'av status' reads the decoder's registers."""
+    import fat_image
+    stick = VirtualStick(fat_image.build({"VIDEO/AVC.TS": tiny_ts(0x1B), "VIDEO/JUNK.TS": bytes(range(256)) * 8},
+                                         fat=12, size_mb=1, partition=False))
+    box.usb.attach("high", stick)
+    box.run(4.0)
+    avc = shell(box, "play 1:/VIDEO/AVC.TS", timeout=60)
+    junk = shell(box, "play 1:/VIDEO/JUNK.TS", timeout=60)
+    status = shell(box, "av status", timeout=30)
+    check("transport stream" in avc and "video PID 0x101 (type 0x1b" in avc and "not MPEG-1/2 (stream type 0x1b)"
+          in avc and "not a transport stream" in junk and "decoder 0xb8004200" in status,
+          f"play: an H.264 .ts named and not played, junk refused, av status {avc!r} {junk!r}")
     box.usb.detach()
     box.run(0.6)
 
@@ -1743,6 +2197,20 @@ def run(args):
     # ---- more than seven USB devices ----------------------------------------------
     check_many_devices(box)
 
+    # ---- a junk packet from the keyboard, a hub that stops answering ----------------
+    check_usb_faults(box)
+
+    # ---- the Game Boy player --------------------------------------------------------
+    check_gameboy(box)
+
+    # ---- the Master System, Game Gear and ZX Spectrum players -----------------------
+    check_sega_and_spectrum(box)
+    check_atari(box)
+    check_c64(box)
+    check_amiga(box)
+    check_dos(box)
+    check_play(box)
+
     # ---- a shell on the USB disks: cd, mkdir, rm, ... ------------------------------
     check_shell(box)
 
@@ -1795,7 +2263,9 @@ def run(args):
     start = box.sim._vtime()
     while box.sim._vtime() < start + 0.5:
         box.t.read(4096, start + 0.5 - box.sim._vtime())
-    while box.sim._vtime() < start + 4:
+    # (8 s: the bootloader checks the main code before it looks for 'c' -- 4.7 s of emulated time for the 588 KB
+    # demo with the Z80 / 2600 players; maciej_uart.py on the real box keeps sending for up to 90 s)
+    while box.sim._vtime() < start + 8:
         box.t.write(b"c")
         nxt = box.sim._vtime() + 1 / 30
         while box.sim._vtime() < nxt:
@@ -1812,7 +2282,7 @@ def run(args):
     check("Version: v4" in box.boot().decode("latin-1"), "and its reboot command starts the demo again")
     box.t.pending.clear()
     mark = len(box.t.received)
-    deadline = box.sim._vtime() + 5
+    deadline = box.sim._vtime() + 8
     while box.sim._vtime() < deadline:                 # maciej_uart.capture_boot's pacing, in emulated time
         box.t.write(b"c")
         nxt = min(deadline, box.sim._vtime() + 0.05)

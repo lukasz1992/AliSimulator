@@ -740,6 +740,10 @@ static void command(struct session *s, char *l)
     char v[340], p[340];
     int moves = verb_is(verb, "LIST") || verb_is(verb, "NLST") || verb_is(verb, "MLSD") || verb_is(verb, "RETR")
                 || verb_is(verb, "STOR") || verb_is(verb, "APPE");
+    if ((verb_is(verb, "RETR") || verb_is(verb, "STOR") || verb_is(verb, "APPE")) && http_disk_busy()) {
+        reply(s, "450 The box's web page moves a file now: try again in a moment");
+        return;
+    }
     if (xfer && (xs == s ? !verb_is(verb, "ABOR") && !verb_is(verb, "STAT") && !verb_is(verb, "NOOP")
                                && !verb_is(verb, "QUIT")
                          : moves)
@@ -1013,6 +1017,11 @@ const char *ftp_poll(void)
     if (say)
         return say;
     return pump();
+}
+
+int ftp_disk_busy(void)
+{
+    return xfer == X_RETR || xfer == X_STOR;
 }
 
 void ftp_status(void)

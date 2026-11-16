@@ -16,6 +16,16 @@
    the frames are read on every main loop pass (on the box: netload took
    296 KB in 0.11 s, wget 1 MB from the internet in 1.3 s).
 
+   The same network goes through a GSM / LTE module's RNDIS function (the
+   SIMCom A7670E's interfaces 0 and 1, Linux's usb0): Ethernet frames in
+   RNDIS packet messages (a 44-byte header each), set up with RNDIS control
+   messages (INITIALIZE, QUERY of its MAC address, SET of its packet filter)
+   over endpoint 0; the module's DHCP gives the address, its router the way
+   out over the mobile network.  One link carries the network at a time --
+   the Ethernet adapter's when there is one, the module's when there is no
+   adapter, when the adapter is unplugged, or when it gets no DHCP answer --
+   so wget, ping, NTP, telnet, FTP and netload go through whichever is there.
+
    Not re-entrant: a frame is read into the one rx[] and handled from there,
    so the code that reads frames (take, eth_poll) counts itself in `depth`
    and eth_service refuses to run inside it (the telnet console's output
@@ -39,16 +49,23 @@ static struct {
     u32 rx, tx, rx_ignored;
     u32 rx_ours, rx_multi;              /* frames to our MAC; broadcasts and multicasts */
     u32 dhcp_ours, dhcp_multi;          /* DHCP answers: sent to our MAC, broadcast */
-    u8 again;                           /* the packet filter was set again while DHCP had no answer */
     u16 ip_id;
     u32 bound;                          /* DHCP acknowledgements so far (net.c sets the clock after the first) */
     const char *pending;                /* a line from a frame handled outside eth_poll, for its next pass */
+    u8 rndis;                           /* the link is an LTE module's RNDIS function (else CDC ECM) */
+    u32 rndis_id;                       /* its control messages' request IDs */
 } eth;
-static int depth;                       /* frames being read / handled (rx[] in use) */
-static u8 revived, reviving;            /* the adapter was set up again while DHCP had no answer (once, until
-                                           it has one or another is plugged in); that is under way */
 
-static u8 rx[FRAME_MAX + 512], tx[FRAME_MAX + 2];
+/* the links there are: [0] an Ethernet adapter (CDC ECM), [1] an LTE module (RNDIS); eth is the one in use */
+static struct link {
+    u8 used, device, ctrl_if, data_if, data_alt, in_ep, out_ep, mac_string;
+    u16 maxp;
+} links[2];
+static int activate(int which);
+static int depth;                       /* frames being read / handled (rx[] in use) */
+
+static u8 rx[FRAME_MAX + 44 + 512], tx[FRAME_MAX + 2];
+static u8 rtx[44 + FRAME_MAX + 2];      /* a frame in its RNDIS packet message */
 static char said[96];
 
 #define ARP_ENTRIES 8
@@ -142,12 +159,34 @@ static void set_filter(void)
 }
 
 /* ---- frames ---- */
+static void put32le(u8 *p, u32 v)
+{
+    p[0] = (u8)v, p[1] = (u8)(v >> 8), p[2] = (u8)(v >> 16), p[3] = (u8)(v >> 24);
+}
+
+static u32 le32(const u8 *p)
+{
+    return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
+}
+
 static int send_frame(u8 *f, int len)
 {
     while (len < 60)                            /* (the shortest Ethernet frame, without its CRC) */
         f[len++] = 0;
+    if (eth.rndis) {                            /* REMOTE_NDIS_PACKET_MSG: the frame 36 bytes after its offset field */
+        for (int i = 0; i < 44; i++)
+            rtx[i] = 0;
+        put32le(rtx, 1);
+        put32le(rtx + 4, (u32)(44 + len));
+        put32le(rtx + 8, 36);
+        put32le(rtx + 12, (u32)len);
+        copy(rtx + 44, f, len);
+        f = rtx;
+        len += 44;
+    }
     if (!(len % eth.maxp))
-        f[len++] = 0;                           /* (a whole number of packets would need a zero-length one) */
+        f[len++] = 0;                           /* (a whole number of packets would need a zero-length one; RNDIS
+                                                   takes one byte more instead, its message's length unchanged) */
     if (usb_bulk_out(eth.device, eth.out_ep, eth.maxp, f, (u32)len, 200) < 0)
         return -1;
     eth.tx++;
@@ -162,12 +201,26 @@ static int receive(u32 wait_ms)
         int k = usb_bulk_in_packet(eth.device, eth.in_ep, eth.maxp, rx + len, len ? 20 : wait_ms);
         if (k == -1)
             return -1;
-        if (k <= 0)
-            return len;                         /* (none in time; a zero-length packet ends a frame too) */
+        if (k <= 0) {                           /* (none in time; a zero-length packet ends a frame too) */
+            if (!len || !eth.rndis)
+                return len;
+            break;                              /* (an RNDIS message of whole packets: unwrapped below) */
+        }
         len += k;
         if (k < eth.maxp || len + eth.maxp > (int)sizeof(rx))
-            return len;
+            break;
     }
+    if (!eth.rndis)
+        return len;
+    /* an RNDIS packet message: its frame moved to rx[0] (anything else -- a status message -- is no frame) */
+    if (len < 44 || le32(rx) != 1)
+        return 0;
+    u32 at = 8 + le32(rx + 8), n = le32(rx + 12);
+    if (at < 44 || at > (u32)len || n > (u32)len - at || n > FRAME_MAX)
+        return 0;
+    for (u32 i = 0; i < n; i++)
+        rx[i] = rx[at + i];
+    return (int)n;
 }
 
 static u8 *ether(u8 *f, const u8 *to, u16 type)
@@ -336,7 +389,6 @@ static const char *dhcp_input(const u8 *b, int len)
         eth.lease = lease;
         eth.dhcp = 3;
         eth.bound++;
-        revived = 0;
         char a[16], r[16];
         ip_text(a, sizeof(a), eth.ip);
         ip_text(r, sizeof(r), eth.router);
@@ -606,25 +658,15 @@ const char *eth_poll(void)
         if (++eth.dhcp_tries > 8) {
             eth.dhcp = 4;
             line = "eth0: no answer from a DHCP server ('dhcp' asks again)";
-        } else {
-            /* No offer: the adapter may not send.  On the box an RTL8153 plugged in while the demo ran took
-               its frames (10 DISCOVERs in 3 minutes: each bulk OUT done) and received the network's
-               broadcasts, but no offer came -- the router answers by broadcast, so it never got one; after
-               a restart of the box the same adapter had its address in 2 s, and plugged in again later it
-               had too.  So after the second DISCOVER its packet filter is set again, and after the fourth
-               (14 s) the adapter is set up again as if it had been plugged in again: its hub port reset,
-               its configuration, eth_attach -- once, until DHCP has an answer */
-            if (eth.dhcp == 1 && eth.dhcp_tries == 2) {
-                set_filter();
-                eth.again = 1;
-            } else if (eth.dhcp == 1 && eth.dhcp_tries == 4 && !revived) {
-                revived = 1;
-                reviving = 1;
-                int r = usb_set_up_again(eth.device);
-                reviving = 0;
-                return r < 0 ? "eth0: no DHCP answer, and the adapter did not come back from its port's reset"
-                             : "eth0: no DHCP answer: the adapter set up again (its port reset)";
+            if (!eth.rndis && links[1].used) {  /* the LTE module's link instead */
+                if (activate(1) == 0) {
+                    line = "eth0: no DHCP answer on Ethernet: the network goes through the LTE module (RNDIS) instead";
+                } else {
+                    line = said;
+                    (void)activate(0);          /* (it did not start: Ethernet again) */
+                }
             }
+        } else {
             dhcp_send(eth.dhcp == 1 ? 1 : 3);
             eth.dhcp_next = now_ms() + 2000u * (u32)(eth.dhcp_tries < 4 ? eth.dhcp_tries : 4);
         }
@@ -718,56 +760,160 @@ int eth_dns_result(u8 ip[4])                    /* its answer: 1 (ip), 0 none ye
 }
 
 /* ---- the commands ---- */
-const char *eth_attach(u8 device, u8 ctrl_if, u8 data_if, u8 data_alt, u8 in_ep, u8 out_ep, u16 maxp, u8 int_ep,
-                       u8 mac_string)
+/* an RNDIS control message to the module and its answer of type `want`: the answer's bytes, -1 */
+static int rndis_call(const struct link *l, u8 *m, u32 len, u32 want, u8 *answer, int max)
 {
-    (void)int_ep;
-    if (eth.used && eth.device != device)
-        return "an Ethernet port, but one is in use already: left alone";
-    if (usb_set_interface(device, data_if, data_alt) < 0)
-        return "an Ethernet port that refused its data interface's setting";
-    u8 s[64];
-    int n = usb_request(device, 0x80, 0x06, (u16)(0x0300 | mac_string), 0x0409, s, sizeof(s), 500);
-    for (int i = 0; i < 6; i++) {
-        int hi = n >= 2 + 24 ? hexval(s[2 + 4 * i]) : -1, lo = n >= 2 + 24 ? hexval(s[4 + 4 * i]) : -1;
-        if (hi < 0 || lo < 0)
-            return "an Ethernet port without a MAC address";
-        eth.mac[i] = (u8)(hi << 4 | lo);
+    put32le(m + 4, len);
+    put32le(m + 8, ++eth.rndis_id);
+    if (usb_request(l->device, 0x21, 0x00, 0, l->ctrl_if, m, (u16)len, 500) < 0)      /* SEND_ENCAPSULATED_COMMAND */
+        return -1;
+    u64 start = now_ms();
+    while (now_ms() - start < 1000) {                   /* (its answer is there when it says so on its interrupt
+                                                           endpoint; asked for instead, for up to a second) */
+        int n = usb_request(l->device, 0xA1, 0x01, 0, l->ctrl_if, answer, (u16)max, 100);  /* GET_ENCAPSULATED_RESPONSE */
+        if (n >= 16 && le32(answer) == want && le32(answer + 8) == eth.rndis_id)
+            return n;
+        delay_ms(10);
+    }
+    return -1;
+}
+
+/* the module's RNDIS function made ready: its MAC address into eth.mac, its frames let through.  0, or why not */
+static const char *rndis_start(const struct link *l)
+{
+    static u8 m[64], a[256];
+    for (int i = 0; i < 64; i++)
+        m[i] = 0;
+    put32le(m, 2);                                      /* INITIALIZE: version 1.0, transfers of 1600 bytes */
+    put32le(m + 12, 1);
+    put32le(m + 20, 1600);
+    if (rndis_call(l, m, 24, 0x80000002, a, sizeof(a)) < 0 || le32(a + 12))
+        return "it did not answer RNDIS's INITIALIZE";
+    for (int i = 0; i < 64; i++)
+        m[i] = 0;
+    put32le(m, 4);                                      /* QUERY OID_802_3_PERMANENT_ADDRESS */
+    put32le(m + 12, 0x01010101);
+    put32le(m + 20, 20);
+    int n = rndis_call(l, m, 28, 0x80000004, a, sizeof(a));
+    u32 at = n >= 24 ? 8 + le32(a + 20) : 0;
+    if (n < 24 || le32(a + 12) || le32(a + 16) < 6 || at + 6 > (u32)n)
+        return "it did not tell its MAC address";
+    copy(eth.mac, a + at, 6);
+    for (int i = 0; i < 64; i++)
+        m[i] = 0;
+    put32le(m, 5);                                      /* SET OID_GEN_CURRENT_PACKET_FILTER: directed, multicast,
+                                                           broadcast */
+    put32le(m + 12, 0x0001010E);
+    put32le(m + 16, 4);
+    put32le(m + 20, 20);
+    put32le(m + 28, 0x0B);
+    if (rndis_call(l, m, 32, 0x80000005, a, sizeof(a)) < 0 || le32(a + 12))
+        return "it refused RNDIS's packet filter";
+    return 0;
+}
+
+/* link `which` made the one in use: set up, its address asked of DHCP.  A line about it */
+static int activate(int which)
+{
+    const struct link *l = &links[which];
+    static const char *why;
+    why = 0;
+    eth.used = 0;
+    eth.rndis = (u8)which;
+    if (which) {
+        why = rndis_start(l);
+    } else if (usb_set_interface(l->device, l->data_if, l->data_alt) < 0) {
+        why = "it refused its data interface's setting";
+    } else {
+        u8 s[64];
+        int n = usb_request(l->device, 0x80, 0x06, (u16)(0x0300 | l->mac_string), 0x0409, s, sizeof(s), 500);
+        for (int i = 0; i < 6 && !why; i++) {
+            int hi = n >= 2 + 24 ? hexval(s[2 + 4 * i]) : -1, lo = n >= 2 + 24 ? hexval(s[4 + 4 * i]) : -1;
+            if (hi < 0 || lo < 0)
+                why = "it has no MAC address";
+            else
+                eth.mac[i] = (u8)(hi << 4 | lo);
+        }
+    }
+    if (why) {
+        usnprintf(said, sizeof(said), "eth0: %s (device %u): %s", which ? "the LTE module's link (RNDIS)"
+                                                                          : "an Ethernet port", l->device, why);
+        return -1;
     }
     eth.used = 1;
-    eth.device = device;
-    eth.ctrl_if = ctrl_if;
-    set_filter();
-    if (!reviving)
-        revived = 0;
-    eth.in_ep = in_ep;
-    eth.out_ep = out_ep;
-    eth.maxp = maxp;
+    eth.device = l->device;
+    eth.ctrl_if = l->ctrl_if;
+    if (!which)
+        set_filter();
+    eth.in_ep = l->in_ep;
+    eth.out_ep = l->out_ep;
+    eth.maxp = l->maxp;
     eth.rx = eth.tx = eth.rx_ignored = eth.rx_ours = eth.rx_multi = eth.dhcp_ours = eth.dhcp_multi = 0;
-    eth.again = 0;
     for (int i = 0; i < 4; i++)
         eth.ip[i] = 0;
     for (int i = 0; i < ARP_ENTRIES; i++)
         arp_table[i].used = 0;
     tcp_drop_all();                             /* (an address of its own again: the old connections are gone) */
     dhcp_start();
-    usnprintf(said, sizeof(said), "eth0: Ethernet (CDC ECM), MAC %02x:%02x:%02x:%02x:%02x:%02x; DHCP asks for an "
-              "address", eth.mac[0], eth.mac[1], eth.mac[2], eth.mac[3], eth.mac[4], eth.mac[5]);
+    usnprintf(said, sizeof(said), "eth0: %s, MAC %02x:%02x:%02x:%02x:%02x:%02x; DHCP asks for an address",
+              which ? "the LTE module's link (RNDIS)" : "Ethernet (CDC ECM)", eth.mac[0], eth.mac[1], eth.mac[2],
+              eth.mac[3], eth.mac[4], eth.mac[5]);
+    return 0;
+}
+
+const char *eth_attach(u8 device, u8 ctrl_if, u8 data_if, u8 data_alt, u8 in_ep, u8 out_ep, u16 maxp, u8 int_ep,
+                       u8 mac_string)
+{
+    (void)int_ep;
+    if (links[0].used && links[0].device != device)
+        return "an Ethernet port, but one is in use already: left alone";
+    links[0] = (struct link){1, device, ctrl_if, data_if, data_alt, in_ep, out_ep, mac_string, maxp};
+    if (eth.used && eth.rndis)
+        uprintf("eth0: an Ethernet port came: the network goes through it from now on, not the LTE module\n");
+    if (activate(0) < 0 && links[1].used) {
+        uprintf("%s\n", said);
+        (void)activate(1);                      /* (it did not start: the module's link again) */
+    }
+    return said;
+}
+
+/* an LTE module's RNDIS function (control interface, data interface's bulk endpoints): the network's link
+   when there is no Ethernet port in use */
+const char *eth_attach_rndis(u8 device, u8 ctrl_if, u8 data_if, u8 in_ep, u8 out_ep, u16 maxp)
+{
+    links[1] = (struct link){1, device, ctrl_if, data_if, 0, in_ep, out_ep, 0, maxp};
+    if (eth.used && !eth.rndis && eth.dhcp != 4) {
+        usnprintf(said, sizeof(said), "a network link through the LTE module (RNDIS): kept for when the Ethernet "
+                  "port is gone or gets no address");
+        return said;
+    }
+    (void)activate(1);
     return said;
 }
 
 void eth_detach(u8 device)
 {
-    if (eth.used && (!device || eth.device == device)) {
+    int was = eth.used ? eth.rndis : -1;
+    for (int i = 0; i < 2; i++)
+        if (links[i].used && (!device || links[i].device == device))
+            links[i].used = 0;
+    if (was >= 0 && !links[was].used) {
         eth.used = 0;
         tcp_drop_all();
+    }
+    if (!eth.used) {                            /* (the other link, when there is one: also after one that did not
+                                                   start was unplugged) */
+        for (int i = 0; i < 2 && !eth.used; i++)
+            if (links[i].used && activate(i) == 0)
+                eth.pending = said;             /* (said on the next pass: "eth0: ... DHCP asks") */
     }
 }
 
 void eth_show(void)
 {
     if (!eth.used) {
-        uprintf("no Ethernet port (a USB Ethernet adapter with CDC ECM: an RTL8153's, ...)\n");
+        uprintf("no network link (a USB Ethernet adapter with CDC ECM -- an RTL8153's --, or an LTE module's RNDIS"
+                "%s)\n", links[0].used || links[1].used ? ": the one there did not start" : "");
         return;
     }
     char a[16], m[16], r[16], d[16];
@@ -775,18 +921,19 @@ void eth_show(void)
     ip_text(m, sizeof(m), eth.mask);
     ip_text(r, sizeof(r), eth.router);
     ip_text(d, sizeof(d), eth.dns);
-    uprintf("eth0: device %u, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", eth.device, eth.mac[0], eth.mac[1], eth.mac[2],
-            eth.mac[3], eth.mac[4], eth.mac[5]);
+    uprintf("eth0: %s, device %u, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", eth.rndis ? "the LTE module (RNDIS)"
+            : "Ethernet (CDC ECM)", eth.device, eth.mac[0], eth.mac[1], eth.mac[2], eth.mac[3], eth.mac[4], eth.mac[5]);
     if (eth.dhcp == 3)
         uprintf("  inet %s, mask %s, router %s, DNS %s (DHCP, lease %u s)\n", a, m, r, d, eth.lease);
     else
         uprintf("  no address yet (DHCP: %s)\n", eth.dhcp == 4 ? "no answer" : eth.dhcp == 2 ? "requesting" : "asking");
     uprintf("  %u frames in (%u to this MAC, %u broadcast / multicast), %u out\n", eth.rx, eth.rx_ours,
             eth.rx_multi, eth.tx);
-    if (eth.dhcp != 3 || eth.again || revived)
-        uprintf("  DHCP answers seen: %u to this MAC, %u broadcast%s%s\n", eth.dhcp_ours, eth.dhcp_multi,
-                eth.again ? "; the packet filter was set again" : "",
-                revived ? "; the adapter was set up again" : "");
+    if (eth.dhcp != 3)
+        uprintf("  DHCP answers seen: %u to this MAC, %u broadcast\n", eth.dhcp_ours, eth.dhcp_multi);
+    if (links[!eth.rndis].used)
+        uprintf("  also there, not in use: %s (device %u)%s\n", eth.rndis ? "an Ethernet port" : "the LTE module's link "
+                "(RNDIS)", links[!eth.rndis].device, eth.rndis ? "" : " -- used when Ethernet gets no address or goes");
 }
 
 void eth_dhcp(void)

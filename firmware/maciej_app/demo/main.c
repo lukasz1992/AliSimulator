@@ -16,6 +16,9 @@
    original bootloader, whose boot window the updater then catches. */
 #include "hw.h"
 #include "video_init.h"
+#include "rf.h"
+#include "snd.h"
+#include "av.h"
 
 /* ------------------------------------------------------------------ */
 /* small string helpers (no libc)                                      */
@@ -365,8 +368,8 @@ static int poll_panel(void)
 /* ------------------------------------------------------------------ */
 /* the command line                                                    */
 /* ------------------------------------------------------------------ */
-#define LINE_MAX 96
-#define HISTORY 16
+#define LINE_MAX 160                    /* (a test's button script for a game needs the room) */
+#define HISTORY 64
 #define ARGS_MAX 48                     /* (as many words as a line can hold) */
 
 static char line[LINE_MAX];
@@ -378,9 +381,17 @@ static int line_len;
    AT+CMGS="..." need their quotes */
 static char raw_line[LINE_MAX];
 static const char *raw_rest;
+/* the history: the commands entered, oldest first (a command entered again moves to the end; one typed with a
+   space in front is not kept), 'history' numbers them from 1.  history_pos: the one shown while Up / Down
+   look through them (history_n: the line being typed, kept in pending -- its text is also what Up / Down
+   look for: the commands that start with it) */
 static char history[HISTORY][LINE_MAX];
-static int history_count, history_pos;
+static int history_n, history_pos;
+static char pending[LINE_MAX];
+static int line_cur;                    /* the cursor in the line (line_len: at its end) */
+static char killed[LINE_MAX];           /* what Ctrl-K / Ctrl-U / Ctrl-W took out: Ctrl-Y puts it back */
 static int esc_state, esc_num;
+static int tabs;                        /* Tabs pressed in a row (the second lists what completes the word) */
 
 /* "m3801> ", with the current directory once 'cd' chose one: "m3801 3:/docs> " */
 static void prompt(void)
@@ -397,11 +408,35 @@ static void prompt(void)
 
 static void show_line(void)
 {
-    /* clear the terminal line and print the prompt and the buffer again */
+    /* clear the terminal line and print the prompt and the buffer again, the cursor back where it is */
     uart_puts("\r\x1b[K");
     prompt();
     for (int i = 0; i < line_len; i++)
         uart_putc(line[i]);
+    if (line_cur < line_len)
+        uprintf("\x1b[%dD", line_len - line_cur);
+}
+
+/* a command entered: to the history's end (the same command earlier taken out; the oldest dropped when it is
+   full; one typed with a space first not kept) */
+static void history_add(const char *l)
+{
+    if (!l[0] || l[0] == ' ')
+        return;
+    int out = 0;
+    for (int i = 0; i < history_n; i++)
+        if (!str_eq(history[i], l)) {
+            if (out != i)
+                str_copy(history[out], history[i], LINE_MAX);
+            out++;
+        }
+    history_n = out;
+    if (history_n == HISTORY) {
+        for (int i = 1; i < HISTORY; i++)
+            str_copy(history[i - 1], history[i], LINE_MAX);
+        history_n--;
+    }
+    str_copy(history[history_n++], l, LINE_MAX);
 }
 
 /* the line being typed, on the TV too (the command line box; the main loop
@@ -455,6 +490,17 @@ static void cmd_video(int argc, char **argv);
 static void cmd_testscreen(int argc, char **argv);
 static void cmd_console(int argc, char **argv);
 static void cmd_explorer(int argc, char **argv);
+static void cmd_nes(int argc, char **argv);
+static void cmd_gb(int argc, char **argv);
+static void cmd_sms(int argc, char **argv);
+static void cmd_gg(int argc, char **argv);
+static void cmd_zx(int argc, char **argv);
+static void cmd_a26(int argc, char **argv);
+static void cmd_c64(int argc, char **argv);
+static void cmd_amiga(int argc, char **argv);
+static void cmd_dos(int argc, char **argv);
+static void cmd_view(int argc, char **argv);
+static void cmd_rf(int argc, char **argv);
 static void cmd_history(int argc, char **argv);
 static void cmd_cd(int argc, char **argv);
 static void cmd_pwd(int argc, char **argv);
@@ -469,6 +515,7 @@ static void cmd_ntfs(int argc, char **argv);
 static void cmd_cp(int argc, char **argv);
 static void cmd_mv(int argc, char **argv);
 static void cmd_tty(int argc, char **argv);
+static void cmd_stty(int argc, char **argv);
 static void cmd_ifconfig(int argc, char **argv);
 static void cmd_dhcp(int argc, char **argv);
 static void cmd_arp(int argc, char **argv);
@@ -552,7 +599,8 @@ static const struct command commands[] = {
                    "keyboard (it types too) or 'console' brings the console back", cmd_testscreen},
     {"console", "", "the console on the TV again", cmd_console},
     {"explorer", "[n:][path]", "a file explorer on the TV, in the current directory (cd follows it, it follows cd; "
-     "with a path: cd there first): USB keyboard Up/Down/PgUp/PgDn/Home/End, Enter opens, Backspace goes up, "
+     "with a path: cd there first): USB keyboard Up/Down/PgUp/PgDn/Home/End, Enter opens (a picture: the viewer, "
+     "a game's file -- .nes, .gb, .gbc, .sms, .gg, .sna, .z80, .tap, .tzx, .a26, .prg, .t64, .d64, .adf, .exe, .com: the game), Backspace goes up, "
      "'/' or Tab types a path, Esc: the console again; the mouse clicks, double-clicks, scrolls; on FAT: F2 "
      "renames, F7 makes a directory, Delete / F8 deletes (y), F5 / F6 mark a file to copy / move and Insert "
      "pastes it here", cmd_explorer},
@@ -572,6 +620,55 @@ static const struct command commands[] = {
      cmd_cd},
     {"pwd", "", "the current directory", cmd_pwd},
     {"cat", "[n:]path", "a text file on a USB disk (Ctrl-C stops it)", cmd_cat},
+    {"nes", "[-f frames] [-k script] <file>", "play a NES cartridge file (.nes) on the TV: arrows or W A S D, "
+     "X = A, Z = B, Enter = Start, Tab = Select; Ctrl-C or Esc ends (-f: that many frames as fast as they go, "
+     "then the picture's CRC-32; -k: a test's buttons, frame:hex,...)", cmd_nes},
+    {"gb", "[-f frames] [-k script] <file>", "play a Game Boy cartridge file (.gb, .gbc) on the TV -- a Game Boy "
+     "Color game in its colours, an older one in four shades: the keys and the options of nes", cmd_gb},
+    {"sms", "[-f frames] [-k script] <file>", "play a Sega Master System cartridge file (.sms) on the TV: X = "
+     "button 2, Z = button 1, Enter = Pause; the other keys and the options of nes", cmd_sms},
+    {"gg", "[-f frames] [-k script] <file>", "play a Sega Game Gear cartridge file (.gg) on the TV: X = button 2, "
+     "Z = button 1, Enter = Start; the options of nes", cmd_gg},
+    {"zx", "[-f frames] [-k script] [file]", "a ZX Spectrum 48K on the TV: a snapshot (.sna, .z80) or a tape "
+     "(.tap, .tzx: loaded by itself with LOAD \"\"); no file: BASIC.  Its ROM is a file 48.rom beside the "
+     "program, in zx/ or at the top of its disk.  The USB keyboard is the Spectrum's (Shift = CAPS SHIFT, "
+     "Ctrl / Alt = SYMBOL SHIFT, Backspace = DELETE), the arrows also a Kempston joystick (fire: the remote's "
+     "OK); typed on the UART / telnet, characters are typed on it; Esc ends", cmd_zx},
+    {"a26", "[-f frames] [-k script] <file>", "play an Atari 2600 cartridge file (.a26, .bin: 2K, 4K, F8, F6, F4, "
+     "their Superchip RAM, FE, E0, 3F, E7, FA) on the TV: arrows or W A S D, X or Z = fire, Enter = the "
+     "console's Reset, Tab = Select; the options of nes", cmd_a26},
+    {"c64", "[-f frames] [-k script] [file]", "a Commodore 64 (PAL) on the TV: a program (.prg, .t64) or a "
+     "disk (.d64), loaded and RUN by itself (LOAD from the disk works later too); no file: BASIC.  Its ROMs are "
+     "kernal.rom, basic.rom and chargen.rom beside the program, in c64/ or at the top of its disk.  The USB "
+     "keyboard is the C64's (Tab = RUN/STOP, PageUp = RESTORE, Alt = C=), its arrows joystick 2 (fire: right "
+     "Ctrl or the remote's OK; F9 swaps the ports); typed on the UART / telnet, characters are typed on it; "
+     "Esc ends", cmd_c64},
+    {"amiga", "[-f frames] [-k script] [file.adf]", "an Amiga 500 (PAL) on the TV, a floppy image (.adf) in its "
+     "drive (no file: none).  Its Kickstart is kick.rom (256 or 512 KB), or AROS's free aros-rom.bin with "
+     "aros-ext.bin, beside the disk, in amiga/ or at the top of its disk.  The USB keyboard is the Amiga's, its "
+     "arrows the joystick (fire: right Ctrl or the remote's OK), Page Up / Down or the remote's 0 the mouse "
+     "button; typed on the UART / telnet, characters are typed on it; Esc ends", cmd_amiga},
+    {"dos", "[-f frames] [-k script] <file.exe>", "a DOS PC (a 286 AT with a VGA) on the TV running a DOS "
+     "program (.exe, .com): the BIOS and DOS built in, its own file readable, no sound.  The USB keyboard is "
+     "the PC's (Esc ends the player); the remote: arrows, OK = Up, 0 = Space, MENU = Enter, INFO = Esc; typed "
+     "on the UART / telnet, characters are typed on it", cmd_dos},
+    {"rf", "<init|tune|status|scan|services|ts|spectrum|...>", "the aerial input (DVB-T): init the MxL603 tuner and the "
+     "chip's demodulator, tune <MHz|channel> [6|7|8], status (lock, level, quality), scan [vhf|all|<from> <to>], "
+     "services (the multiplex's channel names), ts <s> [file] [-p pids] (the stream's PIDs, or recorded to a .ts "
+     "file), spectrum [from to [kHz]] (the aerial's level across the band as a chart on the TV); 'rf' alone "
+     "lists all", cmd_rf},
+    {"snd", "<init|beep|status|stop|vol>", "sound output (a prototype of the original firmware's driver: 48 kHz "
+     "on HDMI -- after 'video init' -- and the SCART's L/R): init, beep [Hz] [ms] (a sine tone, then what the "
+     "DMA did), status (the engine's registers, its DMA position and speed), stop, vol [0..100]", snd_command},
+    {"play", "[-n frames] [-x] [-k] [-v] [-1] <file>", "a video file (.ts, .mpg, .m2v: MPEG-2 / MPEG-1 video, MPEG "
+     "audio) on the TV, decoded by the chip's own MPEG-2 decoder, its sound through 'snd': Esc, Ctrl-C, q or EXIT ends "
+     "(-n: that many frames, -x: as fast as they decode, without sound, -k: the last picture stays on the TV, -v: "
+     "every picture's decoding said, -1: the picture's own size instead of the screen's height)", play_command},
+    {"av", "<status|shot <file.bmp|.yuv>|show|off|reset>", "the video player's decoder and picture layer: their "
+     "registers, the picture shown last saved to a file (RGB .bmp or raw I420 .yuv), shown again, taken away, the "
+     "decoder reset", av_command},
+    {"view", "[-1] <file>", "a picture (JPEG, PNG, GIF, BMP) on the TV, fitted to it: Right / Space the next one "
+     "in its directory, Left the one before, i its details, Esc or q ends (-1: shown, the command ends)", cmd_view},
     {"sum", "[n:]path", "a file read to its end: its size, CRC-32 (as zlib's, 7-Zip's), first bytes, how fast "
      "(Ctrl-C stops it)", cmd_sum},
     {"mkdir", "<path>", "make a directory (this writes the disk)", cmd_mkdir},
@@ -590,6 +687,8 @@ static const struct command commands[] = {
      "(writes the disk)", cmd_mv},
     {"sector", "[n:]<number>", "one sector of a USB disk in hex", cmd_sector},
     {"tty", "", "the USB serial ports (a GSM / LTE module's AT and diagnostic ports, CDC ACM)", cmd_tty},
+    {"stty", "[n] [baud]", "a USB serial port's baud rate (CH340 / CH341, CP210x, FTDI, PL2303, CDC ACM; "
+     "8N1): shown, or set ('stty 0 9600')", cmd_stty},
     {"cu", "[n]", "the terminal joined to serial port n, ttyUSB<n> / ttyACM<n> (without n: the AT port): what "
      "you type goes to it; \"~.\" at a line's start or Ctrl-] ends", cmd_cu},
     {"at", "[command]", "one AT command to the AT port and its answer ('at +csq', 'at i'; a line starting "
@@ -608,7 +707,9 @@ static const struct command commands[] = {
     {"watchdog", "[test|off|on]", "the chip's watchdog: a demo stopped for 8 s restarts the box; "
      "test: stop feeding it (the box restarts)", cmd_watchdog},
     {"clear", "", "clear the terminal", cmd_clear},
-    {"history", "", "the commands typed before (Up / Down recall them)", cmd_history},
+    {"history", "[n | -c]", "the commands typed before, numbered (the last n; -c: forget them).  Up / Down "
+     "recall the ones that start with what is typed, Ctrl-R looks for one holding what is typed next, "
+     "!! / !n / !-n / !text run one again", cmd_history},
     {"video", "init [opticum|comsat] [rev0|rev1]", "experimental: the original firmware's display and HDMI set-up",
      cmd_video},
     {"reboot", "", "restart through the original bootloader", cmd_reboot},
@@ -643,7 +744,9 @@ static void cmd_help(int argc, char **argv)
         uprintf("no command '%s'\n", argv[1]);
         return;
     }
-    uprintf("Commands (whole lines, '/' in front allowed; Up/Down recall earlier ones;\n"
+    uprintf("Commands (whole lines, '/' in front allowed; Tab completes a command, its choices, a file's name\n"
+            "(twice: lists them); Up/Down recall earlier ones starting with what is typed, Ctrl-R searches them;\n"
+            "Left/Right, Home/End, Ctrl-arrows, Delete, Ctrl-W/U/K/Y edit the line, Ctrl-L clears the screen;\n"
             "'ccc' on an empty line restarts into the bootloader for the UART updater;\n"
             "\"...\" or '...' keep spaces in a word; 'command > [n:]path' puts what it prints into a file,\n"
             "'>>' adds it to the file's end):\n");
@@ -913,7 +1016,8 @@ static void cmd_usb(int argc, char **argv)
             uprintf("  reads back %02x\n", (u32)v);
         return;
     }
-    if (argc > 1 && str_eq(argv[1], "ctl")) {          /* a raw control request (IN data or none) */
+    if (argc > 1 && str_eq(argv[1], "ctl")) {          /* a raw control request (data IN, or OUT: the bytes the
+                                                           last 'usb ctl' read -- read a register, write it back) */
         u32 v[5], device = 1;
         if (!parse_args_u32(argc, argv, 2, 5, v) || v[0] > 0xFF || v[1] > 0xFF || v[2] > 0xFFFF || v[3] > 0xFFFF
             || v[4] > 255 || (argc > 7 && (!parse_u32(argv[7], &device) || device < 1 || device > 15))) {
@@ -1054,13 +1158,27 @@ static void cmd_console(int argc, char **argv)
     show_console();
 }
 
+/* 'history': every command kept, numbered ('!n' runs number n again); 'history <n>': the last n; 'history -c':
+   none kept any more */
 static void cmd_history(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
-    int oldest = history_count > HISTORY ? history_count - HISTORY : 0;
-    for (int i = oldest; i < history_count; i++)
-        uprintf("%5d  %s\n", i + 1, history[i % HISTORY]);
+    int from = 0;
+    u32 n;
+    if (argc > 1 && str_eq(argv[1], "-c")) {
+        history_n = history_pos = 0;
+        uprintf("history cleared\n");
+        return;
+    }
+    if (argc > 1) {
+        if (!parse_u32(argv[1], &n)) {
+            uprintf("usage: history [n | -c]\n");
+            return;
+        }
+        if ((int)n < history_n)
+            from = history_n - (int)n;
+    }
+    for (int i = from; i < history_n; i++)
+        uprintf("%5d  %s\n", i + 1, history[i]);
 }
 
 static void cmd_clear(int argc, char **argv)
@@ -1284,6 +1402,150 @@ static void cmd_explorer(int argc, char **argv)
     explorer_show();
     uprintf("the explorer is on the TV, in %s ('help explorer': its keys); Esc on the USB keyboard or 'console' "
             "brings the console back\n", disk_cwd()[0] ? disk_cwd() : "the list of disks");
+}
+
+/* the TV back to what it showed before a command took the test screen's picture for its own (a game) */
+static void picture_back(int console, int explorer)
+{
+    if (explorer) {
+        explorer_show();
+    } else {
+        draw_screen();
+        if (console)
+            show_console();
+    }
+}
+
+static void cmd_game(int argc, char **argv, int (*play)(const char *, u32, const char *))
+{
+    u32 frames = 0;
+    const char *script = "";
+    int first = 1;
+    while (argc > first + 1 && argv[first][0] == '-') {
+        if (str_eq(argv[first], "-f") && parse_u32(argv[first + 1], &frames))
+            first += 2;
+        else if (str_eq(argv[first], "-k")) {
+            script = argv[first + 1];
+            first += 2;
+        } else {
+            break;
+        }
+    }
+    if (argc <= first) {
+        uprintf("usage: %s [-f frames] [-k script] <file>\n", argv[0]);
+        return;
+    }
+    int console = gfx_view_console(), explorer = explorer_shown();
+    if (explorer)
+        explorer_hide();
+    demo_shown = 0;
+    (void)play(joined(argc - first + 1, argv + first - 1), frames, script);
+    picture_back(console, explorer);
+}
+
+static void cmd_nes(int argc, char **argv)
+{
+    cmd_game(argc, argv, nes_play);
+}
+
+static void cmd_gb(int argc, char **argv)
+{
+    cmd_game(argc, argv, gb_play);
+}
+
+static void cmd_sms(int argc, char **argv)
+{
+    cmd_game(argc, argv, sms_play);
+}
+
+static void cmd_gg(int argc, char **argv)
+{
+    cmd_game(argc, argv, gg_play);
+}
+
+static void cmd_zx(int argc, char **argv)
+{
+    if (argc == 1) {                    /* (no file: BASIC) */
+        static char none[] = "", *with[3];
+        with[0] = argv[0];
+        with[1] = none;
+        with[2] = 0;
+        cmd_game(2, with, zx_play);
+        return;
+    }
+    cmd_game(argc, argv, zx_play);
+}
+
+static void cmd_c64(int argc, char **argv)
+{
+    if (argc == 1) {                    /* (no file: BASIC) */
+        static char none[] = "", *with[3];
+        with[0] = argv[0];
+        with[1] = none;
+        with[2] = 0;
+        cmd_game(2, with, c64_play);
+        return;
+    }
+    cmd_game(argc, argv, c64_play);
+}
+
+static void cmd_dos(int argc, char **argv)
+{
+    cmd_game(argc, argv, dos_play);
+}
+
+static void cmd_amiga(int argc, char **argv)
+{
+    if (argc == 1) {                    /* (no file: no disk in the drive) */
+        static char none[] = "", *with[3];
+        with[0] = argv[0];
+        with[1] = none;
+        with[2] = 0;
+        cmd_game(2, with, amiga_play);
+        return;
+    }
+    cmd_game(argc, argv, amiga_play);
+}
+
+static void cmd_a26(int argc, char **argv)
+{
+    cmd_game(argc, argv, a26_play);
+}
+
+static void cmd_rf(int argc, char **argv)
+{
+    if (argc > 1 && str_eq(argv[1], "spectrum")) {     /* (its chart takes the test screen's picture) */
+        if (explorer_shown())
+            explorer_hide();
+        demo_shown = 0;
+    }
+    (void)rf_command(argc, argv);
+}
+
+static void cmd_view(int argc, char **argv)
+{
+    int once = argc > 1 && str_eq(argv[1], "-1"), first = once ? 2 : 1;
+    if (argc <= first) {
+        uprintf("usage: view [-1] <picture file>\n");
+        return;
+    }
+    int console = gfx_view_console(), explorer = explorer_shown();
+    if (explorer)
+        explorer_hide();
+    demo_shown = 0;
+    view_file(joined(argc - first + 1, argv + first - 1), once);
+    if (!once)
+        picture_back(console, explorer);
+}
+
+static void cmd_stty(int argc, char **argv)
+{
+    u32 n = 0, baud = 0;
+    if ((argc > 1 && !parse_u32(argv[1], &n)) || (argc > 2 && (!parse_u32(argv[2], &baud) || !baud)) || argc > 3) {
+        uprintf("usage: stty [port] [baud]\n");
+        return;
+    }
+    serial_stty(argc > 1 ? (int)n : -1, baud);
 }
 
 /* mkdir / rmdir / rm / touch: one path (spaces in it allowed) */
@@ -1541,10 +1803,11 @@ static void run_line(void)
     int argc = split_line(words, argv, &redirect, &append);
     if (argc == 0)
         return;
-    if (history_count == 0 || !str_eq(history[(history_count - 1) % HISTORY], line)) {
-        str_copy(history[history_count % HISTORY], line, LINE_MAX);
-        history_count++;
-    }
+    char kept[LINE_MAX];                                /* (without the space a Tab left at its end) */
+    str_copy(kept, line, LINE_MAX);
+    for (int n = str_len(kept); n > 0 && kept[n - 1] == ' '; n--)
+        kept[n - 1] = 0;
+    history_add(kept);
     str_copy(last_command, line, sizeof(last_command));
     commands_run++;
     update_uart_box();
@@ -1584,57 +1847,613 @@ static void run_line(void)
         uprintf("the output was longer than %u bytes: the file has its first %u\n", CAPTURE_MAX, CAPTURE_MAX);
 }
 
-static void recall(int step)
+/* ---- the line editor ----
+   Keys (a terminal's, the telnet client's and the USB keyboard's alike): Left / Right, Home / End (Ctrl-A /
+   Ctrl-E), Ctrl-Left / Ctrl-Right (Alt-B / Alt-F) a word; Backspace, Delete (Ctrl-D) at the cursor, Ctrl-W the
+   word before it, Ctrl-U all before it, Ctrl-K all after it, Ctrl-Y puts back what those took; Up / Down
+   (Ctrl-P / Ctrl-N) the commands before that start with what is typed; Ctrl-R looks for one holding what is
+   typed next; Tab completes a command's name, its first word's choices as its help names them
+   ("rf <init|tune|...>"), a disk's file or directory -- a second Tab lists them; Ctrl-L clears the screen;
+   Ctrl-C drops the line.  "!!", "!n", "!-n", "!text" at a line's start run a command of the history again. */
+static int typing_on_usb;               /* cli_input is fed by the USB keyboard */
+static int esc_mod;                     /* ESC [ n ; mod x: the modifier (5 Ctrl, 3 Alt) */
+
+static void set_line(const char *s)
 {
-    int oldest = history_count > HISTORY ? history_count - HISTORY : 0;
-    int pos = history_pos + step;
-    if (pos < oldest || pos > history_count)
-        return;
-    history_pos = pos;
-    if (pos == history_count)
-        line_len = 0;
-    else {
-        str_copy(line, history[pos % HISTORY], LINE_MAX);
-        line_len = str_len(line);
-    }
+    str_copy(line, s, LINE_MAX);
+    line_len = line_cur = str_len(line);
     show_line();
 }
 
-static int typing_on_usb;               /* cli_input is fed by the USB keyboard */
+static void edited(void)                /* typed on: Up / Down start again from this line */
+{
+    history_pos = history_n;
+    tabs = 0;
+}
+
+static int starts_with(const char *s, const char *p)
+{
+    while (*p)
+        if (*s++ != *p++)
+            return 0;
+    return 1;
+}
+
+static int lower(int c)
+{
+    return c >= 'A' && c <= 'Z' ? c + 32 : c;
+}
+
+static int starts_nocase(const char *s, const char *p)
+{
+    while (*p)
+        if (lower(*s++) != lower(*p++))
+            return 0;
+    return 1;
+}
+
+/* Up (-1) / Down (+1): the command before / after the one shown that starts with what was typed */
+static void recall(int step)
+{
+    line[line_len] = 0;
+    if (history_pos == history_n)
+        str_copy(pending, line, LINE_MAX);
+    for (int p = history_pos + step; p >= 0 && p <= history_n; p += step) {
+        if (p == history_n) {
+            history_pos = p;
+            set_line(pending);
+            return;
+        }
+        if (starts_with(history[p], pending) && !str_eq(history[p], line)) {
+            history_pos = p;
+            set_line(history[p]);
+            return;
+        }
+    }
+}
+
+/* the cursor to p */
+static void move_to(int p)
+{
+    if (p < 0)
+        p = 0;
+    if (p > line_len)
+        p = line_len;
+    if (p < line_cur)
+        uprintf("\x1b[%dD", line_cur - p);
+    else if (p > line_cur)
+        uprintf("\x1b[%dC", p - line_cur);
+    line_cur = p;
+}
+
+static int word_left(void)
+{
+    int p = line_cur;
+    while (p > 0 && line[p - 1] == ' ')
+        p--;
+    while (p > 0 && line[p - 1] != ' ')
+        p--;
+    return p;
+}
+
+static int word_right(void)
+{
+    int p = line_cur;
+    while (p < line_len && line[p] == ' ')
+        p++;
+    while (p < line_len && line[p] != ' ')
+        p++;
+    return p;
+}
+
+/* n characters at the cursor; the cursor after them */
+static void insert_text(const char *s, int n)
+{
+    if (n > LINE_MAX - 1 - line_len)
+        n = LINE_MAX - 1 - line_len;
+    if (n <= 0)
+        return;
+    for (int i = line_len - 1; i >= line_cur; i--)
+        line[i + n] = line[i];
+    for (int i = 0; i < n; i++)
+        line[line_cur + i] = s[i];
+    line_len += n;
+    line_cur += n;
+    if (line_cur == line_len)                   /* (at the end: only the new characters printed) */
+        for (int i = 0; i < n; i++)
+            uart_putc(s[i]);
+    else
+        show_line();
+}
+
+/* n characters from `at` taken out (keep: into killed, for Ctrl-Y) */
+static void delete_text(int at, int n, int keep)
+{
+    if (at < 0 || n <= 0 || at + n > line_len)
+        return;
+    int backspace_at_end = n == 1 && at + 1 == line_len && line_cur == line_len;
+    if (keep) {
+        for (int i = 0; i < n; i++)
+            killed[i] = line[at + i];
+        killed[n] = 0;
+    }
+    for (int i = at; i + n < line_len; i++)
+        line[i] = line[i + n];
+    line_len -= n;
+    if (line_cur >= at + n)
+        line_cur -= n;
+    else if (line_cur > at)
+        line_cur = at;
+    if (backspace_at_end)
+        uart_puts("\b \b");
+    else
+        show_line();
+}
+
+/* ---- Ctrl-R: the newest command holding what is typed; Ctrl-R again an older one ---- */
+static int srch_on, srch_found;        /* the search is on; the history entry found (-1: none) */
+static char srch_query[40], srch_before[LINE_MAX];
+static int srch_len;
+
+static int holds(const char *s, const char *q)
+{
+    if (!*q)
+        return 1;
+    for (; *s; s++)
+        if (starts_with(s, q))
+            return 1;
+    return 0;
+}
+
+static void search_from(int p)
+{
+    srch_found = -1;
+    for (; p >= 0; p--)
+        if (holds(history[p], srch_query)) {
+            srch_found = p;
+            break;
+        }
+    uprintf("\r\x1b[K(history search)'%s': %s", srch_query, srch_found >= 0 ? history[srch_found] : "(none)");
+}
+
+/* a key while searching: 1 taken; 0 the search ended (the command found is the line now), the key then
+   handled as usual */
+static int search_key(int c)
+{
+    if (c == 0x12) {                                    /* Ctrl-R: an older one */
+        search_from(srch_found > 0 ? srch_found - 1 : srch_found == 0 ? -1 : history_n - 1);
+        return 1;
+    }
+    if (c == 0x08 || c == 0x7f) {
+        if (srch_len)
+            srch_query[--srch_len] = 0;
+        search_from(history_n - 1);
+        return 1;
+    }
+    if (c >= 0x20 && c <= 0x7e) {
+        if (srch_len < (int)sizeof(srch_query) - 1) {
+            srch_query[srch_len++] = (char)c;
+            srch_query[srch_len] = 0;
+        }
+        search_from(srch_found >= 0 ? srch_found : history_n - 1);
+        return 1;
+    }
+    srch_on = 0;
+    edited();
+    if (c == 0x03 || c == 0x07) {                       /* Ctrl-C, Ctrl-G: the line as it was */
+        set_line(srch_before);
+        return 1;
+    }
+    set_line(srch_found >= 0 ? history[srch_found] : srch_before);
+    return 0;
+}
+
+/* ---- Tab ---- */
+#define CANDIDATES 128
+static struct disk_entry tab_entries[CANDIDATES];
+static const char *tab_cand[CANDIDATES];
+static u8 tab_dir[CANDIDATES];
+static int tab_n;
+static char dir_part[LINE_MAX];         /* a file's: the directory typed before its name ("4:/c64/") */
+static char tab_choices[256];           /* a command's first word's choices, as its help names them */
+static u8 tab_swallowed[512];           /* what reading a directory says (not printed in the middle of a line) */
+
+static void add_cand(const char *s, int dir, const char *typed, int nocase)
+{
+    if (tab_n < CANDIDATES && (nocase ? starts_nocase(s, typed) : starts_with(s, typed))) {
+        tab_cand[tab_n] = s;
+        tab_dir[tab_n++] = (u8)dir;
+    }
+}
+
+/* the word the cursor ends: where it starts in the line, its text without quotes and backslashes; which word
+   of the line it is (0: the command) */
+static int word_at(int *start, char *out, int size)
+{
+    int index = 0, at = line_cur, n = 0, in_word = 0;
+    char q = 0;
+    for (int i = 0; i < line_cur; i++) {
+        char ch = line[i];
+        if (!q && (ch == ' ' || ch == '\t')) {
+            if (in_word)
+                index++;
+            in_word = 0;
+            n = 0;
+            continue;
+        }
+        if (!in_word) {
+            in_word = 1;
+            at = i;
+        }
+        if (q) {
+            if (ch == q)
+                q = 0;
+            else if (n < size - 1)
+                out[n++] = ch;
+        } else if (ch == '"' || ch == '\'') {
+            q = ch;
+        } else if (ch == '\\' && i + 1 < line_cur) {
+            if (n < size - 1)
+                out[n++] = line[++i];
+        } else if (ch == '>') {                         /* (a redirect's file: a word of its own) */
+            index++;
+            n = 0;
+            at = i + 1;
+        } else if (n < size - 1) {
+            out[n++] = ch;
+        }
+    }
+    out[n] = 0;
+    if (!in_word)
+        at = line_cur;
+    *start = at;
+    return index;
+}
+
+/* "<init|tune|status|...>" at the start of a command's arguments: its choices into tab_choices[] (words of
+   lower-case letters, digits and '-' only -- "<MHz|channel>" names no words to type), how many */
+static int command_choices(const char *args)
+{
+    int n = 0, count = 0;
+    char close = args[0] == '<' ? '>' : args[0] == '[' ? ']' : 0;
+    if (!close)
+        return 0;
+    const char *p = args + 1;
+    for (;;) {
+        const char *s = p;
+        int good = 1;
+        while (*p && *p != '|' && *p != close) {
+            if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '-'))
+                good = 0;
+            p++;
+        }
+        int k = (int)(p - s);
+        if (good && k && n + k + 1 <= (int)sizeof(tab_choices)) {
+            for (int i = 0; i < k; i++)
+                tab_choices[n + i] = s[i];
+            tab_choices[n + k] = 0;
+            n += k + 1;
+            count++;
+        }
+        if (*p != '|')
+            break;
+        p++;
+    }
+    return count >= 2 ? count : 0;                      /* (one word alone: "<file>"-like, not choices) */
+}
+
+/* a file or directory's name: the volumes (no directory typed, none current), else the directory's entries */
+static void file_cands(const char *word, const char **typed)
+{
+    int slash = -1, colon = -1;
+    for (int i = 0; word[i]; i++) {
+        if (word[i] == '/')
+            slash = i;
+        if (word[i] == ':' && colon < 0)
+            colon = i;
+    }
+    dir_part[0] = 0;
+    *typed = word + slash + 1;
+    char path[LINE_MAX];
+    if (slash < 0 && colon >= 0 && !word[colon + 1]) {           /* "4:": its top */
+        usnprintf(dir_part, sizeof(dir_part), "%s/", word);
+        *typed = "";
+    } else if (slash < 0 && colon < 0 && !disk_cwd()[0]) {         /* the volumes: "4" -> "4:/" */
+        int n = disk_volumes(tab_entries, CANDIDATES);
+        for (int i = 0; i < n; i++) {
+            char *s = tab_entries[i].name;
+            int k = 0;
+            while (s[k] && s[k] != ':')
+                k++;
+            if (!s[k])
+                continue;
+            s[k + 1] = '/';
+            s[k + 2] = 0;
+            add_cand(s, 2, word, 1);
+        }
+        return;
+    } else {
+        for (int i = 0; i <= slash && i < LINE_MAX - 1; i++)
+            dir_part[i] = word[i];
+        dir_part[slash + 1 > 0 ? slash + 1 : 0] = 0;
+    }
+    /* the directory to read: as typed, without its last '/' (but for a volume's top, "4:/", or "/") */
+    str_copy(path, dir_part[0] ? dir_part : disk_cwd(), sizeof(path));
+    int n = str_len(path);
+    if (n > 1 && path[n - 1] == '/' && path[n - 2] != ':')
+        path[n - 1] = 0;
+    u32 total, over;
+    uart_capture(tab_swallowed, sizeof(tab_swallowed));
+    n = disk_dir_read(path, tab_entries, CANDIDATES, &total);
+    (void)uart_capture_end(&over);
+    for (int i = 0; i < n; i++) {
+        const char *s = tab_entries[i].name;
+        if (tab_entries[i].kind == DISK_VOLUME || str_eq(s, ".") || str_eq(s, ".."))
+            continue;
+        add_cand(s, tab_entries[i].kind == DISK_DIR, *typed, 1);
+    }
+}
+
+/* the word from `start` to the cursor replaced by a + b ("..." around it when it holds a space); finished: a
+   space after it (a quote closed first) */
+static void replace_word(int start, const char *a, const char *b, int finished)
+{
+    char t[LINE_MAX];
+    int n = 0, quote = 0;
+    for (const char *s = a; *s; s++)
+        quote |= *s == ' ';
+    for (const char *s = b; *s; s++)
+        quote |= *s == ' ';
+    if (quote)
+        t[n++] = '"';
+    for (const char *s = a; *s && n < LINE_MAX - 3; s++)
+        t[n++] = *s;
+    for (const char *s = b; *s && n < LINE_MAX - 3; s++)
+        t[n++] = *s;
+    if (quote && finished)
+        t[n++] = '"';
+    if (finished)
+        t[n++] = ' ';
+    int k = line_cur - start;
+    for (int i = start; i + k < line_len; i++)
+        line[i] = line[i + k];
+    line_len -= k;
+    line_cur = start;
+    if (n > LINE_MAX - 1 - line_len)
+        n = LINE_MAX - 1 - line_len;
+    for (int i = line_len - 1; i >= line_cur; i--)
+        line[i + n] = line[i];
+    for (int i = 0; i < n; i++)
+        line[line_cur + i] = t[i];
+    line_len += n;
+    line_cur += n;
+    show_line();
+}
+
+static void list_cands(void)
+{
+    for (int i = 1; i < tab_n; i++)                     /* (in order: a few dozen at most) */
+        for (int j = i; j > 0; j--) {
+            const char *x = tab_cand[j - 1], *y = tab_cand[j];
+            while (*x && lower(*x) == lower(*y))
+                x++, y++;
+            if (lower(*x) <= lower(*y))
+                break;
+            const char *t = tab_cand[j];
+            u8 d = tab_dir[j];
+            tab_cand[j] = tab_cand[j - 1], tab_dir[j] = tab_dir[j - 1];
+            tab_cand[j - 1] = t, tab_dir[j - 1] = d;
+        }
+    int w = 0;
+    for (int i = 0; i < tab_n; i++) {
+        int n = str_len(tab_cand[i]) + (tab_dir[i] == 1);
+        if (n > w)
+            w = n;
+    }
+    w += 2;
+    int per = w < 78 ? 78 / w : 1;
+    uart_puts("\r\n");
+    for (int i = 0; i < tab_n; i++) {
+        int n = str_len(tab_cand[i]) + (tab_dir[i] == 1);
+        uart_puts(tab_cand[i]);
+        if (tab_dir[i] == 1)
+            uart_putc('/');
+        if ((i + 1) % per == 0 || i == tab_n - 1)
+            uart_puts("\r\n");
+        else
+            for (; n < w; n++)
+                uart_putc(' ');
+    }
+    if (tab_n == CANDIDATES)
+        uprintf("(and more: type more of the name)\n");
+    show_line();
+}
+
+static void complete(void)
+{
+    char word[LINE_MAX], first[LINE_MAX];
+    const char *typed;
+    int start, index = word_at(&start, word, sizeof(word)), files = 0, fixed = 0;
+    tab_n = 0;
+    dir_part[0] = 0;
+    if (index == 0) {
+        if (word[0] == '/') {                           /* ("/restart") */
+            dir_part[0] = '/';
+            dir_part[1] = 0;
+        }
+        typed = word + (word[0] == '/');
+        for (const struct command *c = commands; c->name; c++)
+            add_cand(c->name, 0, typed, 0);
+    } else {
+        int i = 0, k = 0;
+        while (line[i] == ' ')
+            i++;
+        if (line[i] == '/')
+            i++;
+        while (line[i] && line[i] != ' ' && k < LINE_MAX - 1)
+            first[k++] = line[i++];
+        first[k] = 0;
+        const struct command *c = commands;
+        while (c->name && !str_eq(c->name, first))
+            c++;
+        typed = word;
+        if (index == 1 && str_eq(first, "help")) {
+            for (c = commands; c->name; c++)
+                add_cand(c->name, 0, typed, 0);
+            fixed = 1;
+        } else if (index == 1 && c->name && (k = command_choices(c->args)) > 0) {
+            const char *s = tab_choices;
+            for (int j = 0; j < k; j++, s += str_len(s) + 1)
+                add_cand(s, 0, typed, 0);
+            fixed = 1;
+        }
+        if (!fixed) {
+            file_cands(word, &typed);
+            files = 1;
+        }
+    }
+    if (!tab_n)
+        return;
+    /* what they all start with (a file's name: whatever its letters' case) */
+    int common = str_len(tab_cand[0]);
+    for (int i = 1; i < tab_n; i++) {
+        int k = 0;
+        const char *x = tab_cand[i], *y = tab_cand[0];
+        while (k < common && x[k] && (files ? lower(x[k]) == lower(y[k]) : x[k] == y[k]))
+            k++;
+        common = k;
+    }
+    if (tab_n == 1) {
+        char name[DISK_ENTRY_NAME + 2];
+        usnprintf(name, sizeof(name), "%s%s", tab_cand[0], tab_dir[0] == 1 ? "/" : "");
+        replace_word(start, dir_part, name, tab_dir[0] == 0);
+        tabs = 0;
+        return;
+    }
+    if (common > str_len(typed)) {
+        char part[DISK_ENTRY_NAME + 1];
+        int k = 0;
+        for (; k < common && k < DISK_ENTRY_NAME; k++)
+            part[k] = tab_cand[0][k];
+        part[k] = 0;
+        replace_word(start, dir_part, part, 0);
+        tabs = 0;
+        return;
+    }
+    tabs++;                                             /* a short list at once, a long one at the second Tab */
+    if ((tabs == 1 && tab_n <= 32) || (tabs == 2 && tab_n > 32))
+        list_cands();
+}
+
+/* "!!", "!n", "!-n", "!text" at the line's start: that command of the history in the line (what follows kept,
+   the line printed as it now is) -- 1; 0 not one; -1 none such (said) */
+static int expand_history(void)
+{
+    if (line[0] != '!' || !line[1] || line[1] == ' ')
+        return 0;
+    int p = 1, at = -1;
+    if (line[1] == '!') {
+        at = history_n - 1;
+        p = 2;
+    } else if ((line[1] >= '0' && line[1] <= '9') || (line[1] == '-' && line[2] >= '0' && line[2] <= '9')) {
+        int neg = line[1] == '-', n = 0;
+        p = 1 + neg;
+        while (line[p] >= '0' && line[p] <= '9')
+            n = n * 10 + (line[p++] - '0');
+        at = neg ? history_n - n : n - 1;
+    } else {
+        char want[LINE_MAX];
+        int k = 0;
+        while (line[p] && line[p] != ' ' && k < LINE_MAX - 1)
+            want[k++] = line[p++];
+        want[k] = 0;
+        for (int i = history_n - 1; i >= 0 && at < 0; i--)
+            if (starts_with(history[i], want))
+                at = i;
+    }
+    if (at < 0 || at >= history_n) {
+        line[p] = 0;
+        uprintf("%s: not in the history ('history' lists it)\n", line);
+        return -1;
+    }
+    char t[LINE_MAX];
+    usnprintf(t, sizeof(t), "%s%s", history[at], line + p);
+    str_copy(line, t, LINE_MAX);
+    line_len = line_cur = str_len(line);
+    uprintf("%s\n", line);
+    return 1;
+}
+
+/* an escape sequence's end: ESC [ c, ESC [ n c, ESC [ n ; mod c, ESC O c */
+static void esc_key(int c, int num, int mod)
+{
+    int word = mod >= 2;                                /* (Ctrl- or Alt- with an arrow: a word) */
+    switch (c) {
+    case 'A': recall(-1); return;
+    case 'B': recall(1); return;
+    case 'C': move_to(word ? word_right() : line_cur + 1); return;
+    case 'D': move_to(word ? word_left() : line_cur - 1); return;
+    case 'H': move_to(0); return;
+    case 'F': move_to(line_len); return;
+    case '~':
+        if (num == 5 || num == 6)
+            console_scroll(num == 5 ? 1 : -1);          /* the TV's console looks back or forward */
+        else if (num == 3) {
+            edited();
+            delete_text(line_cur, 1, 0);                /* Delete */
+        } else if (num == 1 || num == 7)
+            move_to(0);
+        else if (num == 4 || num == 8)
+            move_to(line_len);
+        return;                                         /* (Insert, F-keys: the explorer's) */
+    }
+}
 
 static void cli_input(int c)
 {
     line_dirty = 1;
+    if (srch_on && !esc_state && search_key(c))
+        return;
+    if (c != 0x09)
+        tabs = 0;
     if (esc_state == 1) {
-        esc_state = c == '[' ? 2 : 0;
-        return;
-    }
-    if (esc_state == 2) {
         esc_state = 0;
-        if (c == 'A')
-            recall(-1);
-        else if (c == 'B')
-            recall(1);
-        else if (c >= '0' && c <= '9') {
-            esc_state = 3;                  /* ESC [ <number> ~: PgUp 5, PgDn 6, Delete 3, Insert 2, F-keys */
-            esc_num = c - '0';
-        }
-        return;
-    }
-    if (esc_state == 3) {
-        if (c >= '0' && c <= '9') {
-            if (esc_num < 100)
-                esc_num = esc_num * 10 + (c - '0');
+        if (c == '[' || c == 'O') {
+            esc_state = c == '[' ? 2 : 4;
+            esc_num = 0;
             return;
         }
-        if (c == ';')
-            return;                         /* (a modifier: ESC [ 5 ; 2 ~) */
+        if (c == 'b' || c == 'f') {                     /* Alt-B, Alt-F: a word back / on */
+            move_to(c == 'b' ? word_left() : word_right());
+        } else if (c == 0x7f || c == 0x08) {            /* Alt-Backspace: the word before */
+            edited();
+            int p = word_left();
+            delete_text(p, line_cur - p, 1);
+        }
+        return;
+    }
+    if (esc_state == 2 || esc_state == 3) {             /* ESC [ (n) ...  /  ESC [ n ; (mod) ... */
+        if (c >= '0' && c <= '9') {
+            if (esc_state == 2 && esc_num < 1000)
+                esc_num = esc_num * 10 + (c - '0');
+            else if (esc_state == 3 && esc_mod < 100)
+                esc_mod = esc_mod * 10 + (c - '0');
+            return;
+        }
+        if (c == ';') {
+            esc_state = 3;
+            esc_mod = 0;
+            return;
+        }
+        int mod = esc_state == 3 ? esc_mod : 0;
         esc_state = 0;
-        if (c == '~' && (esc_num == 5 || esc_num == 6))
-            console_scroll(esc_num == 5 ? 1 : -1);      /* the TV's console looks back or forward */
-        else if (c == '~' && esc_num == 3)
-            cli_input(0x08);                /* (Delete: as Backspace -- the line has no cursor) */
-        return;                             /* (Insert, F-keys: the explorer's) */
+        esc_key(c, esc_num, mod);
+        return;
+    }
+    if (esc_state == 4) {                               /* ESC O x: Home / End / arrows of some terminals */
+        esc_state = 0;
+        esc_key(c, 0, 0);
+        return;
     }
     switch (c) {
     case 0x1b:
@@ -1646,33 +2465,78 @@ static void cli_input(int c)
             return;                         /* the LF of a CR LF */
         uart_puts("\r\n");
         line[line_len] = 0;
-        net_command(1);                     /* (a telnet client's typing and output go on during it: net.c) */
-        run_line();
-        net_command(0);
-        line_len = 0;
-        history_pos = history_count;
+        if (expand_history() >= 0) {
+            net_command(1);                 /* (a telnet client's typing and output go on during it: net.c) */
+            run_line();
+            net_command(0);
+        }
+        line_len = line_cur = 0;
+        edited();
         prompt();
         return;
     case 0x08:
     case 0x7f:
-        if (line_len) {
-            line_len--;
-            uart_puts("\b \b");
-        }
+        edited();
+        if (line_cur)
+            delete_text(line_cur - 1, 1, 0);
         return;
-    case 0x03:                              /* Ctrl-C */
-    case 0x15:                              /* Ctrl-U */
-        line_len = 0;
+    case 0x03:                              /* Ctrl-C: the line dropped */
+        line_len = line_cur = 0;
+        edited();
         uart_puts("^C\r\n");
         prompt();
         return;
-    }
-    if (c < 0x20 || c > 0x7e || line_len >= LINE_MAX - 1)
+    case 0x01: move_to(0); return;                      /* Ctrl-A */
+    case 0x05: move_to(line_len); return;               /* Ctrl-E */
+    case 0x02: move_to(line_cur - 1); return;           /* Ctrl-B */
+    case 0x06: move_to(line_cur + 1); return;           /* Ctrl-F */
+    case 0x10: recall(-1); return;                      /* Ctrl-P */
+    case 0x0E: recall(1); return;                       /* Ctrl-N */
+    case 0x04:                                          /* Ctrl-D: the character at the cursor */
+        edited();
+        delete_text(line_cur, 1, 0);
         return;
-    line[line_len++] = (char)c;
-    uart_putc((char)c);
+    case 0x0B:                                          /* Ctrl-K: all after the cursor */
+        edited();
+        delete_text(line_cur, line_len - line_cur, 1);
+        return;
+    case 0x15:                                          /* Ctrl-U: all before it */
+        edited();
+        delete_text(0, line_cur, 1);
+        return;
+    case 0x17: {                                        /* Ctrl-W: the word before it */
+        edited();
+        int p = word_left();
+        delete_text(p, line_cur - p, 1);
+        return;
+    }
+    case 0x19:                                          /* Ctrl-Y: what those took, back */
+        edited();
+        insert_text(killed, str_len(killed));
+        return;
+    case 0x0C:                                          /* Ctrl-L: the screen cleared */
+        uart_puts("\x1b[2J\x1b[H");
+        show_line();
+        return;
+    case 0x12:                                          /* Ctrl-R: look through the history */
+        line[line_len] = 0;
+        str_copy(srch_before, line, LINE_MAX);
+        srch_on = 1;
+        srch_len = 0;
+        srch_query[0] = 0;
+        search_from(history_n - 1);
+        return;
+    case 0x09:                                          /* Tab */
+        complete();
+        return;
+    }
+    if (c < 0x20 || c > 0x7e)
+        return;
+    char ch = (char)c;
+    edited();
+    insert_text(&ch, 1);
     /* the UART updater's boot capture: 'c' sent again and again (on the UART) */
-    if (!typing_on_usb && line_len == 3 && line[0] == 'c' && line[1] == 'c' && line[2] == 'c')
+    if (!typing_on_usb && line_len == 3 && line_cur == 3 && line[0] == 'c' && line[1] == 'c' && line[2] == 'c')
         restart("\r\nBootloader capture requested ('ccc'): restarting via original bootloader");
 }
 

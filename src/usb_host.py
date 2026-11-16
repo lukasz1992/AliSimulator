@@ -220,6 +220,10 @@ class VirtualDevice:
     def class_request(self, rtype, request, value, index, length):
         return None
 
+    def setup_data(self, packet, data):
+        """A SETUP with an OUT data stage, its data all there: b'' (taken) or None (stall)."""
+        return self.setup(packet)
+
     def setup(self, packet):
         """A SETUP packet: (data for the IN stage or b'', or None to stall)."""
         rtype, request = packet[0], packet[1]
@@ -874,7 +878,12 @@ class VirtualModem(VirtualDevice):
     packet (which the demo reads a packet at a time).  The IMEI and the serial
     number are made up.  pin: the SIM's PIN (None: no PIN lock); sim=False: no
     SIM.  .received lists (interface, bytes) of every packet its AT ports
-    took, .sms (number, text) of the messages "sent".  restart(): it loses its
+    took, .sms (number, text) of the messages "sent".  Its RNDIS function
+    (interfaces 0 and 1) answers INITIALIZE, QUERY (the MAC address) and SET
+    (the packet filter) and carries frames to a small network behind it: a
+    DHCP server giving 192.168.225.100 (router and DNS .1), ARP for the
+    router, and an echo reply to every ping (.rndis_frames: the frames the
+    host sent).  restart(): it loses its
     configuration -- as the real one once did after AT+CRESET, without the
     port's connection changing -- and once configured again its AT ports say
     RDY, +CPIN: READY, SMS DONE and PB DONE, as after a power-up."""
@@ -914,6 +923,7 @@ class VirtualModem(VirtualDevice):
         self.tries = 3
         self.received, self.sms, self.line_states = [], [], []
         self.requests = []                    # the URLs AT+HTTPACTION fetched
+        self.rndis_frames, self.rndis_messages = [], []
         self._reset_ports()
         self.boot_messages = False
 
@@ -924,6 +934,9 @@ class VirtualModem(VirtualDevice):
         self.sms_to = {}                      # interface -> the number AT+CMGS waits for the text of
         self.later = []                       # (time, interface, packet): what it sends when the time comes
         self.http = None                      # the HTTP client: None, or {"url", "length"} after AT+HTTPINIT
+        self.rndis_answers = []               # RNDIS control messages for GET_ENCAPSULATED_RESPONSE
+        self.rndis_in = []                    # RNDIS packet messages for the data IN endpoint
+        self.rndis_ready = False
 
     def restart(self):
         self.configuration = 0
@@ -940,13 +953,129 @@ class VirtualModem(VirtualDevice):
                                 b"\r\n+CPIN: SIM PIN\r\n", b"\r\nSMS DONE\r\n", b"\r\nPB DONE\r\n"]
         return answer
 
+    RNDIS_MAC = bytes.fromhex("021e0e901100")     # (a locally administered address)
+    NET_MAC = bytes.fromhex("021e0e9011fe")       # the router's, behind the module
+    NET = bytes([192, 168, 225])
+    RNDIS_IN, RNDIS_OUT = 3, 12                   # the data interface's endpoints (0x83, 0x0C)
+
     def class_request(self, rtype, request, value, index, length):
         if rtype == 0x21 and request == 0x22:                                 # SET_CONTROL_LINE_STATE
             self.line_states.append((index, value))
             return b""
+        if rtype == 0xA1 and request == 0x01 and index == 0:                  # GET_ENCAPSULATED_RESPONSE
+            return self.rndis_answers.pop(0)[:length] if self.rndis_answers else b"\x00"
         return None
 
+    def setup_data(self, packet, data):
+        if packet[0] == 0x21 and packet[1] == 0x00 and (packet[4] | packet[5] << 8) == 0:   # SEND_ENCAPSULATED_COMMAND
+            self._rndis_control(data)
+            return b""
+        return self.setup(packet)
+
+    def _rndis_control(self, m):
+        import struct
+        kind, _length, rid = struct.unpack_from("<III", m)
+        self.rndis_messages.append(kind)
+        if kind == 2:                                                         # INITIALIZE
+            self.rndis_ready = True
+            self.rndis_answers.append(struct.pack("<IIIIIIIIIIIII", 0x80000002, 52, rid, 0, 1, 0, 1, 0,
+                                                  1, 1600, 0, 0, 0))     # (... 802.3, one packet a transfer)
+        elif kind == 4:                                                       # QUERY
+            oid = struct.unpack_from("<I", m, 12)[0]
+            info = self.RNDIS_MAC if oid in (0x01010101, 0x01010102) else b""
+            status = 0 if info else 0xC00000BB
+            self.rndis_answers.append(struct.pack("<IIIIII", 0x80000004, 24 + len(info), rid, status, len(info),
+                                                  16 if info else 0) + info)
+        elif kind == 5:                                                       # SET
+            self.rndis_answers.append(struct.pack("<IIII", 0x80000005, 16, rid, 0))
+        elif kind == 6:                                                       # RESET
+            self.rndis_answers.append(struct.pack("<IIII", 0x80000006, 16, 0, 0))
+        elif kind == 8:                                                       # KEEPALIVE
+            self.rndis_answers.append(struct.pack("<IIII", 0x80000008, 16, rid, 0))
+
+    def _rndis_send(self, frame):
+        import struct
+        message = struct.pack("<IIII", 1, 44 + len(frame), 36, len(frame)) + bytes(28) + frame
+        self.rndis_in.append(message)
+        if not len(message) % 512:
+            self.rndis_in.append(b"")         # (a message of whole packets ends with a zero-length one)
+
+    @staticmethod
+    def _csum(b):
+        if len(b) % 2:
+            b += b"\x00"
+        total = sum(int.from_bytes(b[i:i + 2], "big") for i in range(0, len(b), 2))
+        while total >> 16:
+            total = (total & 0xFFFF) + (total >> 16)
+        return (~total) & 0xFFFF
+
+    def _ip(self, src, dst, proto, payload, ident=0x1234):
+        import struct
+        h = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), ident, 0, 64, proto, 0, src, dst)
+        return h[:10] + self._csum(h).to_bytes(2, "big") + h[12:] + payload
+
+    def _network(self, f):
+        """A frame the host sent: the network's answers queued."""
+        import struct
+        if len(f) < 14:
+            return
+        kind = f[12] << 8 | f[13]
+        router = self.NET + b"\x01"
+        if kind == 0x0806 and len(f) >= 42 and f[20:22] == b"\x00\x01" and f[38:42] == router:   # ARP: who has .1
+            arp = struct.pack(">HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 2, self.NET_MAC, router, f[22:28], f[28:32])
+            self._rndis_send(f[6:12] + self.NET_MAC + b"\x08\x06" + arp)
+            return
+        if kind != 0x0800 or len(f) < 34:
+            return
+        ip, proto = f[14:], f[23]
+        hl = (ip[0] & 15) * 4
+        src, dst = ip[12:16], ip[16:20]
+        if proto == 17 and len(ip) >= hl + 8 + 240 and ip[hl + 2:hl + 4] == b"\x00\x43":           # DHCP
+            bootp = ip[hl + 8:]
+            opts, at, msg = bootp[240:], 0, None
+            while at + 1 < len(opts) and opts[at] != 255:
+                if opts[at] == 53:
+                    msg = opts[at + 2]
+                at += 2 + opts[at + 1] if opts[at] else 1
+            if msg not in (1, 3):
+                return
+            yours = self.NET + b"\x64"
+            reply = bytearray(240)
+            reply[0:4] = b"\x02\x01\x06\x00"
+            reply[4:8] = bootp[4:8]                                           # xid
+            reply[16:20] = yours
+            reply[20:24] = router
+            reply[28:34] = bootp[28:34]                                       # the client's MAC
+            reply[236:240] = b"\x63\x82\x53\x63"
+            reply += bytes([53, 1, 2 if msg == 1 else 5, 54, 4]) + router + bytes([1, 4, 255, 255, 255, 0, 3, 4]) \
+                + router + bytes([6, 4]) + router + bytes([51, 4, 0, 0, 0x1C, 0x20, 255])
+            udp = struct.pack(">HHHH", 67, 68, 8 + len(reply), 0) + bytes(reply)
+            self._rndis_send(f[6:12] + self.NET_MAC + b"\x08\x00" + self._ip(router, b"\xff" * 4, 17, udp))
+            return
+        if proto == 1 and len(ip) >= hl + 8 and ip[hl] == 8:                 # ICMP echo request: its reply
+            icmp = bytearray(ip[hl:struct.unpack(">H", ip[2:4])[0]])
+            icmp[0] = 0
+            icmp[2:4] = b"\x00\x00"
+            icmp[2:4] = self._csum(bytes(icmp)).to_bytes(2, "big")
+            self._rndis_send(f[6:12] + self.NET_MAC + b"\x08\x00" + self._ip(dst, src, 1, bytes(icmp)))
+
     def bulk_out(self, endpoint, data):
+        if endpoint == self.RNDIS_OUT:                                        # an RNDIS packet message, packet by packet
+            import struct
+            gather = getattr(self, "rndis_gather", b"")
+            if not gather and len(data) == 1:
+                return True                   # (the byte the host adds to a message of whole packets)
+            gather += bytes(data)
+            if len(gather) >= 8 and len(gather) < struct.unpack_from("<I", gather, 4)[0]:
+                self.rndis_gather = gather
+                return True
+            self.rndis_gather = b""
+            if self.rndis_ready and len(gather) >= 44 and struct.unpack_from("<I", gather)[0] == 1:
+                offset, length = struct.unpack_from("<II", gather, 8)
+                frame = gather[8 + offset:8 + offset + length]
+                self.rndis_frames.append(frame)
+                self._network(frame)
+            return True
         iface = self.AT_OUT.get(endpoint)
         if iface is None:
             return True                       # (the diagnostic and network ports: taken, not answered)
@@ -980,6 +1109,8 @@ class VirtualModem(VirtualDevice):
             for x in due:
                 self.later.remove(x)
                 self.out[x[1]].append(x[2])
+        if endpoint == self.RNDIS_IN:
+            return _take(self.rndis_in, maxp) if self.rndis_in else None
         iface = self.AT_IN.get(endpoint)
         if iface is None or not self.out[iface]:
             return None                       # NAK
@@ -1122,7 +1253,8 @@ class UsbHost:
         self.bulk_out_log = []                # (vtime, data) endpoint A delivered
         self.bulk_in = []                     # (vtime, bytes) endpoint B received from bulk endpoints
         self.pending_in = b""                 # the rest of a control transfer's IN data
-        self.stage = None                     # 'data' / 'status_in' / 'stall' after a SETUP
+        self.stage = None                     # 'data' / 'data_out' / 'status_in' / 'stall' after a SETUP
+        self.out_setup, self.out_data = b"", bytearray()      # a SETUP with OUT data, its data so far
         self.setups = []                      # (vtime, SETUP packet) the device received
         self.interrupt_packets = []           # (vtime, packet) endpoint C delivered
         self.writes = []                      # (vtime, offset, size, value) of every store, for inspection
@@ -1366,6 +1498,10 @@ class UsbHost:
             packet = bytes(self.fifo_out[:8])
             self.fifo_out.clear()
             self.setups.append((round(self.sim._vtime(), 4), packet))
+            if len(packet) == 8 and not packet[0] & 0x80 and packet[6] | packet[7] << 8:
+                self.out_setup, self.out_data = packet, bytearray()     # (its data stage comes first)
+                self.stage = "data_out"
+                return 0
             answer = dev.setup(packet) if len(packet) == 8 else None
             if answer is None:
                 self.events.append((round(self.sim._vtime(), 4), f"SETUP {packet.hex(' ')} stalled"))
@@ -1385,7 +1521,17 @@ class UsbHost:
                 if dev.pending_address is not None:
                     dev.address, dev.pending_address = dev.pending_address, None
             return 0
-        self.fifo_out.clear()                                           # OUT (data or status)
+        if self.stage == "data_out":                                    # OUT data: the request once it is all there
+            self.out_data += self.fifo_out
+            self.fifo_out.clear()
+            want = self.out_setup[6] | self.out_setup[7] << 8
+            if len(self.out_data) >= want:
+                answer = dev.setup_data(self.out_setup, bytes(self.out_data[:want]))
+                if answer is None:
+                    self.events.append((round(self.sim._vtime(), 4), f"SETUP {self.out_setup.hex(' ')} stalled"))
+                self.stage = "stall" if answer is None else "status_in"
+            return 0
+        self.fifo_out.clear()                                           # OUT (status)
         return 0
 
     def _epb_drain(self):

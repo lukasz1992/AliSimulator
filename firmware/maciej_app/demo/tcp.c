@@ -1,6 +1,6 @@
 /* TCP over eth.c's IPv4: a few connections, opened from here (tcp_connect:
    wget) or by a peer through a port listened on (tcp_listen + tcp_accept:
-   the telnet console, netload).  Kept small and plain:
+   the telnet console, netload, FTP, the web page).  Kept small and plain:
      - MSS 1460 offered (the peer's taken from its SYN, 536 without one), no
        window scaling, no SACK, no timestamps;
      - in-order receive only: a segment that does not start at rcv_nxt is
@@ -26,8 +26,8 @@
    or SACK would be the cure). */
 #include "hw.h"
 
-#define CONNS        6               /* (telnet, FTP's control and data, wget or netload, room) */
-#define LISTENS      6
+#define CONNS        12              /* (telnet, FTP's two control and data, wget or netload, the web page's six) */
+#define LISTENS      8
 #define MSS          1460
 #define SEND_SIZE    32768u             /* each connection's send buffer (the telnet console's output) */
 #define RECV_SIZE    32768u             /* its receive buffer: the most the window offers */
