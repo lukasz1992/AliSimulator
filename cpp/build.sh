@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 OUT="${1:-build}"
 CXX="${CXX:-g++}"
 mkdir -p "$OUT"
-CXXFLAGS="-O2 -std=c++17 -DNDEBUG -fPIC -fvisibility=hidden -Iemulator -Wall -Wno-unused-function"
+CXXFLAGS="-O2 -march=native -mtune=native -flto -std=c++17 -DNDEBUG -fPIC -fvisibility=hidden -Iemulator -Wall -Wno-unused-function"
 SRC="emulator/alicore.cpp emulator/alicore_exec.cpp emulator/alicore_fpu.cpp"
 $CXX $CXXFLAGS -shared $SRC emulator/alicore_api.cpp -o "$OUT/libalicore.so" > "$OUT/build.log" 2>&1 || {
   cat "$OUT/build.log"; echo "BUILD FAILED"; exit 1; }

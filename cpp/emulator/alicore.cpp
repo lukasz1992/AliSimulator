@@ -35,9 +35,9 @@ Core::Core() {
   // CP0 reset values of Unicorn's 24Kf (probed), the simulator's Status / EBase
   cp0[1][0] = 6;              // Random
   cp0[12][1] = 0xE0000000;    // IntCtl: IPTI = IPPCI = 7
-  cp0[15][0] = 0x00019300;    // PRId
-  cp0[16][0] = 0x80000482;    // Config0
-  cp0[16][1] = 0x9E190C8F;    // Config1
+  cp0[15][0] = 0x00018055;    // PRId: MIPS 4Kc, rev 0x55 (the A54 box: read with the OTP menu)    // PRId
+  cp0[16][0] = 0x86A70183;    // Config0: MT=3 (fixed mapping, no TLB), K0=3, little endian (the A54 box)
+  cp0[16][1] = 0x00D96C9E;    // Config1: no TLB, I/D cache 512 sets x 2 ways x 16 B = 16 KB, no FPU (the A54 box)
   cp0[16][2] = 0x80000000;    // Config2
   cp0[19][0] = 0x80000000;    // WatchHi
   cp0[23][0] = 0x02008000;    // Debug
