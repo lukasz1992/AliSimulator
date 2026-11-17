@@ -2450,6 +2450,8 @@ static void put_pixel(u32 x, u32 y, u32 colour)
     }
     case T_CGA4: case T_CGA2: {
         u32 a = 0xB8000 + (y & 1) * 0x2000 + (y >> 1) * 80, bits = kind == T_CGA2 ? 1 : 2;
+        if (y >= 200 || x >= (kind == T_CGA2 ? 640u : 320u))
+            break;                      /* (CX, DX as the program gave them: megabytes past the memory) */
         a += x * bits / 8;
         u32 sh = 8 - bits - (x * bits) % 8, mask = (bits == 1 ? 1u : 3u) << sh, v = (colour << sh) & mask;
         mem[a] = (u8)((colour & 0x80) ? mem[a] ^ v : (mem[a] & ~mask) | v);
@@ -2508,10 +2510,15 @@ static void scroll(u32 lines, u32 fill, u32 top, u32 left, u32 bottom, u32 right
         right = cols - 1;
     if (bottom > 24)
         bottom = 24;
+    if (top > bottom || left > right)
+        return;                         /* (no window: its height below wrapped to four billion rows) */
     if (kind != T_TEXT) {               /* (graphics: the window cleared, which is what programs ask for) */
         for (u32 y = top * 8; y < (bottom + 1) * 8; y++)
             for (u32 x = left * 8; x < (right + 1) * 8; x++)
                 put_pixel(x, y, kind == T_VGA256 ? fill & 0xFF : 0);
+        /* (the BIOS's time for it, 4 cycles a pixel: free, a program printing line feeds in a loop had
+           thousands of whole-screen clears in one frame -- a frame of many seconds) */
+        c.cycles += (s32)((bottom + 1 - top) * (right + 1 - left) * 64u * 4u);
         return;
     }
     u32 base = 0xB8000 + mem[BDA + 0x62] * (u32)get16(BDA + 0x4C), h = bottom - top + 1;
@@ -2521,12 +2528,12 @@ static void scroll(u32 lines, u32 fill, u32 top, u32 left, u32 bottom, u32 right
         u32 y = down ? bottom - i : top + i, from = down ? y - lines : y + lines;
         int blank = down ? (y < top + lines) : (y + lines > bottom);
         for (u32 x = left; x <= right; x++) {
-            u32 a = base + (y * cols + x) * 2;
+            u32 a = (base + (y * cols + x) * 2) & 0xFFFFF;      /* (the page and its size are the program's) */
             if (blank) {
                 mem[a] = ' ';
                 mem[a + 1] = (u8)fill;
             } else {
-                u32 b = base + (from * cols + x) * 2;
+                u32 b = (base + (from * cols + x) * 2) & 0xFFFFF;
                 mem[a] = mem[b];
                 mem[a + 1] = mem[b + 1];
             }
@@ -2690,6 +2697,9 @@ static void bios_video(void)
         break;
     case 0x13: {
         u32 page = rBH, n = rCX, at = rBP, attrib = rBL;
+        if (n > 4000)
+            n = 4000;                   /* (two screens of text: 65535 characters in a graphics mode, each a
+                                           scroll, are seconds inside this one call) */
         put16(BDA + 0x50 + (page & 7) * 2, rDX);
         u32 saved = mem[BDA + 0x62];
         mem[BDA + 0x62] = (u8)(page & 7);

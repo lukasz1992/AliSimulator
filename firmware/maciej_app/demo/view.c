@@ -84,6 +84,8 @@ int view_is_picture(const char *name)
 
 /* while a picture is decoded (image.c asks now and then): the clock read -- which feeds the watchdog --, the
    TV console kept up, and Ctrl-C or Esc (UART, telnet, USB keyboard) stop it */
+static int stop_keyed;                  /* the decode was stopped by a key (not by what the file holds) */
+
 static int stop_wanted(void)
 {
     static u64 last;
@@ -95,12 +97,12 @@ static int stop_wanted(void)
     int c;
     while ((c = uart_getc()) >= 0)
         if (c == 3 || c == 27)
-            return 1;
+            return stop_keyed = 1;
     usb_int_poll();
     (void)kbd_poll();
     while ((c = kbd_getc()) >= 0)
         if (c == 3)
-            return 1;
+            return stop_keyed = 1;
     return 0;
 }
 
@@ -252,9 +254,15 @@ static int show_file(const char *path, int quiet)
     for (u32 i = 0; i < f.fw * f.fh; i++)
         f.out[i] = RGB(0, 0, 0);
     f.oy = 0, f.rows = 0;
+    stop_keyed = 0;
     image_poll = stop_wanted;
     why = image_decode(data, (u32)got, work + used, left - used, fit_row, &f);
     image_poll = 0;
+    if (why && !stop_keyed && !f.oy && !f.rows) {       /* (not one row of it came: the TV says why, as for a file
+                                                           that is no picture -- not a black screen) */
+        uprintf("%s: %s %ux%u, %s: %s\n", path, in.kind, in.width, in.height, in.detail, why);
+        return -1;
+    }
     fit_flush(&f);
     u64 t2 = now_ms();
     /* onto the test screen's picture, in the middle, turned (EXIF: 2..8), each pixel k x k */
@@ -376,8 +384,11 @@ static int key(void)
         if (c == 'i')
             return 2;
     }
-    if (esc == 1) {                     /* ESC alone (the USB keyboard's Esc comes as Ctrl-C) */
-        static u64 since;
+    static u64 since;                   /* when the ESC waited for was first seen waiting (0: none is) */
+    if (esc != 1) {
+        since = 0;                      /* (it began an arrow's sequence, or there is none: the next ESC's
+                                           150 ms start afresh -- kept, the second arrow ended the viewer) */
+    } else {                            /* ESC alone (the USB keyboard's Esc comes as Ctrl-C) */
         if (!since)
             since = now_ms();
         if (now_ms() - since > 150) {

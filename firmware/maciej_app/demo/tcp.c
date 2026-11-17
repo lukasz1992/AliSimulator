@@ -292,7 +292,9 @@ static void timeout(struct conn *c, u64 now)
     }
     if (!flight)
         return;
-    int alive = c->snd_wnd == 0 && now - c->heard < 2u * c->rto;       /* (a closed window, answered) */
+    int alive = c->held && c->snd_wnd == 0 && now - c->heard < 2u * c->rto;    /* (a closed window, answered --
+                                                   for a connection somebody still has: one its caller closed
+                                                   would stay for as long as the peer kept its socket) */
     if (!alive && ++c->tries > TRIES) {
         reset(c, "timed out");
         return;
@@ -609,6 +611,14 @@ void tcp_poll(void)
             timeout(c, now);
         if (c->state == CLOSED)
             continue;
+        /* one that came in and that no server took for half a minute after its peer's last segment (the web
+           page's six clients all busy, a server that is only served between commands): reset -- it kept its
+           place for good, and twelve of them left no port answering */
+        if (!c->held && !c->fin_queued && (c->state == ESTABLISHED || c->state == CLOSE_WAIT) &&
+            now - c->heard > 30000) {
+            reset(c, "not taken");
+            continue;
+        }
         output(c);
         if (c->ack_due)
             send_ack(c);

@@ -322,7 +322,10 @@ int snd_room(void)
     service();
     u32 q = queued_frames();
     u32 free_frames = q + 1 < SND_FRAMES ? SND_FRAMES - 1 - q : 0;
-    return (int)(free_frames * SND_FRAME + (SND_FRAME - staged));
+    /* (one sample less than fills the frames there are: the sample that completes a frame needs a free place in
+       the ring for it, and with none snd_write waits for the DMA -- a game ahead of the sound stalled there
+       instead of dropping) */
+    return (int)(free_frames * SND_FRAME + (SND_FRAME - staged) - 1);
 }
 
 void snd_write(const s16 *mono, int n)

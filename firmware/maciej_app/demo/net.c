@@ -658,6 +658,11 @@ static int warsaw_text(char *buf, int size, u32 t, int weekday)
     return time_text(buf, size, t + (summer ? 7200 : 3600), summer ? "CEST" : "CET", weekday);
 }
 
+u32 net_clock_utc(void)                 /* disk.c: the time what it makes is dated with */
+{
+    return synced ? clock_now() : 0;
+}
+
 int ntp_clock_text(char *buf, int size)          /* the TV's SYSTEM box */
 {
     if (!synced)
@@ -1056,8 +1061,22 @@ void cmd_wget(int argc, char **argv)
 /* ================================================================== */
 const char *net_poll(void)
 {
-    if (!eth_ready())
-        return 0;
+    if (!eth_ready()) {
+        /* no address (the adapter unplugged, DHCP not answered): nothing comes in, but what the network's
+           going cut off is still to be ended -- tcp.c failed the connections, and a server that never looked
+           kept its state: an upload left open held its volume's writer ("busy") until an address came back */
+        static u64 looked;
+        const char *s = 0;
+        if (started && now_ms() - looked >= 100) {
+            looked = now_ms();
+            s = tn_poll();
+            if (!s)
+                s = ftp_poll();
+            if (!s)
+                s = http_poll(0);
+        }
+        return s;
+    }
     if (!started) {
         started = 1;
         tcp_listen(TELNET_PORT);

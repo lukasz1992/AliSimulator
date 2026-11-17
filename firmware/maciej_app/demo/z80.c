@@ -61,7 +61,8 @@ static inline u8 rd(struct z80 *c, u16 a)
 {
     cont(c, a);
     T += 3;
-    return c->rd[a >> 10][a & 0x3FF];
+    const u8 *p = c->rd[a >> 10];
+    return p ? p[a & 0x3FF] : c->read(c, a);
 }
 
 static inline void wr(struct z80 *c, u16 a, u8 v)
@@ -81,7 +82,8 @@ static inline u8 fetch(struct z80 *c)
     cont(c, a);
     T += 4;
     c->r++;
-    return c->rd[a >> 10][a & 0x3FF];
+    const u8 *p = c->rd[a >> 10];
+    return p ? p[a & 0x3FF] : c->read(c, a);
 }
 
 /* n T-states of the CPU working inside, address a on the bus */
@@ -773,7 +775,8 @@ prefixed:
     case 0xDD: case 0xFD: {
         /* a prefix: the next opcode with IX or IY; but a prefix followed by another is a NOP of its own (the
            next one starts the instruction; no interrupt in between) */
-        u8 next = c->rd[PC >> 10][PC & 0x3FF];
+        const u8 *page = c->rd[PC >> 10];
+        u8 next = page ? page[PC & 0x3FF] : c->read(c, PC);
         if (next == 0xDD || next == 0xFD) {
             c->ei_block = 1;
             return;

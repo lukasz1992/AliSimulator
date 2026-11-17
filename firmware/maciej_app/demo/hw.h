@@ -255,6 +255,7 @@ void mouse_stop(void);
 int mouse_active(void);
 u8 mouse_device(void);                  /* the address of the mouse in use, 0: none */
 void mouse_yield_epd(void);             /* endpoint D to the keyboard: the mouse reads through endpoint B */
+void mouse_retake_epd(void);            /* the keyboard that had endpoint D stopped: the mouse through it again */
 int mouse_moving_on_b(void);            /* moving, read through endpoint B: eth.c reads less often */
 const char *mouse_poll(void);           /* every main loop pass; a line to show, or 0 */
 void mouse_show_status(void);
@@ -308,6 +309,8 @@ u32 disk_changes(void);                 /* changes when a disk comes or goes or 
 /* disk.c for ftp.c: a reader and a writer of its own (they last across main loop passes), -1 said why */
 int disk_stat(const char *path, struct disk_entry *o);  /* a file, a directory, a volume's root: 0, -1 */
 int disk_stream_open(const char *path, u64 *size);      /* 0, -1 */
+u64 disk_stream_seek(u64 pos);                          /* after the open: on to the cluster / sector holding
+                                                           pos; where it is now (FTP's REST) */
 int disk_stream_read(u8 *buf, u32 max);                 /* max: 512 x n, 4096 at most; bytes, 0 the end, -1 */
 void disk_stream_close(void);
 int disk_upload_open(const char *path, int append);     /* made / emptied / added to: 0, -1 */
@@ -437,6 +440,7 @@ void net_command(int running);          /* main.c: a command runs (1) / ended (0
 void net_uart_poll(void);               /* uart_getc: the telnet client's typing (in a command: the network too) */
 void telnet_putc(char c);               /* uart_putc: every character printed, to the telnet client */
 int ntp_clock_text(char *buf, int size);        /* "11:23:45 CET" once NTP set the clock: 1, else 0 */
+u32 net_clock_utc(void);                /* seconds since 1970 (UTC) once NTP set the clock, else 0 */
 void cmd_wget(int argc, char **argv);
 void cmd_ntp(int argc, char **argv);
 void cmd_date(int argc, char **argv);
@@ -463,11 +467,14 @@ int nes_play(const char *path, u32 frames, const char *script);    /* 'nes': 0, 
 int gb_play(const char *path, u32 frames, const char *script);     /* 'gb': the same for a Game Boy game */
 int sms_play(const char *path, u32 frames, const char *script);    /* 'sms': a Master System game */
 int gg_play(const char *path, u32 frames, const char *script);     /* 'gg': a Game Gear game */
+int sg_play(const char *path, u32 frames, const char *script);     /* 'sg': an SG-1000 / SC-3000 game */
 int zx_play(const char *path, u32 frames, const char *script);     /* 'zx': a ZX Spectrum program ("": BASIC) */
 int a26_play(const char *path, u32 frames, const char *script);    /* 'a26': an Atari 2600 game */
 int c64_play(const char *path, u32 frames, const char *script);    /* 'c64': a C64 program ("": BASIC) */
 int amiga_play(const char *path, u32 frames, const char *script);  /* 'amiga': an .adf ("": no disk) */
 int dos_play(const char *path, u32 frames, const char *script);    /* 'dos': a DOS program (.exe, .com) */
+int md_play(const char *path, u32 frames, const char *script);     /* 'megadrive': a Mega Drive / Genesis game */
+void md_play_region(int region);        /* the console its next game runs on: 'J', 'U', 'E', 0 the header's */
 
 /* view.c: the picture viewer (image.c decodes JPEG, PNG, GIF, BMP) */
 #define IMAGE_WORK_PHYS  0x06900000u      /* the picture as shown, and the decoder's memory (a progressive JPEG's */

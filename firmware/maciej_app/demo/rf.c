@@ -1189,6 +1189,549 @@ static int cmd_spectrum(int argc, char **argv)
     return 0;
 }
 
+/* ---- rf live ---- */
+
+/* 'rf spectrum' kept current, with keys: the band swept again and again, each bar drawn as it is measured
+   (tuner tuned, acquisition restarted, the IF AGC read after `settle` ms -- so a pass takes its points x
+   (settle + the tune's own ~time), not an instant), a marker with its frequency / channel / level, the
+   highest level seen kept as a tick over each bar.  Left / Right move the marker (past an edge: the window
+   moves), Up / Down halve / double the span around it, PgUp / PgDn move the window half its width, F the
+   whole band again, + / - halve / double the settle time (160 ms at first, 40..640), Space pauses, P peak hold on / off (cleared),
+   Enter tries a DVB-T lock on the marker's channel, Esc / q / Ctrl-C / the remote's EXIT end it. */
+#define LIVE_BARS 145                   /* at most: 8 pixels each */
+#define LIVE_MAX  (LIVE_BARS + 3)
+#define LX0 60
+#define LY0 132
+#define LW  (SCREEN_W - 2 * LX0)
+#define LH  400
+#define LIVE_BG RGB(12, 16, 28)
+
+static struct {
+    u32 from, span, step;               /* kHz */
+    int n, marker;                      /* points; the marker's */
+    u32 lo, hi;                         /* the level axis, tenths of a percent */
+    int ranged;                         /* ... set from what was measured */
+    u32 settle, pass_ms;                /* ms a point; the last whole pass */
+    int paused, hold;
+    char note[64];                      /* what Enter found */
+} lv;
+static u16 live_lvl[LIVE_MAX], live_peak[LIVE_MAX];     /* tenths of a percent; 0 = not measured yet */
+
+enum { LK_NONE, LK_LEFT, LK_RIGHT, LK_UP, LK_DOWN, LK_PGUP, LK_PGDN, LK_ENTER, LK_SPACE, LK_FASTER, LK_SLOWER,
+       LK_PEAK, LK_FULL, LK_QUIT };
+
+static int live_same(const char *a, const char *b)     /* (the remote's key names: any case) */
+{
+    for (; *a && *b; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'a' && x <= 'z')
+            x = (char)(x - 32);
+        if (y >= 'a' && y <= 'z')
+            y = (char)(y - 32);
+        if (x != y)
+            return 0;
+    }
+    return *a == *b;
+}
+
+static int live_len(const char *s)
+{
+    int n = 0;
+    while (s[n])
+        n++;
+    return n;
+}
+
+/* the next key (USB keyboard, UART / telnet, the remote), LK_NONE: none */
+static int live_key(void)
+{
+    static u8 esc;
+    static int num;
+    static u64 esc_since;
+    int c;
+    usb_int_poll();
+    (void)kbd_poll();
+    while ((c = kbd_getc()) >= 0 || (c = uart_getc()) >= 0) {
+        if (esc == 2) {
+            if (c >= '0' && c <= '9') {
+                num = num * 10 + c - '0';
+                continue;
+            }
+            esc = 0;
+            if (c == 'C')
+                return LK_RIGHT;
+            if (c == 'D')
+                return LK_LEFT;
+            if (c == 'A')
+                return LK_UP;
+            if (c == 'B')
+                return LK_DOWN;
+            if (c == '~' && num == 5)
+                return LK_PGUP;
+            if (c == '~' && num == 6)
+                return LK_PGDN;
+            continue;
+        }
+        if (esc == 1) {
+            esc = c == '[' ? 2 : 0;
+            num = 0;
+            if (!esc)
+                return LK_QUIT;         /* (a lone ESC, then something else) */
+            continue;
+        }
+        if (c == 27) {
+            esc = 1;
+            esc_since = now_ms();
+            continue;
+        }
+        if (c == 3 || c == 'q' || c == 'Q')
+            return LK_QUIT;
+        if (c == '\r' || c == '\n')
+            return LK_ENTER;
+        if (c == ' ')
+            return LK_SPACE;
+        if (c == '+' || c == '=')
+            return LK_FASTER;
+        if (c == '-' || c == '_')
+            return LK_SLOWER;
+        if (c == 'p' || c == 'P')
+            return LK_PEAK;
+        if (c == 'f' || c == 'F')
+            return LK_FULL;
+    }
+    if (esc == 1 && now_ms() - esc_since > 150) {       /* ESC alone (the UART's; the keyboard's is Ctrl-C) */
+        esc = 0;
+        return LK_QUIT;
+    }
+    struct ir_event ev;
+    while (ir_poll(&ev)) {
+        if (!ev.valid)
+            continue;
+        const char *n = ir_key_name(ev.code);
+        if (!n)
+            continue;
+        if (live_same(n, "LEFT"))       /* (the marker's keys repeat) */
+            return LK_LEFT;
+        if (live_same(n, "RIGHT"))
+            return LK_RIGHT;
+        if (ev.repeat)
+            continue;
+        if (live_same(n, "UP"))
+            return LK_UP;
+        if (live_same(n, "DOWN"))
+            return LK_DOWN;
+        if (live_same(n, "PAGE+"))
+            return LK_PGDN;
+        if (live_same(n, "PAGE-"))
+            return LK_PGUP;
+        if (live_same(n, "OK"))
+            return LK_ENTER;
+        if (live_same(n, "EXIT"))
+            return LK_QUIT;
+    }
+    return LK_NONE;
+}
+
+/* the level in tenths of a percent (dm_level's formula, finer) */
+static u32 live_level(void)
+{
+    u32 agc;
+    (void)dm_level(&agc);
+    s32 x = ((s32)agc - 50) * 1000 / 1150;
+    if (x < 10)
+        x = 10;
+    if (x > 990)
+        x = 990;
+    return (u32)(1000 - x);
+}
+
+/* the window: `span` kHz from `from` (kept inside the tuner's 42..1002 MHz), the marker on `mark` kHz */
+static void live_layout(u32 from, u32 span, u32 mark)
+{
+    if (span < 8000)
+        span = 8000;
+    if (span > 960000)
+        span = 960000;
+    if (from < 42000 || from > 0x7FFFFFFFu)
+        from = 42000;
+    if (from + span > 1002000)
+        from = 1002000 - span;
+    u32 step = (span / LIVE_BARS + 249) / 250 * 250;
+    if (step < 250)
+        step = 250;
+    lv.from = from;
+    lv.span = span;
+    lv.step = step;
+    lv.n = (int)(span / step) + 1;
+    if (lv.n > LIVE_MAX)
+        lv.n = LIVE_MAX;
+    int m = mark > from ? (int)((mark - from + step / 2) / step) : 0;
+    lv.marker = m >= lv.n ? lv.n - 1 : m;
+    lv.lo = 0;
+    lv.hi = 1000;
+    lv.ranged = 0;
+    lv.pass_ms = 0;
+    for (int i = 0; i < LIVE_MAX; i++)
+        live_lvl[i] = live_peak[i] = 0;
+}
+
+/* the level axis from what is measured: from a little under the lowest to well over the highest.  During a
+   pass it only grows (shrink 0), with room to spare so that it seldom has to; after a pass it shrinks when it
+   is well too wide.  1 when it changed (the bars and its labels are to be drawn again: live_rescale) */
+static int live_range(int shrink)
+{
+    u32 floor = 1000, top = 0;
+    for (int i = 0; i < lv.n; i++) {
+        u32 v = live_lvl[i];
+        if (!v)
+            continue;
+        if (v < floor)
+            floor = v;
+        if (v > top)
+            top = v;
+        if (lv.hold && live_peak[i] > top)
+            top = live_peak[i];
+    }
+    u32 lo = 0, hi = 1000;
+    if (top) {
+        lo = floor > 50 ? (floor - 50) / 50 * 50 : 0;
+        hi = (top + 100 > lo + 250 ? top + 100 : lo + 250) / 50 * 50;
+        if (hi > 1000)
+            hi = 1000;
+        if (lv.ranged) {
+            u32 want_lo = lo, want_hi = hi;
+            lo = lv.lo;
+            hi = lv.hi;
+            if (want_lo < lo)
+                lo = want_lo >= 50 ? want_lo - 50 : 0;
+            if (want_hi > hi)
+                hi = want_hi + 50 > 1000 ? 1000 : want_hi + 50;
+            if (shrink && want_lo >= lo + 150)
+                lo = want_lo;
+            if (shrink && hi >= want_hi + 150)
+                hi = want_hi;
+        }
+        lv.ranged = 1;
+    }
+    if (lo == lv.lo && hi == lv.hi)
+        return 0;
+    lv.lo = lo;
+    lv.hi = hi;
+    return 1;
+}
+
+static int live_height(u32 v)
+{
+    if (v <= lv.lo)
+        return 1;
+    int h = (int)((v - lv.lo) * (u32)LH / (lv.hi - lv.lo));
+    return h < 1 ? 1 : h > LH ? LH : h;
+}
+
+static int live_x(u32 khz)              /* a frequency's column (its bar's middle) */
+{
+    return LX0 + LW / (2 * lv.n) + (int)((khz - lv.from) * (u32)LW / ((u32)lv.n * lv.step));
+}
+
+/* one bar: its background and grid lines, the bar, the peak's tick, the marker's line */
+static void live_col(int i)
+{
+    if (i < 0 || i >= lv.n)
+        return;
+    gfx_target(0);
+    int xa = LX0 + i * LW / lv.n, xb = LX0 + (i + 1) * LW / lv.n, bw = xb - xa > 3 ? xb - xa - 1 : xb - xa;
+    gfx_fill(xa, LY0, xb - xa, LH, RGB(24, 30, 48));
+    u32 grid = lv.hi - lv.lo > 500 ? 100 : 50;
+    for (u32 g = lv.lo; g <= lv.hi; g += grid)
+        gfx_fill(xa, LY0 + LH - (int)((g - lv.lo) * (u32)LH / (lv.hi - lv.lo)) - (g == lv.lo), xb - xa, 1,
+                 RGB(50, 60, 84));
+    u32 v = live_lvl[i];
+    if (v) {
+        int bh = live_height(v);
+        u32 rel = v > lv.lo ? (v - lv.lo) * 255 / (lv.hi - lv.lo) : 0;
+        if (rel > 255)
+            rel = 255;
+        gfx_fill(xa, LY0 + LH - bh, bw, bh, RGB(60 + rel * 195 / 255, 120 + rel / 2, 255 - rel * 200 / 255));
+    }
+    if (lv.hold && live_peak[i] > v)
+        gfx_fill(xa, LY0 + LH - live_height(live_peak[i]), bw, 2, RGB(255, 220, 120));
+    if (i == lv.marker)
+        gfx_fill((xa + xb) / 2, LY0, 1, LH, RGB(255, 255, 255));
+}
+
+static void live_tick(int i, int on)    /* where the sweep is: a mark under its bar */
+{
+    if (i < 0 || i >= lv.n)
+        return;
+    gfx_target(0);
+    int xa = LX0 + i * LW / lv.n, xb = LX0 + (i + 1) * LW / lv.n;
+    gfx_fill(xa, LY0 + LH + 2, xb - xa, 4, on ? RGB(255, 230, 80) : LIVE_BG);
+}
+
+static void live_info(void)             /* the settings' line */
+{
+    char buf[128];
+    gfx_target(0);
+    gfx_fill(LX0, 68, LW, 20, LIVE_BG);
+    usnprintf(buf, sizeof(buf), "%u..%u MHz   every %u kHz   %u ms a point", lv.from / 1000,
+              (lv.from + lv.step * (u32)(lv.n - 1)) / 1000, lv.step, lv.settle);
+    if (lv.pass_ms)
+        usnprintf(buf + live_len(buf), (int)sizeof(buf) - live_len(buf), "   a pass %u.%u s", lv.pass_ms / 1000,
+                  lv.pass_ms % 1000 / 100);
+    if (lv.hold)
+        usnprintf(buf + live_len(buf), (int)sizeof(buf) - live_len(buf), "   peak hold");
+    gfx_text(LX0, 70, buf, 2, RGB(150, 160, 180));
+    if (lv.paused)
+        gfx_text(LX0 + LW - gfx_text_width("PAUSED", 2), 70, "PAUSED", 2, RGB(255, 200, 80));
+}
+
+static void live_readout(void)          /* the marker's line */
+{
+    char buf[128];
+    u32 f = lv.from + lv.step * (u32)lv.marker, v = live_lvl[lv.marker], pk = live_peak[lv.marker];
+    gfx_target(0);
+    gfx_fill(LX0, 96, LW, 20, LIVE_BG);
+    usnprintf(buf, sizeof(buf), "Marker %u.%03u MHz", f / 1000, f % 1000);
+    if (f >= 470000 && f < 862000)
+        usnprintf(buf + live_len(buf), (int)sizeof(buf) - live_len(buf), "  UHF ch %u", (f - 470000) / 8000 + 21);
+    else if (f >= 174000 && f < 230000)
+        usnprintf(buf + live_len(buf), (int)sizeof(buf) - live_len(buf), "  VHF ch %u", (f - 174000) / 7000 + 5);
+    if (v)
+        usnprintf(buf + live_len(buf), (int)sizeof(buf) - live_len(buf), "   %u.%u %%", v / 10, v % 10);
+    if (lv.hold && pk > v)
+        usnprintf(buf + live_len(buf), (int)sizeof(buf) - live_len(buf), " (peak %u.%u %%)", pk / 10, pk % 10);
+    gfx_text(LX0, 98, buf, 2, RGB(255, 255, 255));
+    if (lv.note[0])
+        gfx_text(LX0 + gfx_text_width(buf, 2) + 36, 98, lv.note, 2, RGB(255, 220, 120));
+}
+
+static void live_rescale(void)          /* a new level axis: its labels and every bar */
+{
+    char buf[16];
+    gfx_target(0);
+    gfx_fill(0, LY0 - 12, LX0, LH + 24, LIVE_BG);
+    u32 grid = lv.hi - lv.lo > 500 ? 100 : 50;
+    for (u32 g = lv.lo; g <= lv.hi; g += grid) {
+        usnprintf(buf, sizeof(buf), "%u%%", g / 10);
+        gfx_text(LX0 - 8 - gfx_text_width(buf, 1), LY0 + LH - (int)((g - lv.lo) * (u32)LH / (lv.hi - lv.lo)) - 8, buf,
+                 1, RGB(150, 160, 180));
+    }
+    for (int i = 0; i < lv.n; i++)
+        live_col(i);
+}
+
+static void live_all(void)              /* the whole picture: at the start and for a new window */
+{
+    char buf[64];
+    gfx_target(0);
+    gfx_fill(0, 0, SCREEN_W, SCREEN_H, LIVE_BG);
+    gfx_text(LX0, 22, "Aerial level, live", 3, RGB(240, 240, 240));
+    live_info();
+    live_readout();
+    live_rescale();
+    /* the frequency axis: MHz at a spacing that fits the span, the UHF channels under it */
+    u32 last = lv.from + lv.step * (u32)(lv.n - 1), span = last - lv.from;
+    u32 every = span > 400000 ? 100 : span > 160000 ? 50 : span > 64000 ? 20 : span > 32000 ? 10 : span > 12000 ? 5 : 2;
+    for (u32 mhz = (lv.from / 1000 + every - 1) / every * every; mhz * 1000 <= last; mhz += every) {
+        int x = live_x(mhz * 1000);
+        gfx_fill(x, LY0 + LH + 8, 1, 10, RGB(200, 200, 200));
+        usnprintf(buf, sizeof(buf), "%u", mhz);
+        gfx_text(x - gfx_text_width(buf, 2) / 2, LY0 + LH + 22, buf, 2, RGB(200, 200, 200));
+    }
+    u32 label = span > 320000 ? 5 : span > 120000 ? 2 : 1;
+    int any = 0;
+    for (u32 ch = 21; ch <= 69; ch++) {
+        u32 f = 474000 + (ch - 21) * 8000;
+        if (f < lv.from || f > last)
+            continue;
+        int x = live_x(f);
+        any = 1;
+        gfx_fill(x, LY0 + LH + 48, 1, ch % label ? 5 : 10, RGB(150, 200, 150));
+        if (ch % label == 0) {
+            usnprintf(buf, sizeof(buf), "%u", ch);
+            gfx_text(x - gfx_text_width(buf, 2) / 2, LY0 + LH + 62, buf, 2, RGB(150, 200, 150));
+        }
+    }
+    if (any && lv.from < 470000)
+        gfx_text(LX0, LY0 + LH + 62, "UHF channel", 2, RGB(150, 200, 150));
+    gfx_text(LX0, SCREEN_H - 92, "Left / Right  marker      Up / Down  zoom in / out      PgUp / PgDn  move      "
+             "F  whole band", 2, RGB(150, 160, 180));
+    gfx_text(LX0, SCREEN_H - 68, "Enter  try DVB-T at the marker      + / -  faster / slower      Space  pause", 2,
+             RGB(150, 160, 180));
+    gfx_text(LX0, SCREEN_H - 44, "P  peak hold      Esc  back", 2, RGB(150, 160, 180));
+}
+
+static int cmd_live(int argc, char **argv)
+{
+    u32 from = 174000, to = 862000, b;
+    if (argc > 2 && (argc < 4 || !parse_khz(argv[2], &from, &b) || !parse_khz(argv[3], &to, &b) || from >= to)) {
+        uprintf("usage: rf live [<from MHz> <to MHz>]\n");
+        return -1;
+    }
+    if (from < 42000 || to > 1002000) {
+        uprintf("rf live: the MxL603 tunes 42..1002 MHz\n");
+        return -1;
+    }
+    if (need_init())
+        return -1;
+    dm_setup();
+    lv.settle = 160;                    /* as 'rf spectrum': sooner the AGC has not settled (+ trades that for speed) */
+    lv.paused = 0;
+    lv.hold = 1;
+    lv.note[0] = 0;
+    live_layout(from, to - from, (from + to) / 2);
+    uprintf("rf live: the chart is on the TV, swept again and again.  Left / Right the marker, Up / Down zoom, "
+            "PgUp / PgDn move, F the whole band, + / - faster / slower, Space pause, P peak hold, Enter a DVB-T "
+            "lock tried at the marker, Esc / q / Ctrl-C end it\n");
+    live_all();
+    gfx_view(0);
+    int i = 0, rc = 0;
+    u32 passes = 0;
+    u64 pass_start = now_ms();
+    for (;;) {
+        int k = LK_NONE;
+        if (lv.paused) {
+            delay_ms(5);
+            k = live_key();
+        } else {
+            live_tick(i, 1);
+            mxl_err = 0;
+            mxl_chan_tune(lv.from + lv.step * (u32)i, 8);
+            dm_acquire(8);
+            if (mxl_err) {
+                uprintf("rf live: the tuner does not answer\n");
+                rc = -1;
+                break;
+            }
+            u64 end = now_ms() + lv.settle;
+            while (now_ms() < end && (k = live_key()) == LK_NONE)
+                delay_us(500);
+            if (k == LK_NONE) {
+                u32 v = live_level();
+                live_lvl[i] = (u16)v;
+                if (v > live_peak[i])
+                    live_peak[i] = (u16)v;
+                if (live_range(0))
+                    live_rescale();
+                else
+                    live_col(i);
+                if (i == lv.marker)
+                    live_readout();
+                live_tick(i, 0);
+                if (++i >= lv.n) {
+                    i = 0;
+                    passes++;
+                    lv.pass_ms = (u32)(now_ms() - pass_start);
+                    pass_start = now_ms();
+                    if (live_range(1))
+                        live_rescale();
+                    live_info();
+                }
+                continue;
+            }
+            live_tick(i, 0);
+        }
+        if (k == LK_NONE)
+            continue;
+        if (k == LK_QUIT)
+            break;
+        u32 mark = lv.from + lv.step * (u32)lv.marker;
+        int again = 0;                  /* a new window: everything from its first point */
+        if (k == LK_LEFT || k == LK_RIGHT) {
+            int m = lv.marker + (k == LK_RIGHT ? 1 : -1);
+            lv.note[0] = 0;
+            if (m < 0 || m >= lv.n) {   /* past the edge: the window a quarter of its width on */
+                u32 by = lv.span / 4, f = lv.from;
+                if (k == LK_RIGHT)
+                    f = f + by + lv.span <= 1002000 ? f + by : 1002000 - lv.span;
+                else
+                    f = f >= 42000 + by ? f - by : 42000;
+                if (f != lv.from) {
+                    live_layout(f, lv.span, k == LK_RIGHT ? mark + lv.step : mark > lv.step ? mark - lv.step : mark);
+                    again = 1;
+                }
+            } else {
+                int old = lv.marker;
+                lv.marker = m;
+                live_col(old);
+                live_col(m);
+                live_readout();
+            }
+        } else if (k == LK_UP || k == LK_DOWN) {
+            u32 span = k == LK_UP ? lv.span / 2 : lv.span * 2;
+            if (span < 8000)
+                span = 8000;
+            if (span > 960000)
+                span = 960000;
+            if (span != lv.span) {
+                lv.note[0] = 0;
+                live_layout(mark > 42000 + span / 2 ? mark - span / 2 : 42000, span, mark);
+                again = 1;
+            }
+        } else if (k == LK_PGUP || k == LK_PGDN) {
+            u32 by = lv.span / 2, f = lv.from;
+            if (k == LK_PGDN)
+                f = f + by + lv.span <= 1002000 ? f + by : 1002000 - lv.span;
+            else
+                f = f >= 42000 + by ? f - by : 42000;
+            if (f != lv.from) {
+                lv.note[0] = 0;
+                live_layout(f, lv.span, f + (mark - lv.from));
+                again = 1;
+            }
+        } else if (k == LK_FULL) {
+            lv.note[0] = 0;
+            live_layout(174000, 688000, mark);
+            again = 1;
+        } else if (k == LK_FASTER || k == LK_SLOWER) {
+            u32 s = k == LK_FASTER ? lv.settle / 2 : lv.settle * 2;
+            lv.settle = s < 40 ? 40 : s > 640 ? 640 : s;
+            lv.pass_ms = 0;
+            live_info();
+        } else if (k == LK_SPACE) {
+            lv.paused = !lv.paused;
+            live_info();
+        } else if (k == LK_PEAK) {
+            lv.hold = !lv.hold;
+            for (int j = 0; j < LIVE_MAX; j++)
+                live_peak[j] = live_lvl[j];
+            (void)live_range(1);
+            live_rescale();
+            live_info();
+        } else if (k == LK_ENTER) {     /* a DVB-T lock tried on the marker's channel */
+            u32 f = mark, bw = 8, took = 0, ch = 0;
+            if (f >= 470000 && f < 862000) {
+                ch = (f - 470000) / 8000 + 21;
+                f = 474000 + (ch - 21) * 8000;
+            } else if (f >= 174000 && f < 230000) {
+                ch = (f - 174000) / 7000 + 5;
+                f = 177500 + (ch - 5) * 7000;
+                bw = 7;
+            }
+            usnprintf(lv.note, sizeof(lv.note), "trying %u.%03u MHz ...", f / 1000, f % 1000);
+            live_readout();
+            int r = rf_tune(f, bw, 0, &took);
+            const char *what = r == 0 ? "DVB-T LOCKED" : r == 1 ? "a DVB-T carrier, no data lock"
+                               : r == TUNE_NO_TUNER ? "the tuner did not lock" : "no DVB-T (DVB-T2 or nothing)";
+            if (ch)
+                usnprintf(lv.note, sizeof(lv.note), "ch %u: %s", ch, what);
+            else
+                usnprintf(lv.note, sizeof(lv.note), "%u.%03u MHz: %s", f / 1000, f % 1000, what);
+            uprintf("rf live: %u.%03u MHz, %u MHz wide: %s (%u ms)\n", f / 1000, f % 1000, bw, what, took);
+            dm_setup();
+            live_readout();
+        }
+        if (again) {
+            i = 0;
+            pass_start = now_ms();
+            live_all();
+        }
+    }
+    cur_khz = 0;
+    uprintf("rf live: ended after %u whole passes\n", passes);
+    return rc;
+}
+
 /* ---- rf ts ---- */
 #define MAX_PIDS 64
 
@@ -1818,6 +2361,8 @@ int rf_command(int argc, char **argv)
         return cmd_ts(argc, argv);
     if (s_eq(c, "spectrum"))
         return cmd_spectrum(argc, argv);
+    if (s_eq(c, "live"))
+        return cmd_live(argc, argv);
     if (s_eq(c, "services"))
         return cmd_services(argc, argv);
     if (s_eq(c, "dr") || s_eq(c, "dw") || s_eq(c, "tr") || s_eq(c, "tw"))
@@ -1830,6 +2375,7 @@ int rf_command(int argc, char **argv)
             "rf scan [vhf|all|<from> <to>] every channel 474..858 MHz (vhf: 177.5..226.5 MHz, 7 MHz)\n"
             "rf ts <s> [file] [-p pids]    the stream: a PID table with rates, or a .ts file\n"
             "rf spectrum [from to [kHz]]   the aerial's level across 174..862 MHz as a chart on the TV\n"
+            "rf live [from to]             that chart kept current, with keys: marker, zoom, move, pause, peaks\n"
             "rf services [pmt]             PAT and SDT: the services' ids, providers, names\n"
             "rf dr|dw|tr|tw <reg> [val]    demodulator / tuner registers; rf i2cscan [0|1]\n");
     return c[0] ? -1 : 0;

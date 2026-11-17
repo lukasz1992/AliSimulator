@@ -494,11 +494,13 @@ static void cmd_nes(int argc, char **argv);
 static void cmd_gb(int argc, char **argv);
 static void cmd_sms(int argc, char **argv);
 static void cmd_gg(int argc, char **argv);
+static void cmd_sg(int argc, char **argv);
 static void cmd_zx(int argc, char **argv);
 static void cmd_a26(int argc, char **argv);
 static void cmd_c64(int argc, char **argv);
 static void cmd_amiga(int argc, char **argv);
 static void cmd_dos(int argc, char **argv);
+static void cmd_megadrive(int argc, char **argv);
 static void cmd_view(int argc, char **argv);
 static void cmd_rf(int argc, char **argv);
 static void cmd_history(int argc, char **argv);
@@ -600,7 +602,9 @@ static const struct command commands[] = {
     {"console", "", "the console on the TV again", cmd_console},
     {"explorer", "[n:][path]", "a file explorer on the TV, in the current directory (cd follows it, it follows cd; "
      "with a path: cd there first): USB keyboard Up/Down/PgUp/PgDn/Home/End, Enter opens (a picture: the viewer, "
-     "a game's file -- .nes, .gb, .gbc, .sms, .gg, .sna, .z80, .tap, .tzx, .a26, .prg, .t64, .d64, .adf, .exe, .com: the game), Backspace goes up, "
+     "a game's file -- .nes, .gb, .gbc, .sms, .gg, .sg, .sc, .sna, .z80, .tap, .tzx, .a26, .prg, .t64, .d64, .crt, "
+     ".adf, .exe, .com, .md, .gen, .smd, a Mega Drive .bin, any of them in a .zip or a .gz (.adz): the game), "
+     "Backspace goes up, "
      "'/' or Tab types a path, Esc: the console again; the mouse clicks, double-clicks, scrolls; on FAT: F2 "
      "renames, F7 makes a directory, Delete / F8 deletes (y), F5 / F6 mark a file to copy / move and Insert "
      "pastes it here", cmd_explorer},
@@ -622,13 +626,16 @@ static const struct command commands[] = {
     {"cat", "[n:]path", "a text file on a USB disk (Ctrl-C stops it)", cmd_cat},
     {"nes", "[-f frames] [-k script] <file>", "play a NES cartridge file (.nes) on the TV: arrows or W A S D, "
      "X = A, Z = B, Enter = Start, Tab = Select; Ctrl-C or Esc ends (-f: that many frames as fast as they go, "
-     "then the picture's CRC-32; -k: a test's buttons, frame:hex,...)", cmd_nes},
+     "then the picture's CRC-32; -k: a test's buttons, frame:hex,...).  Every player also takes its game in a "
+     ".zip (the largest file in it that is no text or picture) or a .gz", cmd_nes},
     {"gb", "[-f frames] [-k script] <file>", "play a Game Boy cartridge file (.gb, .gbc) on the TV -- a Game Boy "
      "Color game in its colours, an older one in four shades: the keys and the options of nes", cmd_gb},
     {"sms", "[-f frames] [-k script] <file>", "play a Sega Master System cartridge file (.sms) on the TV: X = "
      "button 2, Z = button 1, Enter = Pause; the other keys and the options of nes", cmd_sms},
     {"gg", "[-f frames] [-k script] <file>", "play a Sega Game Gear cartridge file (.gg) on the TV: X = button 2, "
      "Z = button 1, Enter = Start; the options of nes", cmd_gg},
+    {"sg", "[-f frames] [-k script] <file>", "play a Sega SG-1000 / SC-3000 cartridge file (.sg, .sc) on the TV: "
+     "X = button 2, Z = button 1, Enter = Pause; the other keys and the options of nes", cmd_sg},
     {"zx", "[-f frames] [-k script] [file]", "a ZX Spectrum 48K on the TV: a snapshot (.sna, .z80) or a tape "
      "(.tap, .tzx: loaded by itself with LOAD \"\"); no file: BASIC.  Its ROM is a file 48.rom beside the "
      "program, in zx/ or at the top of its disk.  The USB keyboard is the Spectrum's (Shift = CAPS SHIFT, "
@@ -638,7 +645,9 @@ static const struct command commands[] = {
      "their Superchip RAM, FE, E0, 3F, E7, FA) on the TV: arrows or W A S D, X or Z = fire, Enter = the "
      "console's Reset, Tab = Select; the options of nes", cmd_a26},
     {"c64", "[-f frames] [-k script] [file]", "a Commodore 64 (PAL) on the TV: a program (.prg, .t64) or a "
-     "disk (.d64), loaded and RUN by itself (LOAD from the disk works later too); no file: BASIC.  Its ROMs are "
+     "disk (.d64), loaded and RUN by itself (LOAD from the disk works later too), or a cartridge (.crt: normal, "
+     "Ocean, Magic Desk, EasyFlash, System 3, Dinamic, Fun Play, Super Games, RGCD, Simons' BASIC, Final "
+     "Cartridge III), started in it; no file: BASIC.  Its ROMs are "
      "kernal.rom, basic.rom and chargen.rom beside the program, in c64/ or at the top of its disk.  The USB "
      "keyboard is the C64's (Tab = RUN/STOP, PageUp = RESTORE, Alt = C=), its arrows joystick 2 (fire: right "
      "Ctrl or the remote's OK; F9 swaps the ports); typed on the UART / telnet, characters are typed on it; "
@@ -652,11 +661,17 @@ static const struct command commands[] = {
      "program (.exe, .com): the BIOS and DOS built in, its own file readable, no sound.  The USB keyboard is "
      "the PC's (Esc ends the player); the remote: arrows, OK = Up, 0 = Space, MENU = Enter, INFO = Esc; typed "
      "on the UART / telnet, characters are typed on it", cmd_dos},
-    {"rf", "<init|tune|status|scan|services|ts|spectrum|...>", "the aerial input (DVB-T): init the MxL603 tuner and the "
+    {"megadrive", "[-r j|u|e] [-f frames] [-k script] <file>", "play a Sega Mega Drive / Genesis cartridge file (.md, "
+     ".gen, .bin; .smd and copier headers taken apart) on the TV with its sound, at its console's rate (-r: a "
+     "Japanese, American or European one; else the header's region): X = B, Z = A, Tab / Space = C, Enter = Start, "
+     "the remote's OK / 0 / INFO / MENU too; cartridge RAM kept in a .sav file; the options of nes", cmd_megadrive},
+    {"rf", "<init|tune|status|scan|services|ts|spectrum|live|...>", "the aerial input (DVB-T): init the MxL603 tuner and the "
      "chip's demodulator, tune <MHz|channel> [6|7|8], status (lock, level, quality), scan [vhf|all|<from> <to>], "
      "services (the multiplex's channel names), ts <s> [file] [-p pids] (the stream's PIDs, or recorded to a .ts "
-     "file), spectrum [from to [kHz]] (the aerial's level across the band as a chart on the TV); 'rf' alone "
-     "lists all", cmd_rf},
+     "file), spectrum [from to [kHz]] (the aerial's level across the band as a chart on the TV), live [from to] "
+     "(that chart swept again and again: Left / Right a marker, Up / Down zoom, PgUp / PgDn move, + / - faster / "
+     "slower, Space pause, P peak hold, Enter a DVB-T lock tried at the marker, Esc ends); 'rf' alone lists all",
+     cmd_rf},
     {"snd", "<init|beep|status|stop|vol>", "sound output (a prototype of the original firmware's driver: 48 kHz "
      "on HDMI -- after 'video init' -- and the SCART's L/R): init, beep [Hz] [ms] (a sine tone, then what the "
      "DMA did), status (the engine's registers, its DMA position and speed), stop, vol [0..100]", snd_command},
@@ -751,10 +766,15 @@ static void cmd_help(int argc, char **argv)
             "\"...\" or '...' keep spaces in a word; 'command > [n:]path' puts what it prints into a file,\n"
             "'>>' adds it to the file's end):\n");
     for (const struct command *c = commands; c->name; c++) {
-        char head[56];
+        char head[96];
         usnprintf(head, sizeof(head), "%s %s", c->name, c->args);
         uprintf("  %s", head);
-        for (int i = str_len(head); i < 44; i++)
+        int n = str_len(head);
+        if (n >= 44) {                  /* (longer than its column: what it does starts on the next line) */
+            uprintf("\n");
+            n = -2;
+        }
+        for (int i = n; i < 44; i++)
             uart_putc(' ');
         uprintf("%s\n", c->help);
     }
@@ -1463,6 +1483,11 @@ static void cmd_gg(int argc, char **argv)
     cmd_game(argc, argv, gg_play);
 }
 
+static void cmd_sg(int argc, char **argv)
+{
+    cmd_game(argc, argv, sg_play);
+}
+
 static void cmd_zx(int argc, char **argv)
 {
     if (argc == 1) {                    /* (no file: BASIC) */
@@ -1507,6 +1532,30 @@ static void cmd_amiga(int argc, char **argv)
     cmd_game(argc, argv, amiga_play);
 }
 
+static void cmd_megadrive(int argc, char **argv)
+{
+    int region = 0;
+    /* (-r j|u|e: the console -- anywhere among the options, each of which has a value; taken out of the
+       words for cmd_game) */
+    for (int i = 1; i + 1 < argc && argv[i][0] == '-'; i += 2) {
+        if (!str_eq(argv[i], "-r"))
+            continue;
+        char c = (char)(argv[i + 1][0] & ~32);
+        if (c != 'J' && c != 'U' && c != 'E') {
+            uprintf("-r: j (Japan, NTSC), u (America, NTSC) or e (Europe, PAL)\n");
+            return;
+        }
+        region = c;
+        for (int k = i; k + 2 < argc; k++)
+            argv[k] = argv[k + 2];
+        argc -= 2;
+        break;
+    }
+    md_play_region(region);
+    cmd_game(argc, argv, md_play);
+    md_play_region(0);
+}
+
 static void cmd_a26(int argc, char **argv)
 {
     cmd_game(argc, argv, a26_play);
@@ -1514,6 +1563,15 @@ static void cmd_a26(int argc, char **argv)
 
 static void cmd_rf(int argc, char **argv)
 {
+    if (argc > 1 && str_eq(argv[1], "live")) {         /* (its chart has the TV until Esc: then what was there) */
+        int console = gfx_view_console(), explorer = explorer_shown();
+        if (explorer)
+            explorer_hide();
+        demo_shown = 0;
+        (void)rf_command(argc, argv);
+        picture_back(console, explorer);
+        return;
+    }
     if (argc > 1 && str_eq(argv[1], "spectrum")) {     /* (its chart takes the test screen's picture) */
         if (explorer_shown())
             explorer_hide();
@@ -2116,7 +2174,8 @@ static int command_choices(const char *args)
 {
     int n = 0, count = 0;
     char close = args[0] == '<' ? '>' : args[0] == '[' ? ']' : 0;
-    if (!close)
+    if (!close || args[1] == '-')       /* ("[-r j|u|e] ... <file>": an option and its values -- taken for
+                                           choices, 'megadrive' completed "u" / "e" and no file's name) */
         return 0;
     const char *p = args + 1;
     for (;;) {
@@ -2609,7 +2668,7 @@ void app_main(void)
     for (;;) {
         u64 pass_start = now_ticks(), t = pass_start;
         int c = uart_getc();
-        if (c >= 0)
+        if (c >= 0 && !(c == 3 && av_dismiss()))    /* (Ctrl-C: a picture 'play -k' left on the TV goes) */
             cli_input(c);
         usb_int_poll();                         /* the keyboard's interrupt endpoint (endpoint B) */
         const char *said = kbd_poll();          /* a USB keyboard's keys: as if typed on the UART */
@@ -2626,6 +2685,9 @@ void app_main(void)
         }
         typing_on_usb = 1;
         while ((c = kbd_getc()) >= 0) {
+            if (c == 3 && av_dismiss())         /* a picture 'play -k' left on the TV: Esc (kbd.c gives it
+                                                   as Ctrl-C) gives the OSD back */
+                continue;
             if (explorer_shown()) {
                 explorer_key(c);                /* the explorer on the TV: its keys (Esc: the console again) */
                 continue;
@@ -2654,6 +2716,11 @@ void app_main(void)
         if (explorer_poll())                    /* the explorer: the shell's 'cd' followed, its own done */
             show_line();                        /* (it changed the current directory: the prompt shows it) */
         if (ir_poll(&ev)) {
+            if (ev.valid && !ev.repeat) {       /* EXIT: a picture 'play -k' left on the TV goes */
+                const char *key = ir_key_name(ev.code);
+                if (key && key[0] == 'E' && key[1] == 'X')
+                    (void)av_dismiss();
+            }
             event_begin();
             on_ir(&ev);
             show_line();

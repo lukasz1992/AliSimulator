@@ -498,8 +498,8 @@ static const char *tzx(const u8 *f, u32 size)
                 return 0;               /* (a block it does not know: the tape up to there) */
             return "a .tzx block this player does not know (it reads the data blocks: 0x10, 0x11, 0x14)";
         }
-        if (at + skip > size)
-            break;                      /* (cut short) */
+        if (skip > size - at)
+            break;                      /* (cut short; a 32-bit length must not wrap the sum: at <= size here) */
         at += skip;
     }
     return blocks ? 0 : "a .tzx file with no data blocks";

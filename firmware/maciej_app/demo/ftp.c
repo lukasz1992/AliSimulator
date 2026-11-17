@@ -322,6 +322,9 @@ static void xfer_end(void)
     else if (xfer == X_RETR)
         disk_stream_close();
     xfer = X_NONE;
+    if (xs)
+        xs->heard = now_ms();           /* (no command came while its file moved: after one of over five minutes
+                                           the session was told "421 No command for five minutes" at once) */
     xs = 0;
     skip = 0;
 }
@@ -428,6 +431,9 @@ static void retr(struct session *s, const char *arg, u64 from)
         return;
     }
     skip = from < xfer_size ? from : xfer_size;
+    if (skip)
+        skip -= disk_stream_seek(skip);         /* (not read from the file's start: a gigabyte took ten minutes
+                                                   before the first byte went) */
 }
 
 static void stor(struct session *s, const char *arg, int append, u64 from)
@@ -464,6 +470,13 @@ static const char *pump(void)
         return 0;
     struct session *s = xs;
     u64 now = now_ms();
+    /* (this runs between commands only: a command of over a minute -- a game, a video -- left moved_at that old
+       though the client never stopped, and the transfer was ended with 426 at the first look after it.  After
+       such a gap both clocks start again) */
+    static u64 pumped_at;
+    if (now - pumped_at > 2000)
+        xfer_since = moved_at = now;
+    pumped_at = now;
     if (s->dc < 0) {
         if (now - xfer_since > WAIT_MS) {
             reply(s, "425 No data connection came");

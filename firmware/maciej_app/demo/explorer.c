@@ -25,6 +25,8 @@
    a command whose output is going into a file). */
 #include "hw.h"
 #include "av.h"
+#include "md.h"
+#include "zip.h"
 
 #define CELL        12                  /* the font's cells (gfx_cell): 12 x 16 */
 #define TITLE_H     44
@@ -531,6 +533,7 @@ static u64 loaded_at;
 static void load(void)
 {
     loaded_at = now_ms();
+    confirm = 0;                        /* ("delete X?" was asked of the listing before this one) */
     const char *now = disk_cwd();
     int same_dir = loaded && same(now, cwd_shown), keep_top = top, want_up = 0;
     if (same_dir && sel < rows && !want_forced) {
@@ -734,8 +737,52 @@ static int ends_gb(const char *s)        /* .gb, and .gbc (the Game Boy Color's)
     return n > 3 && s[n - 3] == '.' && (s[n - 2] | 32) == 'g' && (s[n - 1] | 32) == 'b';
 }
 
-/* a Master System / Game Gear / Spectrum / Atari 2600 / C64 / Amiga / DOS file: which player (0: none) */
-static int (*z80_player(const char *s))(const char *, u32, const char *)
+typedef int (*player_fn)(const char *, u32, const char *);
+static player_fn player_for(const char *s, int on_disk);
+
+/* the name of the game in a .zip / .gz / .adz: a .gz's own (kept in its header), else its file's name without
+   .gz (.adz: .adf); a .zip's first member when a player knows it, else the member the player would unpack (the
+   whole archive read for that).  1, or 0: none */
+static int archive_name(const char *s, char *inner, int max)
+{
+    u32 size = 0;
+    int got = disk_read_head(s, head, HEAD_BYTES, &size);
+    if (got <= 0)
+        return 0;
+    if (gz_is(head, (u32)got)) {
+        if (gz_name(head, (u32)got, inner, max))
+            return 1;
+        int n = 0, dot = -1;
+        for (; s[n] && n < max - 5; n++) {
+            inner[n] = s[n];
+            if (s[n] == '.')
+                dot = n;
+            else if (s[n] == '/' || s[n] == ':')
+                dot = -1;
+        }
+        inner[n] = 0;
+        if (dot > 0 && (inner[dot + 1] | 32) == 'a' && (inner[dot + 2] | 32) == 'd' && (inner[dot + 3] | 32) == 'z')
+            inner[dot + 3] = 'f';
+        else if (dot > 0)
+            inner[dot] = 0;
+        return 1;
+    }
+    if (!zip_is(head, (u32)got))
+        return 0;
+    if (!zip_first_name(head, (u32)got, inner, max) && player_for(inner, 0))
+        return 1;
+    if (size > MEDIA_MAX)
+        return 0;
+    u8 *all = (u8 *)KSEG0(MEDIA_PHYS);
+    got = disk_read_head(s, all, MEDIA_MAX, &size);
+    return got > 0 && !zip_pick_name(all, (u32)got, inner, max);
+}
+
+/* a game file (NES, Game Boy, Master System / Game Gear / SG-1000, Spectrum, Atari 2600, C64, Amiga, DOS, Mega
+   Drive): which player (0: none).  A .bin is the Mega Drive's only when its beginning says it is one of its
+   cartridges; a .zip / .gz / .adz goes to the player of the game in it.  on_disk 0: s is only a name (a game's
+   in an archive): nothing read */
+static player_fn player_for(const char *s, int on_disk)
 {
     int n = 0, dot = -1;
     for (; s[n]; n++)
@@ -746,22 +793,44 @@ static int (*z80_player(const char *s))(const char *, u32, const char *)
     char e[4] = {0, 0, 0, 0};
     for (int i = 0; dot + 1 + i < n; i++)
         e[i] = (char)(s[dot + 1 + i] | 32);
+    if (ends_nes(s))
+        return nes_play;
+    if (ends_gb(s))
+        return gb_play;
+    int zip = e[0] == 'z' && e[1] == 'i' && e[2] == 'p' && !e[3];
+    int adz = e[0] == 'a' && e[1] == 'd' && e[2] == 'z' && !e[3];
+    int gz = e[0] == 'g' && e[1] == 'z' && !e[2];
+    if (on_disk && (zip || adz || gz)) {
+        char inner[96];
+        return archive_name(s, inner, sizeof(inner)) ? player_for(inner, 0) : 0;
+    }
     if (e[0] == 's' && e[1] == 'm' && e[2] == 's' && !e[3])
         return sms_play;
     if (e[0] == 'g' && e[1] == 'g' && !e[2])
         return gg_play;
+    if (e[0] == 's' && (e[1] == 'g' || e[1] == 'c') && !e[2])
+        return sg_play;
     if (e[0] == 'a' && e[1] == '2' && e[2] == '6' && !e[3])
         return a26_play;
     if ((e[0] == 's' && e[1] == 'n' && e[2] == 'a') || (e[0] == 'z' && e[1] == '8' && e[2] == '0') ||
         (e[0] == 't' && e[1] == 'a' && e[2] == 'p') || (e[0] == 't' && e[1] == 'z' && e[2] == 'x'))
         return e[3] ? 0 : zx_play;
     if ((e[0] == 'p' && e[1] == 'r' && e[2] == 'g') || (e[0] == 't' && e[1] == '6' && e[2] == '4') ||
-        (e[0] == 'd' && e[1] == '6' && e[2] == '4') || (e[0] == 'p' && e[1] == '0' && e[2] == '0'))
+        (e[0] == 'd' && e[1] == '6' && e[2] == '4') || (e[0] == 'p' && e[1] == '0' && e[2] == '0') ||
+        (e[0] == 'c' && e[1] == 'r' && e[2] == 't'))
         return e[3] ? 0 : c64_play;
     if (e[0] == 'a' && e[1] == 'd' && e[2] == 'f' && !e[3])
         return amiga_play;
     if (((e[0] == 'e' && e[1] == 'x' && e[2] == 'e') || (e[0] == 'c' && e[1] == 'o' && e[2] == 'm')) && !e[3])
         return dos_play;
+    if (((e[0] == 'm' && e[1] == 'd' && !e[2]) || (e[0] == 'g' && e[1] == 'e' && e[2] == 'n') ||
+         (e[0] == 's' && e[1] == 'm' && e[2] == 'd')) && !e[3])
+        return md_play;
+    if (on_disk && e[0] == 'b' && e[1] == 'i' && e[2] == 'n' && !e[3]) {
+        u32 size = 0;
+        int got = disk_read_head(s, head, HEAD_BYTES, &size);
+        return got > 0 && md_cartridge(head, (u32)got, size) ? md_play : 0;
+    }
     return 0;
 }
 
@@ -770,6 +839,8 @@ static void open_row(int i)
     if (i < 0 || i >= rows)
         return;
     const struct disk_entry *e = entry(i);
+    int video = 0;
+    player_fn play = 0;
     if (!e) {
         go_up();
     } else if (e->kind == DISK_VOLUME) {
@@ -784,20 +855,19 @@ static void open_row(int i)
         go(name);
     } else if (e->kind == DISK_DIR) {
         go(e->name);
-    } else if (view_is_picture(e->name) || ends_nes(e->name) || ends_gb(e->name) || z80_player(e->name) ||
-               av_is_video(e->name)) {
+    } else if (view_is_picture(e->name) || (video = av_is_video(e->name)) != 0 ||
+               (play = player_for(e->name, 1)) != 0) {  /* (asked once: for a game in an archive player_for
+                                                           reads the archive -- three askings were three reads,
+                                                           and one that failed the third time called nothing) */
         char name[DISK_ENTRY_NAME];                     /* a picture, a game or a video: on the whole TV, then back */
         scopy(name, e->name, sizeof(name));
         on = 0;
-        if (av_is_video(name)) {
-            char *argv[2] = {"play", name};
+        if (video) {
+            static char word[] = "play";
+            char *argv[2] = {word, name};
             (void)av_play(2, argv);
-        } else if (ends_nes(name)) {
-            (void)nes_play(name, 0, "");
-        } else if (ends_gb(name)) {
-            (void)gb_play(name, 0, "");
-        } else if (z80_player(name)) {
-            (void)z80_player(name)(name, 0, "");
+        } else if (play) {
+            (void)play(name, 0, "");
         } else {
             view_file(name, 0);
             const char *last = view_last(), *b = last;          /* (the picture it ended on: selected) */
@@ -1264,6 +1334,11 @@ void explorer_mouse(int x, int y, u8 buttons, int wheel)
     if (!on || gfx_view_console())
         return;
     ensure_loaded();
+    if (confirm && (wheel || (down & 1))) {
+        confirm = 0;                    /* ("delete X?" stayed armed while a click selected another entry: 'y'
+                                           then deleted that one, never asked about) */
+        draw_selection();
+    }
     if (wheel && !preview)
         scroll(-3 * wheel);                             /* (away from you: up) */
     if (!(down & 1))
@@ -1313,6 +1388,7 @@ void explorer_show(void)
     on = 1;
     loaded = 0;
     editing = preview = 0;
+    confirm = 0;
     esc = 0;
     pending_open = last_click_row = -1;
     status_msg[0] = 0;

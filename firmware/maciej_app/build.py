@@ -32,7 +32,7 @@ DEMO_SOURCES = ("demo/main.c", "demo/time.c", "demo/uart.c", "demo/gfx.c",
                 "demo/tcp.c", "demo/net.c", "demo/explorer.c", "demo/ftp.c", "demo/nes.c", "demo/gb.c", "demo/play.c",
                 "demo/image.c", "demo/view.c", "demo/http.c", "demo/web.S", "demo/rf.c", "demo/snd.c",
                 "demo/z80.c", "demo/sms.c", "demo/zx.c", "demo/a26.c", "demo/c64.c", "demo/amiga.c", "demo/dos.c",
-                "demo/av.c", "demo/mp2.c")
+                "demo/av.c", "demo/mp2.c", "demo/md.c", "demo/zip.c")
 
 
 def build(output, version="v1", cross_prefix=None, *, sources=("app.c",),

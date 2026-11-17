@@ -248,6 +248,17 @@ void mouse_yield_epd(void)
     via_d = 0;
 }
 
+/* endpoint D is free again (the keyboard that had it stopped: kbd.c): the mouse's reports through it once
+   more -- it stayed on endpoint B's turns, the lossy way, until it was plugged in again */
+void mouse_retake_epd(void)
+{
+    if (!active || via_d)
+        return;
+    disarm();
+    via_d = 1;
+    retry_at = now_ms();
+}
+
 /* every pass of the main loop (after usb_int_poll): its reports; a line to
    show, or 0 */
 const char *mouse_poll(void)

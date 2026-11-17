@@ -224,7 +224,10 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   before its entry links it in, a directory grown by a cluster when it is
   full, an entry deleted before its clusters are freed, FAT32's FSInfo
   counts made unknown; a write-protected disk (MODE SENSE) is not written.
-  The box has no clock: what is made is dated 2026-11-13 12:00. NTFS is
+  What is made is dated by the clock once NTP has set it (Polish time, as
+  FAT keeps local time); before that, 2026-11-13 12:00. A path's directory
+  part may be 95 characters and a name 127: longer ones are refused (they
+  were cut, and the file went to another name or directory). NTFS is
   read: `ls`, `cd`, `cat`, `cp` onto a FAT disk, `sum
   [n:]path` (a file read to its end: size, CRC-32, speed) and the explorer
   go through its MFT -- records with their fixups, resident and
@@ -300,7 +303,9 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   RTL8153 (0bda:8153) in its second configuration, which the demo chooses
   when the first has no ECM -- becomes eth0: its MAC address from the
   Ethernet descriptor, frames over its bulk endpoints (read every 20 ms in
-  the main loop), DHCP at once (`[eth] eth0: 192.168.0.161 (DHCP) ...`),
+  the main loop), DHCP at once (`[eth] eth0: 192.168.0.161 (DHCP) ...`;
+  with no answer it says so once and asks again every minute, and a lease
+  is renewed at half its time),
   ARP and ICMP echo answered (the box can be pinged). `ifconfig` shows the
   port, `dhcp` asks again, `arp` lists the table, `ping [-c n] <host>`
   pings like Linux's ping: a name asked of the DHCP's DNS server, each
@@ -451,8 +456,27 @@ masked, everything polled) for the same bootloader. It prints the same banner an
     DVB-T only, so nothing locks there. `rf spectrum` draws the aerial's
     level across 174 - 862 MHz on the TV (the tuner stepped every 4 MHz,
     the demodulator's IF AGC read after 160 ms; shorter waits read the AGC
-    before it settles): on the box it shows two multiplexes (UHF 45/46 and
-    55) and the LTE-800 band.
+    before it settles). On the box it shows three flat-topped blocks, each
+    exactly 8 MHz wide with sharp edges, centred on 668.25, 742.5 and
+    816.75 MHz: 9, 10 and 11 x 74.25 MHz (swept every 250 / 500 kHz, the
+    centres to 0.25 MHz). That shape is one narrow carrier seen through the
+    tuner's 8 MHz filter (a multiplex would ramp up and down over 8 MHz on
+    each side), and 74.25 MHz is the box's own 720p pixel clock (the CPU's
+    594 MHz is 8 x it): the box hears itself. Everywhere else the level
+    stays at its floor (16 %, the IF AGC at full gain): no aerial was
+    connected for these sweeps. An earlier reading of these blocks as two DVB-T2
+    multiplexes and the LTE-800 band was wrong. `rf live [from to]` is that chart kept
+    current: the band swept again and again, each bar drawn as it is
+    measured, the highest level seen kept as a tick over it, a marker with
+    its frequency / channel / level. Keys (USB keyboard, UART, remote):
+    Left / Right the marker (past an edge the window moves), Up / Down
+    halve / double the span around it (8 - 960 MHz), PgUp / PgDn move the
+    window, F the whole band, + / - halve / double the settle time (160 ms
+    at first, 40 - 640), Space pause, P peak hold, Enter a DVB-T lock tried
+    on the marker's channel, Esc ends. A pass still takes its points times
+    the settle time (the whole band in tens of seconds, a narrow window in
+    a few). The level axis follows what is measured; when it changes only
+    the bars and its labels are drawn again.
   - A Commodore 64 (PAL) player (`c64.c`, command `c64`, the explorer's .prg /
     .t64 / .d64 / .p00): the 6510 (a26.c's 6507 grown into it -- the $00/$01
     port, every undocumented opcode; Klaus Dormann's tests pass), the PLA's
@@ -505,6 +529,67 @@ masked, everything polled) for the same bootloader. It prints the same banner an
     EGA mode 0Dh in VGA colours, 50 Hz timer) plays on the box: a frame
     2.5 - 4 ms to run + 2 - 2.5 ms to draw (960 x 600). The suite checks it
     with a .com program made in the test.
+  - A Sega Mega Drive / Genesis player (`md.c`, command `megadrive` -- `md` is
+    the memory dump --, the explorer's .md / .gen / .smd, and a .bin whose
+    first 2 KB say it is one). The 68000 is the Amiga's: moved into
+    `m68k.inc`, included by `amiga.c` and `md.c` so memory access stays
+    inlined, with hooks for the interrupt acknowledge (the VDP clears its
+    pending interrupt), TAS and branch watching (waiting loops skipped); the
+    Amiga is bit-identical (every frame's picture, registers and cycles
+    over AROS and both Dizzy disks; SingleStepTests; the same -Os code). The
+    Z80 is `z80.c` (a read hook added for the 68000's bank window). The VDP
+    draws line by line: both planes with full / cell / line horizontal and
+    full / 2-cell vertical scroll, the window, sprites (link list, per-line
+    and dot limits, X = 0 masking, overflow and collision), shadow /
+    highlight, H32 / H40, V28 / V30, HINT / VINT, DMA (68000 to VRAM / CRAM
+    / VSRAM, fill, copy). Sound: the YM2612 (6 channels of 4 operators, 8
+    algorithms, envelopes, LFO, channel 3's mode, the DAC, timers A / B)
+    and the PSG, mixed to 48 kHz mono. Pads: 3 and 6 buttons (the player
+    gives a 3-button pad: X = B, Z = A, Tab / Space = C). Cartridge RAM
+    (.sav), Sega's mapper over 4 MB, Super Mario World (Taiwan)'s
+    protection. .smd (interleaved, with or without its header) and a copier
+    header on a plain image are found by their bytes; NTSC / PAL by the
+    header's region, or `-r j|u|e`. On the box, with sound, at 60 frames a
+    second: Super Mario World (Taiwan) 12.3 ms to run + 2.7 ms to draw,
+    Super Mario Bros. (PD hack) 9.3 + 1.9, Snake 9.7 + 2.3. Two things made
+    that fit: the sound chips' writes are logged through the frame and the
+    sound made from the log at its end in one go (the same sound, sample
+    for sample, as made after every line -- but its tables stay in the
+    caches: 2.3 ms of the frame instead of 5.1), and the FM operators are
+    worked out every second sample (26.6 kHz). Box and PC give the same
+    picture CRCs. Raster demos that change every line (a-dietrich's wobble,
+    scaling) do not fit in 16.7 ms. Not done: changes in the middle of a
+    line, interlace mode 2 (its first field only), SSG-EG and CSM, the
+    YM2612's busy flag. The suite checks it with a cartridge made in the
+    test.
+  - SG-1000 / SC-3000 (`sms.c`, command `sg`, the explorer's .sg / .sc): the
+    TMS9918 modes in the Master System's VDP code -- Graphics I and II (with
+    the pattern / colour table masks), Multicolour, Text (40 columns), the
+    TMS sprites (8 x 8 / 16 x 16, magnified, 4 a line with the 5th sprite's
+    flag and number, collision) -- also used when a Master System game
+    leaves mode 4; 1 KB of RAM (2 KB on the SC-3000), cartridge RAM by size
+    (8 KB at 0x8000 up to 32 KB, at 0x2000 for 33 - 48 KB images whose
+    0x2000 - 0x3FFF is blank), the Sega mapper above 48 KB, Pause as the NMI.
+    Master System and Game Gear pictures are bit-identical to before. On the
+    box a frame takes 5 ms + 1.6 ms to draw. No SC-3000 keyboard, no sound.
+  - C64 cartridges (`c64.c`, .crt, found by its "C64 CARTRIDGE" header):
+    the PLA's 8K / 16K / Ultimax maps (the VIC seeing ROMH in Ultimax), and
+    the boards normal, Ocean, Magic Desk, EasyFlash (with its 256 bytes of
+    RAM; flash writes ignored), System 3, Dinamic, Fun Play, Super Games,
+    RGCD, Simons' BASIC, Final Cartridge III (not its NMI). The machine
+    starts in the cartridge; a reset brings it back to bank 0. A damaged
+    file is refused, never followed (fuzzed: 400 damaged cartridges under
+    AddressSanitizer). Without a cartridge every picture is as before. On
+    the box a frame takes 3.3 ms + 2.7 ms.
+  - Archives for every player (`zip.c`, `play.c`, the explorer): a game in a
+    .zip (stored or deflated; the largest member that is no text, picture or
+    folder) or a .gz (the Amiga's .adz too), unpacked with `image.c`'s
+    inflate and its CRC-32 checked. The machine is told the member's own
+    name beside the archive (the Spectrum, the C64 and the SC-3000 know a
+    file by its extension); the .sav goes beside the archive; the explorer
+    picks the player by the member. On the box an archived game gives the
+    same picture CRCs as the file itself (the user's zipped Super Mario
+    World and Super Mario Bros., Tobu Tobu Girl, a gzipped Dizzy disk).
   - Sound (a prototype nobody has heard yet: the user's HDMI-to-VGA converter
     drops it). `snd.c`, command `snd` (`init`, `beep [Hz] [ms]`, `vol`,
     `status`, `stop`): the S3811's sound engine at 0xB8002000 set up as
@@ -622,7 +707,10 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   Start, Tab = Select), the UART's and telnet's keys as short presses, the
   remote (arrows, OK = A, 0 = B, MENU = Start, INFO = Select, EXIT ends),
   the Comsat's two front buttons (Start, A); Ctrl-C or Esc ends. A game with
-  a battery keeps its RAM in `game.sav` beside it. `-f` runs that many
+  a battery keeps its RAM beside it in a file named after the whole game
+  file (`game.nes.sav`, so that `game.gb` there keeps its own; an older
+  `game.sav` of the right size is still read, a save of another size is
+  another machine's and left alone). `-f` runs that many
   frames as fast as they go and prints the picture's CRC-32 (`-k` gives
   their buttons: `frame:hex,...`). Checked on a PC: nestest's 8991
   instructions with their cycle counts as its log, every sprite-hit test,
@@ -847,18 +935,19 @@ strings, configuration, the exact SETUP packets) / speed / bus reset /
 plug-out and the controller's set-up (the PHY as the box's firmware writes
 it), `lsusb`, a USB keyboard (as the real one tried on a box: low speed,
 two interfaces, GET_REPORT always empty; enumerated in 8-byte packets, the
-boot protocol, the IN on endpoint B set up as the SDK's bulk IN with its
-packet into RAM by DMA, one IN token per millisecond while no key changes,
+boot protocol, the controller's endpoint D set polling its interrupt
+endpoint as the SDK sets it up, both toggles DATA0 first, one IN token
+every 8 ms while no key changes and none from endpoints B and C,
 typing with Shift, punctuation, Backspace, Up, Caps Lock, Escape, a held key
-repeating, `ccc` only text, the line on the TV; a control request while the
-IN is pending; nothing typed with `usb kbd report` on that keyboard, typing
+repeating, `ccc` only text, the line on the TV; a control request while
+endpoint D polls; nothing typed with `usb kbd report` on that keyboard, typing
 again after `usb kbd interrupt`; enumerated again with no report lost to the
 data toggle; unplugged without an error line; a full-speed keyboard, also
 with GET_REPORT; keyboards that stall GET_REPORT, the interrupt endpoint, or
 both), a USB hub (the tree tried on a real box: a high-speed hub with a
 second hub, a stick and the low-speed keyboard behind it -- all enumerated,
 the ports powered and reset one after the other, the keyboard addressed
-and read through the translator with the split registers, `lsusb`, the TV's
+and read (endpoint D's tokens) through the translator with the split registers, `lsusb`, the TV's
 USB box, `usb ctl` to a device behind the hub; a second keyboard plugged
 in, the first unplugged and the second taking over; the keyboard moved
 behind the second hub; that hub unplugged with what is behind it; a
@@ -873,13 +962,15 @@ command broken; a card reader without a card; a stick that leaves the
 first command after idling unanswered, sent again after 2 s; a stick pulled
 out), a USB
 mouse (as on the real box: low speed behind the second hub, the keyboard on
-the first, a stick -- its endpoint polled by endpoint D as the SDK sets it
-up, both toggles DATA0 first; the pointer drawn and moved, a click, a
+the first, a stick -- the keyboard has endpoint D, so the mouse's endpoint
+is read through endpoint B's IN, through its hub's translator; the pointer
+drawn and moved, a click, a
 painted line in the framebuffer and on the captured screen, the right
 button's colour, the wheel, `usb mouse`; the keyboard typing and `ls` /
-`cat` on the stick while the mouse moves, nothing dropped; unplugged and
+`cat` on the stick while the mouse moves, nothing dropped; unplugged --
+endpoint B's IN ended, endpoint D polling on -- and
 plugged in again), more than seven USB devices (eight behind two hubs, the
-mouse as device 8, and a third hub as the ninth refused: a hub needs one of
+mouse as device 8, read through endpoint B, and a third hub as the ninth refused: a hub needs one of
 the first seven addresses), a shell on writable sticks (`cd` / `pwd` /
 `dir` / `mkdir` / `rmdir` / `rm` / `touch` on FAT16 with a partition table,
 FAT32 -- its root grown by a cluster -- and a full-speed FAT12 without one,

@@ -8,9 +8,12 @@
    by memory access, so a machine whose chips slow the CPU down (the ZX
    Spectrum's) can say by how much at each access.
 
-   Shared by the Sega Master System (sms.c) and the ZX Spectrum (zx.c).
-   Nothing in it knows either: the machine fills in the memory map (1 KB
-   pages), the I/O port handlers and, when it has one, its contention table. */
+   Shared by the Sega Master System (sms.c), the ZX Spectrum (zx.c) and the
+   Mega Drive (md.c, its sound CPU).  Nothing in it knows any of them: the
+   machine fills in the memory map (1 KB pages; a page without memory read
+   through read(), as the Mega Drive's sound chip and its window on the
+   68000's bus are), the I/O port handlers and, when it has one, its
+   contention table. */
 #ifndef DEMO_Z80_H
 #define DEMO_Z80_H
 
@@ -43,8 +46,10 @@ struct z80 {
     u8 bus;                             /* the byte on the data bus when an interrupt is acknowledged (0xFF) */
     s32 cycles;                         /* T-states: z80_run goes on until it reaches its target */
     s32 trap;                           /* z80_run stops when the PC comes to this address (-1: never) */
-    u8 *rd[64];                         /* the memory map, 1 KB pages: where reads of each come from */
+    u8 *rd[64];                         /* the memory map, 1 KB pages: where reads of each come from (0: from
+                                           read() instead) */
     u8 *wr[64];                         /* where writes go (0: to write() instead) */
+    u8 (*read)(struct z80 *c, u16 address);
     void (*write)(struct z80 *c, u16 address, u8 value);
     u8 (*in)(struct z80 *c, u16 port);
     void (*out)(struct z80 *c, u16 port, u8 value);

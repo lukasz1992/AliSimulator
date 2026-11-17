@@ -1072,8 +1072,11 @@ int usb_epd_open(u8 device, u8 ep, u16 size, u8 interval)
     struct device *d = device_at(device);
     if (!d)
         return no_device();
-    if (epd_device && epd_device != device)
-        return -2;
+    if (epd_device && (epd_device != device || epd_ep != (ep & 0x0F)))
+        return -2;                      /* (another device's -- or this device's other endpoint: a keyboard and
+                                           a mouse in one device, a wireless set's receiver, both took endpoint
+                                           D by the address alone; it then polled the mouse's endpoint and the
+                                           keyboard read the mouse's reports as keys) */
     epd_halt();
     epd_device = 0;
     last_stage = "interrupt IN (endpoint D)";

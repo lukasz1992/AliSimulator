@@ -46,6 +46,9 @@ static struct {
     int dhcp_tries;
     u32 xid;
     u64 dhcp_next, last_poll;
+    u64 renew_at, expires_at;           /* bound: when the lease is asked for again (half its time, then every
+                                           minute), when it ends (0: it has no end) */
+    u8 renewing, gave_up;               /* a renewal is asked for; "no answer" was said (tried on quietly) */
     u32 rx, tx, rx_ignored;
     u32 rx_ours, rx_multi;              /* frames to our MAC; broadcasts and multicasts */
     u32 dhcp_ours, dhcp_multi;          /* DHCP answers: sent to our MAC, broadcast */
@@ -211,7 +214,8 @@ static int receive(u32 wait_ms)
             break;
     }
     if (!eth.rndis)
-        return len;
+        return len > FRAME_MAX ? 0 : len;       /* (more than a frame: answered -- an echo -- it would be copied
+                                                   past tx[]) */
     /* an RNDIS packet message: its frame moved to rx[0] (anything else -- a status message -- is no frame) */
     if (len < 44 || le32(rx) != 1)
         return 0;
@@ -300,7 +304,13 @@ static void dhcp_send(int type)
     b[5] = (u8)(eth.xid >> 16);
     b[6] = (u8)(eth.xid >> 8);
     b[7] = (u8)eth.xid;
-    b[10] = 0x80;                               /* the answer broadcast: no address yet */
+    int renew = type == 3 && eth.dhcp == 3;     /* the lease asked for again: from our address, which goes
+                                                   in ciaddr -- no requested address, no server named (RFC 2131's
+                                                   rebinding request, which any of the network's servers takes) */
+    if (renew)
+        copy(b + 12, eth.ip, 4);
+    else
+        b[10] = 0x80;                           /* the answer broadcast: no address yet */
     copy(b + 28, eth.mac, 6);
     b[236] = 99;
     b[237] = 130;
@@ -310,7 +320,7 @@ static void dhcp_send(int type)
     *o++ = 53;
     *o++ = 1;
     *o++ = (u8)type;                            /* 1 DISCOVER, 3 REQUEST */
-    if (type == 3) {
+    if (type == 3 && !renew) {
         *o++ = 50;
         *o++ = 4;
         copy(o, eth.offered, 4);
@@ -336,7 +346,7 @@ static void dhcp_send(int type)
     u[3] = 67;
     put16(u + 4, 8 + 300);
     u[6] = u[7] = 0;                            /* (no UDP checksum: allowed over IPv4) */
-    ipv4(h, zero, bcast, 17, 8 + 300);
+    ipv4(h, renew ? eth.ip : zero, bcast, 17, 8 + 300);
     send_frame(tx, 14 + 20 + 8 + 300);
 }
 
@@ -344,6 +354,8 @@ static void dhcp_start(void)
 {
     eth.dhcp = 1;
     eth.dhcp_tries = 0;
+    eth.renew_at = eth.expires_at = 0;
+    eth.renewing = eth.gave_up = 0;
     eth.xid = cp0_count() ^ (u32)(eth.mac[2] << 24 | eth.mac[3] << 16 | eth.mac[4] << 8 | eth.mac[5]);
     eth.dhcp_next = now_ms() + 2000;            /* (the link comes up about 1.6 s after the set-up) */
 }
@@ -387,6 +399,9 @@ static const char *dhcp_input(const u8 *b, int len)
         copy(eth.router, router, 4);
         copy(eth.dns, dns, 4);
         eth.lease = lease;
+        eth.renew_at = lease ? now_ms() + (u64)lease * 500 : 0;
+        eth.expires_at = lease ? now_ms() + (u64)lease * 1000 : 0;
+        eth.renewing = eth.gave_up = 0;
         eth.dhcp = 3;
         eth.bound++;
         char a[16], r[16];
@@ -398,6 +413,30 @@ static const char *dhcp_input(const u8 *b, int len)
     if (type == 6 && eth.dhcp == 2) {           /* refused: from the start */
         dhcp_start();
         eth.dhcp_next = now_ms() + 1000;
+    }
+    if (type == 5 && eth.dhcp == 3 && eth.renewing) {  /* the lease renewed (what it left out stays as it was) */
+        if (!same(b + 16, eth.ip, 4)) {         /* (another address: the connections on the old one are gone) */
+            copy(eth.ip, b + 16, 4);
+            tcp_drop_all();
+        }
+        if (mask[0] | mask[1] | mask[2] | mask[3])
+            copy(eth.mask, mask, 4);
+        if (router[0] | router[1] | router[2] | router[3])
+            copy(eth.router, router, 4);
+        if (dns[0] | dns[1] | dns[2] | dns[3])
+            copy(eth.dns, dns, 4);
+        if (lease)
+            eth.lease = lease;
+        eth.renew_at = now_ms() + (u64)eth.lease * 500;
+        eth.expires_at = now_ms() + (u64)eth.lease * 1000;
+        eth.renewing = 0;
+        return 0;
+    }
+    if (type == 6 && eth.dhcp == 3 && eth.renewing) {  /* refused: the address is not ours any more */
+        tcp_drop_all();
+        dhcp_start();
+        eth.dhcp_next = now_ms() + 1000;
+        return "eth0: the DHCP server took the address back: asking for a new one";
     }
     return 0;
 }
@@ -628,8 +667,10 @@ static const char *handle(int len)
    timers, TCP's, then net.c's servers (telnet, netload) and its NTP; a line to show, or 0 */
 const char *eth_poll(void)
 {
-    if (!eth.used || depth)
+    if (depth)
         return 0;
+    if (!eth.used)
+        return net_poll();                      /* (no port: its servers still end what its going cut off) */
     u64 now = now_ms();
     int moving = mouse_moving_on_b();
     if (now - eth.last_poll < (u32)(moving ? POLL_MOUSE_MS : tcp_busy() ? 0 : POLL_MS))
@@ -654,11 +695,22 @@ const char *eth_poll(void)
             line = s;
     }
     depth--;
-    if ((eth.dhcp == 1 || eth.dhcp == 2) && now_ms() >= eth.dhcp_next) {
+    if (eth.dhcp == 4 && now_ms() >= eth.dhcp_next) {
+        /* (given up, and said so: asked again every minute all the same -- a router that starts slower than the
+           box, a cable plugged in later left it without an address until someone typed 'dhcp') */
+        eth.dhcp = 1;
+        eth.dhcp_tries = 8;
+        dhcp_send(1);
+        eth.dhcp_next = now_ms() + 4000;
+    } else if ((eth.dhcp == 1 || eth.dhcp == 2) && now_ms() >= eth.dhcp_next) {
         if (++eth.dhcp_tries > 8) {
+            int first = !eth.gave_up;
             eth.dhcp = 4;
-            line = "eth0: no answer from a DHCP server ('dhcp' asks again)";
-            if (!eth.rndis && links[1].used) {  /* the LTE module's link instead */
+            eth.gave_up = 1;
+            eth.dhcp_next = now_ms() + 60000;
+            if (first)
+                line = "eth0: no answer from a DHCP server (asked again every minute; 'dhcp' asks now)";
+            if (first && !eth.rndis && links[1].used) {  /* the LTE module's link instead */
                 if (activate(1) == 0) {
                     line = "eth0: no DHCP answer on Ethernet: the network goes through the LTE module (RNDIS) instead";
                 } else {
@@ -669,6 +721,19 @@ const char *eth_poll(void)
         } else {
             dhcp_send(eth.dhcp == 1 ? 1 : 3);
             eth.dhcp_next = now_ms() + 2000u * (u32)(eth.dhcp_tries < 4 ? eth.dhcp_tries : 4);
+        }
+    } else if (eth.dhcp == 3 && eth.renew_at && now_ms() >= eth.renew_at) {
+        /* the lease: asked for again at half its time, then every minute; at its end the address is not ours
+           any more (it was never renewed: the server could give it to another host) */
+        if (now_ms() >= eth.expires_at) {
+            tcp_drop_all();
+            dhcp_start();
+            eth.dhcp_next = now_ms();
+            line = "eth0: the address's lease ran out with no answer from the DHCP server: asking for a new one";
+        } else {
+            eth.renewing = 1;
+            dhcp_send(3);
+            eth.renew_at = now_ms() + 60000;
         }
     }
     tcp_poll();
@@ -867,6 +932,8 @@ const char *eth_attach(u8 device, u8 ctrl_if, u8 data_if, u8 data_alt, u8 in_ep,
     (void)int_ep;
     if (links[0].used && links[0].device != device)
         return "an Ethernet port, but one is in use already: left alone";
+    if (!maxp)
+        maxp = 64;                              /* (a descriptor saying 0: send_frame divides by it) */
     links[0] = (struct link){1, device, ctrl_if, data_if, data_alt, in_ep, out_ep, mac_string, maxp};
     if (eth.used && eth.rndis)
         uprintf("eth0: an Ethernet port came: the network goes through it from now on, not the LTE module\n");
@@ -881,8 +948,11 @@ const char *eth_attach(u8 device, u8 ctrl_if, u8 data_if, u8 data_alt, u8 in_ep,
    when there is no Ethernet port in use */
 const char *eth_attach_rndis(u8 device, u8 ctrl_if, u8 data_if, u8 in_ep, u8 out_ep, u16 maxp)
 {
+    if (!maxp)
+        maxp = 64;
     links[1] = (struct link){1, device, ctrl_if, data_if, 0, in_ep, out_ep, 0, maxp};
-    if (eth.used && !eth.rndis && eth.dhcp != 4) {
+    if (eth.used && !eth.rndis && eth.dhcp != 4 && !eth.gave_up) {      /* (gave_up: also in the few seconds
+                                                                           of its asking again each minute) */
         usnprintf(said, sizeof(said), "a network link through the LTE module (RNDIS): kept for when the Ethernet "
                   "port is gone or gets no address");
         return said;

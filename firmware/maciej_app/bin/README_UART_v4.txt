@@ -48,8 +48,10 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
   explorer [n:][sciezka]
                        menedzer plikow na TV w biezacym katalogu, zgrany z
                        "cd" w obie strony: strzalki/PgUp/PgDn wybieraja,
-                       Enter otwiera (obraz: przegladarka, plik .nes albo
-                       .gb: gra, inny plik: jego poczatek), Backspace w gore,
+                       Enter otwiera (obraz: przegladarka, plik gry -
+                       .nes, .gb, .sms, .sg, .md, .crt, .adf itd., takze w
+                       .zip albo .gz: gra, inny plik: jego poczatek),
+                       Backspace w gore,
                        "/" albo Tab - wpisywanie sciezki w pasku; mysz:
                        klik, podwojny klik, kolko; Esc wraca do konsoli;
                        F2 zmienia nazwe, F7 nowy katalog, Delete/F8
@@ -114,8 +116,10 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
                        dekoderem MPEG-2 ukladu; dzwiek przez "snd". Esc,
                        Ctrl-C, q albo EXIT na pilocie konczy; -n tyle klatek,
                        -x tak szybko jak dekoduje (bez dzwieku), -k ostatnia
-                       klatka zostaje na TV, -v kazda klatka opisana, -1
-                       obraz w swoim rozmiarze (zamiast na wysokosc ekranu)
+                       klatka zostaje na TV (zdejmuje ja Esc na klawiaturze
+                       USB, EXIT na pilocie albo "av off"), -v kazda klatka
+                       opisana, -1 obraz w swoim rozmiarze (zamiast na
+                       wysokosc ekranu)
   av <polecenie>       dekoder wideo i warstwa obrazu: av status (rejestry),
                        av shot <plik.bmp|plik.yuv> (ostatnia klatka do
                        pliku), av show, av off (z powrotem menu), av reset
@@ -131,7 +135,10 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
                        W A S D, X = A, Z = B, Enter = Start, Tab = Select
                        (klawiatura USB, UART, pilot: strzalki, OK = A, 0 = B,
                        MENU = Start, INFO = Select); Ctrl-C albo Esc konczy;
-                       pamiec baterii gry w pliku .sav obok niej
+                       pamiec baterii gry w pliku .sav obok niej. Kazdy
+                       emulator bierze tez gre spakowana w .zip (najwiekszy
+                       plik w nim, ktory nie jest tekstem ani obrazkiem)
+                       albo .gz (tez .adz Amigi)
   sms [-f klatki] <plik.sms>
                        gra Sega Master System na TV (256 x 192, 3 razy
                        wiekszy; mappery Sega i Codemasters, pamiec kartridza
@@ -140,6 +147,18 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
   gg [-f klatki] <plik.gg>
                        gra Sega Game Gear na TV (160 x 144, 5 razy wiekszy):
                        X = przycisk 2, Z = przycisk 1, Enter = Start
+  sg [-f klatki] <plik.sg|plik.sc>
+                       gra Sega SG-1000 / SC-3000 na TV (256 x 192, 3 razy
+                       wiekszy; kartridze do 48 KB, powyzej mapper Sega;
+                       tylko pady, bez dzwieku): X = przycisk 2, Z =
+                       przycisk 1, Enter = Pause; reszta jak w nes
+  megadrive [-r j|u|e] [-f klatki] <plik>
+                       gra Sega Mega Drive / Genesis na TV (320 x 224 albo
+                       256 x 224, 3 razy wiekszy; .md, .gen, .bin, .smd;
+                       NTSC albo PAL wg regionu z naglowka albo -r) z
+                       dzwiekiem (YM2612 i PSG): X = B, Z = A, Tab / spacja
+                       = C, Enter = Start (klawiatura USB, UART, pilot);
+                       pad 3-przyciskowy; pamiec kartridza w pliku .sav
   zx [-f klatki] [plik]
                        ZX Spectrum 48K na TV (320 x 240 z ramka, 3 razy
                        wiekszy, 50 klatek/s): snapshot (.sna, .z80) albo
@@ -161,7 +180,11 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
                        Commodore 64 (PAL) na TV (352 x 240 z ramka, 3 razy
                        wiekszy, 50 klatek/s): program (.prg, .t64) albo
                        dyskietka (.d64) - wczytuje sie i startuje (RUN) sam,
-                       LOAD z dyskietki dziala tez pozniej; bez pliku: BASIC.
+                       LOAD z dyskietki dziala tez pozniej; albo kartridz
+                       (.crt: zwykly 8K/16K/Ultimax, Ocean, Magic Desk,
+                       EasyFlash, System 3, Dinamic, Fun Play, Super Games,
+                       RGCD, Simons' BASIC, Final Cartridge III) - start z
+                       kartridza; bez pliku: BASIC.
                        ROM-y C64 to pliki kernal.rom, basic.rom i chargen.rom
                        (nie ma ich w demie) obok programu, w katalogu c64/
                        albo na szczycie dysku. Klawiatura USB jest klawiatura
@@ -198,7 +221,9 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
                        bledy), rf scan, rf services (nazwy kanalow
                        multipleksu), rf ts <s> [plik] (PID-y albo nagranie
                        .ts), rf spectrum (poziom sygnalu z anteny od 174 do
-                       862 MHz jako wykres na TV); tylko DVB-T, nie DVB-T2
+                       862 MHz jako wykres na TV), rf live [od do] (ten
+                       wykres odswiezany na biezaco, sterowany klawiszami);
+                       tylko DVB-T, nie DVB-T2
   tty                  porty szeregowe USB: porty modulu GSM / LTE (SIMCom,
                        Quectel, Huawei, ZTE ...), urzadzenia CDC ACM
                        i przejsciowki USB-UART (CH340 / CH341, CP210x, FTDI,
@@ -278,10 +303,11 @@ wolumin FAT (wszystkie kopie FAT, dlugie nazwy, FSInfo w FAT32; pliki
 tekstowe maja konce linii jak w Linuksie) i NTFS - ten tylko wtedy, gdy
 Windows zamknal go czysto (pusty dziennik: "Bezpieczne usuwanie" przed
 wyjeciem; "ntfs n:" mowi, czy demo go zapisuje). Po zapisie przez demo
-warto sprawdzic pendrive w Windows (chkdsk). Tuner nie ma zegara - nowe pliki
-i katalogi maja date 2026-11-13 12:00. Dysk chroniony przed zapisem (MODE
-SENSE) nie jest zapisywany. Uwaga: zapis zmienia dane na pendrivie - najpierw
-sprobuj na pendrivie bez waznych plikow.
+warto sprawdzic pendrive w Windows (chkdsk). Nowe pliki i katalogi maja date
+z zegara, gdy NTP go ustawil (czas polski); wczesniej 2026-11-13 12:00. Czesc
+katalogowa sciezki moze miec 95 znakow, nazwa 127 - dluzsze sa odrzucane.
+Dysk chroniony przed zapisem (MODE SENSE) nie jest zapisywany. Uwaga: zapis
+zmienia dane na pendrivie - najpierw sprobuj na pendrivie bez waznych plikow.
 Modul GSM / LTE (sprawdzone z SIMCom A7670E, 1e0e:9011): jego porty to
 ttyUSB0..3 ("tty"), "at +csq" pyta o zasieg, "cu" otwiera port AT jak
 terminal. Gdy modul sie zrestartuje (np. po AT+CRESET), demo samo
@@ -374,16 +400,61 @@ prawdziwa stacja (sciezki MFM), wiec dzialaja tez gry z wlasnym loaderem.
 Klatka ok. 5,5-9 ms + 3-4 ms rysowania. Sprawdzone na Comsacie: Magicland
 Dizzy (wersja TRSi) z AROS-em - start ok. 30 s, intro wymaga klikniecia
 myszka (0 na pilocie albo Page Down).
+Sega Mega Drive / Genesis: "megadrive plik.md" (albo .gen, .bin, .smd) albo
+Enter w eksploratorze (.bin tylko gdy naglowek mowi, ze to gra Mega Drive).
+68000 jest ten sam co w Amidze (wspolny plik m68k.inc), Z80 ten sam co w
+Master System; obraz rysowany linia po linii (plany A i B, okno, sprite'y,
+cien / podswietlenie, przewijanie calym ekranem, pasami i liniami), dzwiek
+YM2612 (FM, 6 kanalow, DAC) i PSG. Na pudelku z dzwiekiem: Super Mario
+World (Taiwan) 12,3 ms + 2,7 ms rysowania, Super Mario Bros. (hack PD)
+9,3 + 1,9 ms, Snake 9,7 + 2,3 ms - pelne 60 klatek/s. Zapisy rejestrow
+ukladow dzwiekowych sa zbierane przez cala klatke i graja sie na jej koncu
+za jednym razem (to samo co probka po probce, ale tablice zostaja w
+cache'u: dzwiek kosztowal 5,1 ms klatki, teraz 2,3 ms), a operatory FM sa
+liczone co druga probke (26,6 kHz). Dema z efektami w kazdej linii
+(wobble, scaling) nie mieszcza sie w 16,7 ms. Nie ma: zmian w polowie
+linii, trybu interlace 2 (tylko pierwsze pole), SSG-EG i CSM w YM2612,
+pada 6-przyciskowego z klawiatury. Gra Super Mario World (Taiwan) ma
+zabezpieczenie (odczyt 0xA13000) - rozpoznawana po naglowku "SEGASEGA".
+Sega SG-1000 / SC-3000: "sg plik.sg" (albo .sc) albo Enter w eksploratorze;
+tryby obrazu TMS9918 (Graphics I i II z maskami, Multicolour, tekst 40
+kolumn, sprite'y 8x8 / 16x16 z limitem 4 na linie). Klatka ok. 5 ms + 1,6
+ms. Kartridze z wlasnym RAM-em: do 32 KB - 8 KB RAM-u od 0x8000 (The
+Castle), 33-48 KB z pustym 0x2000-0x3FFF - RAM tam. Bez klawiatury SC-3000.
+Kartridze C64 (.crt): "c64 gra.crt" albo Enter w eksploratorze; typ
+rozpoznawany po naglowku "C64 CARTRIDGE", nie po nazwie; ROM-y C64 nadal
+potrzebne. Klatka ok. 3,3 ms + 2,7 ms. Zapis do flasha EasyFlash jest
+ignorowany (gry nie zapisza stanu), zamrazarki (Action Replay itp.) i
+przycisk NMI Final Cartridge III nie sa obslugiwane.
+Archiwa: kazdy emulator bierze gre w .zip (metody stored i deflate; brany
+jest najwiekszy plik, ktory nie jest tekstem, obrazkiem ani katalogiem) albo
+w .gz (.adz Amigi tez); suma CRC-32 sprawdzana. Plik zapisu ma nazwe calego
+pliku gry z dopisanym .sav (gra.nes.sav; przy archiwum gra.zip.sav), wiec gry
+roznych konsol o tej samej nazwie maja osobne zapisy; starszy plik gra.sav
+o wlasciwym rozmiarze jest nadal czytany, a zapis o innym rozmiarze (innej
+konsoli) zostaje nietkniety. Gra w archiwum gra tak samo jak rozpakowana (te
+same sumy obrazu na pudelku).
 Wejscie antenowe ("rf"): tuner MaxLinear MxL603 na I2C 0x60 (SCB0) i
 demodulator COFDM wbudowany w S3811 - ustawiane rejestr w rejestr tak jak
 robi to oryginalny soft tunera (dump.bin). "rf scan" przeszukuje kanaly
 21-69, "rf services" czyta nazwy kanalow (PAT, SDT), "rf ts 10 4:/x.ts"
 nagrywa caly multipleks do pliku (do odtworzenia np. w VLC). Uwaga: S3811
 odbiera tylko DVB-T, a w Polsce multipleksy nadaja juz w DVB-T2, wiec na
-Comsacie w Polsce nie ma czego zlapac: tuner dziala i widzi sygnaly, ale
-demodulator nie zlapie DVB-T2. "rf spectrum" rysuje na TV poziom sygnalu z
-anteny od 174 do 862 MHz (ok. 35 s) - widac na nim multipleksy DVB-T2 i LTE
-800.
+Comsacie w Polsce nie ma czego zlapac: tuner dziala, ale demodulator nie
+zlapie DVB-T2. "rf spectrum" rysuje na TV poziom sygnalu z anteny od 174
+do 862 MHz (ok. 35 s). Trzy rowne prostokaty po 8 MHz na 668,25, 742,5 i
+816,75 MHz to NIE multipleksy ani LTE, tylko zaklocenia z samego pudelka:
+harmoniczne jego zegara 74,25 MHz (zegar obrazu 720p; 9, 10 i 11 x 74,25).
+Poza nimi poziom stoi na minimum (16 %): przy tych pomiarach antena nie
+byla podlaczona. "rf live" to ten sam wykres mierzony w kolko: kazdy slupek rysowany
+od razu po pomiarze (jedno przejscie calego pasma to nadal kilkadziesiat
+sekund - tuner musi sie ustalic na kazdej czestotliwosci; waskie okno
+odswieza sie co pare sekund). Klawisze (klawiatura USB, UART, pilot):
+lewo / prawo - znacznik (czestotliwosc, kanal, poziom), gora / dol -
+zblizenie / oddalenie wokol znacznika, PgUp / PgDn - przesuniecie okna,
+F - cale pasmo, + / - krotszy / dluzszy czas pomiaru (szybciej, ale mniej
+dokladnie), spacja - pauza, P - zapamietywanie szczytow, Enter - proba
+zlapania DVB-T na kanale znacznika, Esc - koniec.
 Hub USB: demo wlacza zasilanie portow huba, resetuje kazdy port z urzadzeniem
 i odczytuje urzadzenia za hubem (takze hub za hubem), razem do 15 urzadzen
 (hub musi miec jeden z pierwszych 7 adresow);

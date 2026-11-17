@@ -15,9 +15,12 @@
    board with two front buttons, UP = Start and DOWN = A.  Ctrl-C or Esc
    ends.
 
-   A cartridge with a battery keeps its RAM in a file beside it (game.nes
-   -> game.sav), read at the start and written at the end when the game
-   changed it.  A machine that makes sound (the NES) plays it through snd.c
+   A cartridge with a battery keeps its RAM in a file beside it, named
+   after the whole file (game.nes -> game.nes.sav, so that game.gb beside
+   it keeps its own), read at the start and written at the end when the
+   game changed it.  A save made before that had the extension dropped
+   (game.sav): it is still read when there is no new one and its size is
+   this cartridge's RAM's, and never written again.  A machine that makes sound (the NES) plays it through snd.c
    (HDMI and SCART), 48 kHz. */
 #include "hw.h"
 #include "nes.h"
@@ -28,7 +31,10 @@
 #include "c64.h"
 #include "amiga.h"
 #include "dos.h"
+#include "md.h"
 #include "snd.h"
+#include "zip.h"
+#include "image.h"
 
 /* a machine, as the player sees it */
 struct machine {
@@ -120,6 +126,21 @@ static const struct machine gg_machine = {GG_W, GG_H, 5, 5, SMS_FRAME_US, gg_ope
                                           "arrows or W A S D, X = button 2, Z = button 1, Enter = Start; Ctrl-C or "
                                           "Esc ends", 0, 0, 0};
 
+/* the SG-1000 / SC-3000 (256 x 192, three times): a .sc file gets the SC-3000's 2 KB of RAM */
+static const char *sg_open(u8 *image, u32 size, const char *path)
+{
+    int n = 0;
+    while (path && path[n])
+        n++;
+    int sc = n >= 3 && path[n - 3] == '.' && (path[n - 2] | 32) == 's' && (path[n - 1] | 32) == 'c';
+    return sms_load(image, size, sc ? SMS_SC3000 : SMS_SG1000);
+}
+
+static const struct machine sg_machine = {SMS_W, 192, 3, 3, SMS_FRAME_US, sg_open, sms_info, sms_one,
+                                          sms_save_ram, sms_save_changed, sms_jammed, 0, 0, "the Z80", 0, 0,
+                                          "arrows or W A S D, X = button 2, Z = button 1, Enter = Pause; Ctrl-C or "
+                                          "Esc ends", 0, 0, 0};
+
 /* the ZX Spectrum 48K: 320 x 240 with its border, three times (960 x 720).  Its ROM is not in the demo: a
    file 48.rom (16 KB) in the program's directory, or zx/48.rom or 48.rom at its volume's top */
 static u8 zx_rom[16384];
@@ -142,21 +163,33 @@ static u32 rom_find(const char *path, const char *sub, const char *name, u8 *rom
     char dir[160], try[200], in_sub[40], top[40];
     usnprintf(in_sub, sizeof(in_sub), "/%s/%s", sub, name);
     usnprintf(top, sizeof(top), "/%s", name);
-    int n = 0, cut = 0, colon = -1;
-    const char *base = *path ? path : disk_cwd();
-    for (; base[n] && n < (int)sizeof(dir) - 1; n++) {
-        dir[n] = base[n];
-        if (base[n] == '/' || base[n] == '\\')
+    int n = 0, cut = 0, colon = -1, named = 0;
+    const char *cwd = disk_cwd();
+    for (const char *q = path; *q; q++)
+        named |= *q == ':';
+    /* the program's directory: as its path names it; a path without a volume ("manic.tap" after 'cd', what the
+       explorer opens; "/top.tap": the current volume's top) starts from the current directory; none: that
+       directory itself */
+    if (!named && *cwd) {
+        for (; cwd[n] && n < (int)sizeof(dir) - 2; n++) {
+            dir[n] = cwd[n];
+            if (cwd[n] == ':' && colon < 0)
+                colon = n;
+        }
+        if (*path == '/' || *path == '\\')
+            n = colon + 1;              /* ("4:" of "4:/games") */
+        else if (n && dir[n - 1] != '/')
+            dir[n++] = '/';
+        cut = n;
+    }
+    for (const char *q = path; *q && n < (int)sizeof(dir) - 1; q++, n++) {
+        dir[n] = *q;
+        if (*q == '/' || *q == '\\')
             cut = n + 1;
-        if (base[n] == ':' && colon < 0)
+        if (*q == ':' && colon < 0)
             colon = n;
     }
     dir[n] = 0;
-    if (!*path) {                       /* (the current directory itself) */
-        if (n && dir[n - 1] != '/')
-            dir[n++] = '/', dir[n] = 0;
-        cut = n;
-    }
     for (int k = 0; k < 3 + 16; k++) {
         if (k == 0) {
             if (!cut)
@@ -233,7 +266,8 @@ static const struct machine zx_machine = {ZX_W, ZX_H, 3, 3, ZX_FRAME_US, zx_open
 #define TAP_FRAMES 6                    /* a key typed on the UART: the button held this many frames */
 #define IR_FRAMES  9                    /* a remote's key: until its repeat frame would have come (108 ms) */
 
-#define PICTURE_MAX (352 * 272)          /* the largest picture: the Amiga's with its border */
+#define PICTURE_MAX (352 * 272)          /* the largest picture: the Amiga's with its border (the Mega Drive's
+                                           320 x 240 fits) */
 static u16 picture[PICTURE_MAX], before[PICTURE_MAX];         /* (u8 for the NES, u16 for the others) */
 static u16 colours[128];
 static int pw, ph;                      /* the picture's size now (m->w, m->h, or what m->size says) */
@@ -446,8 +480,10 @@ static u8 scripted(const char **script, u32 frame, u8 pad)
     return pad;
 }
 
-/* the cartridge's file name with another ending: "4:/games/a.nes" -> "4:/games/a.sav" */
-static int save_path(const char *path, char *out, int size)
+/* the save file of a cartridge: its whole file name and ".sav" ("4:/games/a.nes" -> "4:/games/a.nes.sav": a.gb
+   beside it has a save of its own); old: the name used before, the ending replaced ("4:/games/a.sav"), which
+   two machines' games of one name shared -- one overwrote the other's.  0: the name does not fit */
+static int save_path(const char *path, char *out, int size, int old)
 {
     int n = 0, dot = -1;
     for (; path[n]; n++)
@@ -455,7 +491,7 @@ static int save_path(const char *path, char *out, int size)
             dot = n;
         else if (path[n] == '/' || path[n] == '\\')
             dot = -1;
-    if (dot < 0)
+    if (dot < 0 || !old)
         dot = n;
     if (dot + 5 > size)
         return 0;
@@ -467,6 +503,71 @@ static int save_path(const char *path, char *out, int size)
     out[dot + 3] = 'v';
     out[dot + 4] = 0;
     return 1;
+}
+
+/* while an archive is unpacked (image.c asks every 32 KB it makes and every 64 blocks): the clock read, which
+   feeds the watchdog -- a large archive takes seconds --, and Ctrl-C ends it */
+static int unpack_poll(void)
+{
+    (void)now_ms();
+    return uart_getc() == 3;
+}
+
+/* a game in a .zip or a .gz (an Amiga's .adz is one), read whole at image: the archive moved to the top of the
+   media area, the game unpacked to its start.  The game's size (the file's own when it is no archive), or -1;
+   as: the path the machine is told -- the archive's directory and the game's own name (its folders dropped),
+   since the Spectrum, the C64 and the SC-3000 know a file by its extension; a .gz without a name in it: the
+   file's own name without .gz (.adz: .adf) */
+static int unpack(const char *path, u8 *image, u32 got, char *as, int max)
+{
+    int n = 0;
+    while (path[n] && n < max - 1) {
+        as[n] = path[n];
+        n++;
+    }
+    as[n] = 0;
+    int zip = zip_is(image, got);
+    if (!zip && !gz_is(image, got))
+        return (int)got;
+    u8 *top = image + MEDIA_MAX - got;
+    for (u32 i = got; i-- > 0;)                 /* (moved up: overlapping, so from the end) */
+        top[i] = image[i];
+    char name[96];
+    u32 size = 0;
+    image_poll = unpack_poll;
+    const char *why = zip ? zip_unpack(top, got, 0, image, MEDIA_MAX - got, &size, name, sizeof(name))
+                          : gz_unpack(top, got, image, MEDIA_MAX - got, &size, name, sizeof(name));
+    image_poll = 0;
+    if (why) {
+        uprintf("%s: %s\n", path, why);
+        return -1;
+    }
+    int dir = 0, dot = -1;                      /* (the path's directory: up to its last / \ or :) */
+    for (int i = 0; path[i]; i++)
+        if (path[i] == '/' || path[i] == '\\' || path[i] == ':')
+            dir = i + 1, dot = -1;
+        else if (path[i] == '.')
+            dot = i;
+    const char *base = name;
+    for (const char *q = name; *q; q++)
+        if (*q == '/' || *q == '\\')
+            base = q + 1;
+    n = dir < max - 1 ? dir : max - 1;
+    if (*base) {
+        for (int i = 0; base[i] && n < max - 1; i++)
+            as[n++] = base[i];
+    } else {                                    /* (a .gz with no name: the file's) */
+        int adz = dot > 0 && (path[dot + 1] | 32) == 'a' && (path[dot + 2] | 32) == 'd' &&
+                  (path[dot + 3] | 32) == 'z' && !path[dot + 4];
+        int end = dot > dir ? dot : n;
+        for (int i = dir; i < end && n < max - 1; i++)
+            as[n++] = path[i];
+        for (const char *e = adz ? ".adf" : ""; *e && n < max - 1; e++)
+            as[n++] = *e;
+    }
+    as[n] = 0;
+    uprintf("%s: %s unpacked (%u bytes)\n", path, *base ? base : as + dir, size);
+    return (int)size;
 }
 
 /* 'nes' / 'gb' [-f frames] [-k script] <file>: frames 0 = until the player ends it.  0, -1 it could not
@@ -483,7 +584,12 @@ static int play(const struct machine *machine, const char *path, u32 frames, con
         uprintf("%s: %u bytes -- more than a cartridge file can be here (%u MB)\n", path, size, MEDIA_MAX >> 20);
         got = -1;
     }
-    if (got >= 0 && (why = m->load(image, (u32)got, path)) != 0) {
+    char as[160];                               /* (a game in an archive: its own name, beside the archive) */
+    if (got > 0)
+        got = unpack(path, image, (u32)got, as, sizeof(as));
+    else
+        as[0] = 0;
+    if (got >= 0 && (why = m->load(image, (u32)got, *as ? as : path)) != 0) {
         uprintf("%s: %s\n", path, why);
         got = -1;
     }
@@ -492,14 +598,31 @@ static int play(const struct machine *machine, const char *path, u32 frames, con
         return -1;
     }
     uprintf("%s: %s\n", path, m->info());
-    char sav[128];
+    char sav[128], old_sav[128];
     u32 ram_size;
-    int battery, have_sav = save_path(path, sav, sizeof(sav));
+    int battery, have_sav = save_path(path, sav, sizeof(sav), 0), foreign = 0;
     u8 *ram = m->save_ram(&ram_size, &battery);
-    if (battery && have_sav && disk_exists(sav)) {
+    if (battery && have_sav) {
+        const char *from = 0;
+        static struct disk_entry e;
+        if (disk_exists(sav)) {
+            /* (a save of another size is not this cartridge's: the file run with another machine's player
+               once -- a Game Boy game as a Master System's, which keeps 32 KB for any game.  It is neither
+               read nor written over) */
+            if (disk_stat(sav, &e) == 0 && e.kind == DISK_FILE && e.size == ram_size && !e.size_hi)
+                from = sav;
+            else
+                foreign = 1;
+        }
+        if (!from && save_path(path, old_sav, sizeof(old_sav), 1) && disk_exists(old_sav) &&
+            disk_stat(old_sav, &e) == 0 && e.kind == DISK_FILE && e.size == ram_size && !e.size_hi)
+            from = old_sav;             /* (a save from before the names told the machines apart) */
         u32 n = 0;
-        if (disk_read_head(sav, ram, ram_size, &n) > 0)
-            uprintf("its battery RAM read from %s\n", sav);
+        if (foreign)
+            uprintf("%s is not this cartridge's save (its RAM is %u bytes): left alone, and nothing will be "
+                    "saved while it is there\n", sav, ram_size);
+        if (from && disk_read_head(from, ram, ram_size, &n) > 0)
+            uprintf("its battery RAM read from %s\n", from);
         (void)m->save_changed();
     }
     for (int i = 0; i < m->colours; i++)
@@ -523,7 +646,7 @@ static int play(const struct machine *machine, const char *path, u32 frames, con
     /* sound, played as it is made (a test's run of -f frames makes none); what does not fit in the sound's ring
        (a game ahead of it) is dropped */
     static s16 samples[4096];
-    u32 dropped = 0;
+    u32 dropped = 0, sound_us = 0;              /* (sound_us: the run's time in m->audio and snd_write) */
     int sound = !frames && m->audio && snd_init(0) == 0;
     if (sound)
         m->audio_rate(snd_rate());
@@ -537,6 +660,7 @@ static int play(const struct machine *machine, const char *path, u32 frames, con
         pad = by_script ? scripted(&script, n, pad) : (u8)held;
         u64 t0 = now_ticks();
         m->frame(pad, picture);
+        u64 ts = now_ticks();
         if (sound) {
             int k = m->audio(samples, (int)(sizeof(samples) / sizeof(samples[0]))), room = snd_room();
             if (k > room)
@@ -560,6 +684,7 @@ static int play(const struct machine *machine, const char *path, u32 frames, con
         u64 t2 = now_ticks();
         emu += (u32)(t1 - t0) / per;
         draw += (u32)(t2 - t1) / per;
+        sound_us += (u32)(t1 - ts) / per;
         u32 took = (u32)(t2 - t0) / per;
         if (took > slowest)
             slowest = took, slowest_at = n, slowest_draw = (u32)(t2 - t1) / per;
@@ -586,12 +711,13 @@ static int play(const struct machine *machine, const char *path, u32 frames, con
             slowest, m->frame_us, slowest_at, slowest_draw, over, late ? " (some frames came late)" : "",
             crc32((const u8 *)picture, (u32)(pw * ph * (m->colours ? 1 : 2))));
     if (sound) {
+        uprintf("sound: %u us a frame of the run handing it over\n", n ? sound_us / n : 0);
         m->audio_rate(0);
         snd_stop();
         if (dropped)
             uprintf("sound: %u samples did not fit in the sound's ring\n", dropped);
     }
-    if (battery && have_sav && m->save_changed())
+    if (battery && have_sav && !foreign && m->save_changed())
         disk_write_file(sav, ram, ram_size, 0);
     return 0;
 }
@@ -614,6 +740,11 @@ int sms_play(const char *path, u32 frames, const char *script)
 int gg_play(const char *path, u32 frames, const char *script)
 {
     return play(&gg_machine, path, frames, script);
+}
+
+int sg_play(const char *path, u32 frames, const char *script)
+{
+    return play(&sg_machine, path, frames, script);
 }
 
 /* the Atari 2600: 160 x 228 of its 128 colours' numbers, five times as wide and three times as high (800 x
@@ -787,4 +918,46 @@ int dos_play(const char *path, u32 frames, const char *script)
 int zx_play(const char *path, u32 frames, const char *script)
 {
     return play(&zx_machine, path, frames, script);
+}
+
+/* the Mega Drive / Genesis: 320 x 224 (256 wide in H32, 240 high in PAL's V30) three times as large (960 x 672 of
+   1280 x 720), at the console's own rate (NTSC's 59.92 frames a second, PAL's 49.70: chosen from the cartridge's
+   header when it is loaded, or by md_play_region), with its sound.  The pad: the player's A (X, the remote's OK)
+   is its B, the player's B (Z, the remote's 0) its A, Select (Tab / Space, the remote's INFO) its C, Start its
+   Start: a 3-button pad */
+static struct machine md_machine;
+static int md_region;
+
+void md_play_region(int region)
+{
+    md_region = region;
+}
+
+static const char *md_open(u8 *image, u32 size, const char *path)
+{
+    (void)path;
+    const char *why = md_load(image, size, md_region);
+    md_machine.frame_us = md_pal() ? MD_FRAME_US_PAL : MD_FRAME_US;
+    return why;
+}
+
+static void md_one(u8 pad, void *picture)
+{
+    md_frame(pad, (u16 *)picture);
+}
+
+static void md_size(int *w, int *h)
+{
+    *w = md_width();
+    *h = md_height();
+}
+
+static struct machine md_machine = {MD_W_MAX, 224, 3, 3, MD_FRAME_US, md_open, md_info, md_one, md_save_ram,
+                                    md_save_changed, md_jammed, 0, 0, "the 68000", 0, 0,
+                                    "arrows or W A S D, Z = A, X = B, Tab / Space = C, Enter = Start; Ctrl-C or "
+                                    "Esc ends", md_size, md_audio_rate, md_audio};
+
+int md_play(const char *path, u32 frames, const char *script)
+{
+    return play(&md_machine, path, frames, script);
 }

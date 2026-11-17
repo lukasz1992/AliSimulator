@@ -65,7 +65,21 @@
    caught too, for device 8 (see 'A 1541' below): OPEN, CHKIN, CHRIN and
    the command channel work, so loaders that read files through the KERNAL
    do.  A game's own fast loader (code sent to the 1541) finds no drive
-   that runs it -- most then fall back to the KERNAL. */
+   that runs it -- most then fall back to the KERNAL.
+
+   Cartridges (.crt, VICE's / CCS64's files): the chips' 8 KB banks for
+   ROML ($8000) and ROMH ($A000, or $E000 in Ultimax mode), the EXROM and
+   GAME lines and the PLA's configurations with them: 8K (EXROM low: ROML
+   over the RAM at $8000 with LORAM and HIRAM), 16K (both low: ROMH in
+   BASIC's place with HIRAM; the character ROM not with HIRAM low),
+   Ultimax (GAME low: RAM at $0000-$0FFF, ROML, the I/O, ROMH at $E000
+   whatever the 6510's port says, nothing elsewhere -- reads there give the
+   bus's last byte, writes go nowhere; the VIC sees ROMH's upper 4 KB at
+   $3000-$3FFF of each bank and no character ROM).  ROM reads come from the
+   bank, writes go to the RAM below (in Ultimax mode: nowhere).  The banking
+   of the game cartridges' kinds is done at I/O 1 and 2 ($DE00-$DFFF): see
+   cart_read / cart_write.  The machine then starts in the cartridge (its
+   CBM80 at $8004, or its own reset vector in Ultimax mode), at bank 0. */
 #include "c64.h"
 
 #define LINE_CYCLES  63u
@@ -121,6 +135,26 @@ static u8 *wrp[256];                    /* for writes; 0: I/O or the 6510's port
 static u8 port_dir, port_out;           /* $00 and $01 */
 static u8 open_bus;                     /* the last byte the VIC fetched */
 static u8 trap_ok, wait_ok;             /* the KERNAL is the one whose LOAD and key loop are known */
+
+/* a cartridge */
+#define CART_BANKS 128
+static struct {
+    u8 on;                              /* one is plugged in */
+    u8 type;                            /* its hardware type (the .crt's numbers) */
+    u8 sub;                             /* the .crt's hardware revision */
+    u8 exrom, game;                     /* its lines now (1: high, not asserted) ... */
+    u8 exrom0, game0;                   /* ... and at the reset */
+    u8 bank, mask, locked;              /* the bank; the bank numbers' mask; its register no longer written */
+    u8 lo_on, hi_at;                    /* ROML is mapped at $8000; ROMH at this page ($A0, $E0; 0: not) */
+    const u8 *roml, *romh;              /* the bank's 8 KB at $8000 and $A000 / $E000 (0: none) */
+    const u8 *lo[CART_BANKS], *hi[CART_BANKS];
+    u8 ram[256];                        /* EasyFlash's, at $DF00 */
+    u32 size;                           /* its ROM's bytes */
+    u8 name[32];
+} cart;
+static u8 ultimax;                      /* the cartridge's Ultimax mode is on */
+static u8 nowhere[256];                 /* where writes to nothing go */
+static u8 short_chip[4][0x2000];        /* chips of less than 8 KB, repeated to 8 KB */
 
 struct cia {
     u8 pra, prb, ddra, ddrb, cra, crb;
@@ -751,6 +785,13 @@ static void vic_bank(void)
     if (!(base & 0x4000))
         for (int i = 4; i < 8; i++)
             vmem[i] = chargen + ((u32)(i - 4) << 10);
+    if (ultimax) {                              /* (no character ROM; ROMH's upper 4 KB at $3000) */
+        for (int i = 4; i < 8; i++)
+            vmem[i] = ram + base + ((u32)i << 10);
+        if (cart.romh)
+            for (int i = 12; i < 16; i++)
+                vmem[i] = cart.romh + ((u32)(i - 8) << 10);
+    }
 }
 
 static u32 raster_now(void)
@@ -824,10 +865,16 @@ static void vic_write(u32 r, u8 v)
 }
 
 /* ---- memory ---- */
+static void map_cart(u32 lines);
+
 static void map(void)
 {
     u8 lines = (u8)(((port_out & port_dir) | ~port_dir) & 7);  /* (inputs read high) */
     int loram = lines & 1, hiram = lines & 2, charen = lines & 4;
+    if (cart.on) {
+        map_cart(lines);
+        return;
+    }
     for (int i = 0xA0; i < 0x100; i++) {
         rdp[i] = ram + (i << 8);
         wrp[i] = ram + (i << 8);
@@ -848,6 +895,193 @@ static void map(void)
     }
 }
 
+/* the cartridge's banks where the PLA has mapped them (0: nothing there -- the slow way, the bus's last byte) */
+static void cart_pages(void)
+{
+    if (cart.lo_on)
+        for (int i = 0; i < 0x20; i++)
+            rdp[0x80 + i] = cart.roml ? cart.roml + (i << 8) : 0;
+    if (cart.hi_at)
+        for (int i = 0; i < 0x20; i++)
+            rdp[cart.hi_at + i] = cart.romh ? cart.romh + (i << 8) : 0;
+    if (ultimax)
+        vic_bank();
+}
+
+/* the PLA with a cartridge: LORAM, HIRAM, CHAREN (`lines` bits 0-2) with EXROM and GAME */
+static void map_cart(u32 lines)
+{
+    int loram = lines & 1, hiram = lines & 2, charen = lines & 4, was = ultimax;
+    int mode = (cart.exrom ? 0 : 1) | (cart.game ? 0 : 2);     /* 0 none, 1 8K, 2 Ultimax, 3 16K */
+    ultimax = mode == 2;
+    cart.lo_on = cart.hi_at = 0;
+    if (ultimax) {                              /* RAM to $0FFF, ROML, the I/O, ROMH; nothing else */
+        for (int i = 0x10; i < 0x100; i++) {
+            rdp[i] = 0;
+            wrp[i] = nowhere;
+        }
+        for (int i = 0xD0; i < 0xE0; i++)
+            wrp[i] = 0;
+        cart.lo_on = 1;
+        cart.hi_at = 0xE0;
+    } else {
+        for (int i = was ? 0x10 : 0x80; i < 0x100; i++) {     /* (below $8000: RAM but after Ultimax) */
+            rdp[i] = ram + (i << 8);
+            wrp[i] = ram + (i << 8);
+        }
+        if (loram && hiram && mode)
+            cart.lo_on = 1;
+        if (hiram && mode == 3)
+            cart.hi_at = 0xA0;
+        else if (loram && hiram)
+            for (int i = 0; i < 0x20; i++)
+                rdp[0xA0 + i] = basic + (i << 8);
+        if (hiram)
+            for (int i = 0; i < 0x20; i++)
+                rdp[0xE0 + i] = kernal + (i << 8);
+        if (loram || hiram)
+            for (int i = 0; i < 0x10; i++) {
+                if (charen)
+                    rdp[0xD0 + i] = wrp[0xD0 + i] = 0;
+                else if (hiram || mode != 3)
+                    rdp[0xD0 + i] = chargen + (i << 8);
+            }
+    }
+    cart_pages();
+    if (was && !ultimax)
+        vic_bank();
+}
+
+static void cart_switch(u32 bank)               /* bank n (of those there are) */
+{
+    bank &= cart.mask;
+    cart.bank = (u8)bank;
+    cart.roml = cart.lo[bank];
+    cart.romh = cart.hi[bank];
+    cart_pages();
+}
+
+static void cart_lines(u8 exrom, u8 game)       /* EXROM and GAME (1: high) */
+{
+    if (exrom == cart.exrom && game == cart.game)
+        return;
+    cart.exrom = exrom;
+    cart.game = game;
+    map();
+}
+
+/* I/O 1 ($DE00-$DEFF) and I/O 2 ($DF00-$DFFF) read: the bank switched by a read, what is there */
+static u8 cart_read(u16 a)
+{
+    int io1 = a < 0xDF00;
+    switch (cart.type) {
+    case 3:                                     /* Final Cartridge III: its ROM's last 512 bytes */
+        if (cart.roml)
+            return cart.roml[a - 0xC000];
+        break;
+    case 4:                                     /* Simons' BASIC: a read of I/O 1 maps out ROMH (8K) */
+        if (io1)
+            cart_lines(0, 1);
+        break;
+    case 15:                                    /* C64 Game System: a read of I/O 1 is bank 0 */
+        if (io1)
+            cart_switch(0);
+        break;
+    case 17:                                    /* Dinamic: a read of $DE00 + n is bank n */
+        if (io1)
+            cart_switch(a & 0xFF);
+        break;
+    case 32:                                    /* EasyFlash: its RAM at I/O 2 */
+        if (!io1)
+            return cart.ram[a & 0xFF];
+        break;
+    }
+    return open_bus;
+}
+
+static void cart_write(u16 a, u8 v)
+{
+    int io1 = a < 0xDF00;
+    switch (cart.type) {
+    case 3:                                     /* Final Cartridge III: $DFFF -- bit 7 hides the register,
+                                                   5 GAME, 4 EXROM, 0-1 the 16 KB bank (6: its NMI, not done) */
+        if (a == 0xDFFF && !cart.locked) {
+            cart.locked = v >> 7;
+            cart_switch(v & 3);
+            cart_lines((v >> 4) & 1, (v >> 5) & 1);
+        }
+        break;
+    case 4:                                     /* Simons' BASIC: a write to I/O 1 maps ROMH in (16K) */
+        if (io1)
+            cart_lines(0, 0);
+        break;
+    case 5:                                     /* Ocean type 1: $DE00 bits 0-5 the bank (bit 7 always set) */
+        if (io1)
+            cart_switch(v & 0x3F);
+        break;
+    case 7:                                     /* Fun Play, Power Play: $DE00 bits 3-5 the bank's 0-2, bit 0
+                                                   its bit 3; $86 switches the cartridge off */
+        if (io1) {
+            if (v == 0x86) {
+                cart_lines(1, 1);
+            } else {
+                cart_switch(((v >> 3) & 7) | (v & 1) << 3);
+                cart_lines(0, 1);
+            }
+        }
+        break;
+    case 8:                                     /* Super Games: $DF00 bits 0-1 the 16 KB bank, bit 2 off, bit 3
+                                                   no more writes until the reset */
+        if (!io1 && !cart.locked) {
+            cart_switch(v & 3);
+            cart_lines((v >> 2) & 1, (v >> 2) & 1);
+            cart.locked = (v >> 3) & 1;
+        }
+        break;
+    case 15:                                    /* C64 Game System: a write to $DE00 + n is bank n */
+        if (io1)
+            cart_switch(a & 0xFF);
+        break;
+    case 19:                                    /* Magic Desk, Domark, HES Australia: $DE00 bits 0-6 the bank,
+                                                   bit 7 switches it off */
+        if (io1) {
+            cart_switch(v & 0x7F);
+            cart_lines(v >> 7, 1);
+        }
+        break;
+    case 32:                                    /* EasyFlash: $DE00 the bank; $DE02 bit 2 GAME from bit 0 (else
+                                                   from the boot jumper: low), bit 1 EXROM, bit 0 GAME (1: low);
+                                                   its RAM at I/O 2 (writes to the flash: not done) */
+        if (!io1)
+            cart.ram[a & 0xFF] = v;
+        else if (a & 2)
+            cart_lines(!(v & 2), (v & 4) ? !(v & 1) : 0);
+        else
+            cart_switch(v & 0x3F);
+        break;
+    case 57:                                    /* RGCD: $DE00 bits 0-2 the bank, bit 3 off until the reset */
+        if (io1 && !cart.locked) {
+            cart_switch(cart.sub == 1 ? (v & 7) ^ 7 : v & 7);
+            if (v & 8) {
+                cart.locked = 1;
+                cart_lines(1, 1);
+            }
+        }
+        break;
+    }
+}
+
+static void cart_reset(void)
+{
+    for (u32 i = 0; i < sizeof(cart.ram); i++)
+        cart.ram[i] = 0;
+    cart.locked = 0;
+    cart.lo_on = cart.hi_at = 0;
+    cart.exrom = cart.exrom0;
+    cart.game = cart.game0;
+    cart_switch(0);
+}
+
 /* $00 / $01: the port's direction and data.  The 6510 reads its port there (the RAM under it is the
    VIC's alone), so those two bytes of `ram` hold what a read of the port gives: the outputs as written,
    the inputs high -- but the cassette's motor (bit 5) and the unconnected bits 6 and 7 low */
@@ -862,15 +1096,17 @@ static void port_write(u16 a, u8 v)
     map();
 }
 
-static u8 slow_read(u16 a)                      /* $D000-$DFFF with the I/O there */
+static u8 slow_read(u16 a)                      /* $D000-$DFFF with the I/O there (or nothing there) */
 {
+    if ((a >> 12) != 0xD)
+        return open_bus;                        /* (a cartridge's Ultimax mode, or a bank it has not) */
     switch ((a >> 8) & 0x0F) {
     case 0x0: case 0x1: case 0x2: case 0x3: return vic_read(a & 0x3F);
     case 0x4: case 0x5: case 0x6: case 0x7: return sid_read(a & 0x1F);
     case 0x8: case 0x9: case 0xA: case 0xB: return (u8)((colram[a & 0x3FF] & 0x0F) | (open_bus & 0xF0));
     case 0xC: return cia_read(0, a & 0x0F);
     case 0xD: return cia_read(1, a & 0x0F);
-    default: return open_bus;                   /* (I/O 1 and 2: no cartridge) */
+    default: return cart.on ? cart_read(a) : open_bus;     /* I/O 1 and 2 */
     }
 }
 
@@ -889,7 +1125,10 @@ static void slow_write(u16 a, u8 v)             /* page 0 and the I/O */
     case 0x8: case 0x9: case 0xA: case 0xB: colram[a & 0x3FF] = v & 0x0F; break;
     case 0xC: cia_write(0, a & 0x0F, v); break;
     case 0xD: cia_write(1, a & 0x0F, v); break;
-    default: break;
+    default:
+        if (cart.on)
+            cart_write(a, v);
+        break;
     }
 }
 
@@ -2268,6 +2507,8 @@ void c64_reset(void)
     }
     wrp[0] = 0;                                 /* (the port: written the slow way) */
     stack = ram + 0x100;
+    if (cart.on)
+        cart_reset();
     port_dir = port_out = 0;
     port_write(0, 0);
     for (int n = 0; n < 2; n++) {
@@ -2464,6 +2705,108 @@ static const char *from_d64(const u8 *f, u32 size)
     return 0;
 }
 
+/* a cartridge: the .crt's header (64 bytes: "C64 CARTRIDGE   ", its length, the version, the hardware type,
+   EXROM, GAME, the revision, the name) and its CHIP packets (the length, ROM / RAM / flash, the bank, the
+   address, the size, the bytes) */
+static const char *const cart_names[] = {
+    "normal", "Action Replay", "KCS Power Cartridge", "Final Cartridge III", "Simons' BASIC", "Ocean type 1",
+    "Expert Cartridge", "Fun Play, Power Play", "Super Games", "Atomic Power", "Epyx Fastload",
+    "Westermann Learning", "Rex Utility", "Final Cartridge I", "Magic Formel", "C64 Game System, System 3",
+    "Warp Speed", "Dinamic", "Zaxxon, Super Zaxxon", "Magic Desk, Domark, HES Australia", "Super Snapshot V5",
+    "Comal-80", "Structured BASIC", "Ross", "Dela EP64", "Dela EP7x8", "Dela EP256", "Rex EP256",
+    "Mikro Assembler", "Final Cartridge Plus", "Action Replay 4", "Stardos", "EasyFlash", "EasyFlash Xbank",
+    "Capture", "Action Replay 3", "Retro Replay", "MMC64", "MMC Replay", "IDE64", "Super Snapshot V4",
+    "IEEE-488", "Game Killer", "Prophet64", "EXOS", "Freeze Frame", "Freeze Machine", "Snapshot64",
+    "Super Explode V5.0", "Magic Voice", "Action Replay 2", "MACH 5", "Diashow-Maker", "Pagefox", "Kingsoft",
+    "Silverrock 128K", "Formel 64", "RGCD", "RR-Net MK3", "EasyCalc", "GMod2", "MAX Basic", "GMod3",
+};
+
+static u32 be16(const u8 *p)
+{
+    return (u32)p[0] << 8 | p[1];
+}
+
+static const char *from_crt(const u8 *f, u32 size)
+{
+    static const u8 supported[] = {0, 3, 4, 5, 7, 8, 15, 17, 19, 32, 57};
+    u32 type = be16(f + 0x16), at = (u32)f[0x10] << 24 | (u32)f[0x11] << 16 | (u32)f[0x12] << 8 | f[0x13];
+    u32 shorts = 0, top = 0, ok = 0;
+    char *p;
+    for (u32 i = 0; i < sizeof(supported); i++)
+        ok |= type == supported[i];
+    if (!ok) {
+        p = put(info, "a cartridge of type ");
+        p = put_number(p, type);
+        if (type < sizeof(cart_names) / sizeof(cart_names[0])) {
+            p = put(p, " (");
+            p = put(p, cart_names[type]);
+            p = put(p, ")");
+        }
+        put(p, ": not supported");
+        return info;
+    }
+    for (int i = 0; i < CART_BANKS; i++)
+        cart.lo[i] = cart.hi[i] = 0;
+    cart.type = (u8)type;
+    cart.sub = f[0x1A];
+    cart.exrom0 = f[0x18] ? 1 : 0;
+    cart.game0 = f[0x19] ? 1 : 0;
+    if (type == 3)
+        cart.exrom0 = cart.game0 = 0;           /* (the Final Cartridge III starts as 16K) */
+    if (type == 32)
+        cart.exrom0 = 1, cart.game0 = 0;        /* (EasyFlash: Ultimax, its boot jumper's GAME) */
+    for (int i = 0; i < 32; i++)
+        cart.name[i] = f[0x20 + i];
+    cart.size = 0;
+    if (at < 0x40)
+        at = 0x40;
+    while (at <= size - 16 && f[at] == 'C' && f[at + 1] == 'H' && f[at + 2] == 'I' && f[at + 3] == 'P') {
+        const u8 *c = f + at;
+        u32 len = (u32)c[4] << 24 | (u32)c[5] << 16 | (u32)c[6] << 8 | c[7];
+        u32 kind_of = be16(c + 8), bank = be16(c + 10), addr = be16(c + 12), n = be16(c + 14);
+        const u8 *data = c + 16;
+        if (len < 16 + n)
+            len = 16 + n;
+        if (len > size - at)
+            len = size - at;                    /* (a damaged length: never back into the file, round 4 GB) */
+        if (at + 16 + n > size)
+            return "a .crt cartridge cut short";
+        at += len;
+        if (kind_of == 1 || !n)
+            continue;                           /* (RAM: nothing to load) */
+        if (type == 5 && addr == 0xA000)
+            bank &= 15;                         /* (Ocean's 256 KB: banks 16-31 are ROMH's 0-15) */
+        if (bank >= CART_BANKS)
+            return "a .crt cartridge with more than 128 banks";
+        if (!((addr == 0x8000 && (n == 0x4000 || n <= 0x2000)) ||
+              ((addr == 0xA000 || addr == 0xE000) && n <= 0x2000) || (addr == 0xF000 && n <= 0x1000)))
+            return "a .crt cartridge with a chip that is not at $8000, $A000 or $E000 (8 or 16 KB)";
+        if (n < 0x2000) {                       /* (repeated to 8 KB) */
+            u8 *s;
+            if (shorts == sizeof(short_chip) / sizeof(short_chip[0]))
+                return "a .crt cartridge with too many small chips";
+            s = short_chip[shorts++];
+            for (u32 i = 0; i < 0x2000; i++)
+                s[i] = data[i % n];
+            data = s;
+        }
+        if (addr == 0x8000)
+            cart.lo[bank] = data;
+        if (addr != 0x8000 || n == 0x4000)
+            cart.hi[bank] = addr == 0x8000 ? data + 0x2000 : data;
+        if (bank > top)
+            top = bank;
+        cart.size += n;
+    }
+    if (!cart.size)
+        return "a .crt cartridge with no ROM";
+    cart.mask = 0;
+    while (cart.mask < top)
+        cart.mask = (u8)(cart.mask << 1 | 1);
+    cart.on = 1;
+    return 0;
+}
+
 const char *c64_load(const u8 *kernal8k, const u8 *basic8k, const u8 *chargen4k, const u8 *file, u32 size,
                      const char *name)
 {
@@ -2496,7 +2839,18 @@ const char *c64_load(const u8 *kernal8k, const u8 *basic8k, const u8 *chargen4k,
     name_len = 0;
     for (int i = 0; i < 5; i++)
         disk_id[i] = (u8)"00 2A"[i];
-    if (file && size) {
+    cart.on = 0;
+    ultimax = 0;
+    hid_swap = 0;                               /* (F9 in the game before: this one's joystick is in port 2
+                                                   again, as its start says) */
+    if (file && size >= 0x40 && file[0] == 'C' && file[1] == '6' && file[2] == '4' && file[3] == ' ' &&
+        file[4] == 'C' && file[5] == 'A' && file[6] == 'R' && file[7] == 'T') {
+        why = from_crt(file, size);             /* (a cartridge: by its header, whatever its name) */
+        if (why) {
+            cart.on = 0;
+            return why;
+        }
+    } else if (file && size) {
         if (ends_with(name, ".t64") || (size >= 64 && file[0] == 'C' && file[1] == '6' && file[2] == '4' &&
                                         !ends_with(name, ".prg") && file[3] != 'F'))
             why = from_t64(file, size), kind = T64;
@@ -2547,7 +2901,27 @@ const char *c64_load(const u8 *kernal8k, const u8 *basic8k, const u8 *chargen4k,
         }
         break;
     default:
-        put(info, "BASIC");
+        if (!cart.on) {
+            put(info, "BASIC");
+            break;
+        }
+        p = put(info, "a cartridge (");
+        p = put(p, cart_names[cart.type]);
+        if (cart.mask) {
+            p = put(p, ", ");
+            p = put_number(p, (u32)cart.mask + 1);
+            p = put(p, " banks");
+        }
+        p = put(p, "): ");
+        {
+            int n = 0;
+            while (n < 32 && cart.name[n])
+                n++;
+            p = put_name(p, cart.name, n);
+        }
+        p = put(p, " (");
+        p = put_number(p, (cart.size + 1023) >> 10);
+        put(p, " KB)");
         break;
     }
     return 0;

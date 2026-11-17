@@ -32,6 +32,8 @@ int av_play(int argc, char **argv);
 void play_command(int argc, char **argv);       /* (the same for the command table) */
 /* 'av <status|shot <file.bmp|file.yuv>|show|off|reset>' */
 void av_command(int argc, char **argv);
+/* the picture a 'play -k' / 'av show' left on the TV (the OSD hidden under it) taken away: 1 if there was one */
+int av_dismiss(void);
 /* the explorer: is this a file 'play' takes (.ts .mpg .mpeg .m2v .m2t .vob)? */
 int av_is_video(const char *name);
 

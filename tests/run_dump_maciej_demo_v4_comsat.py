@@ -165,8 +165,9 @@ def run(args):
     out = box.command("usb")
     check("PHY settings (+0xf0, +0xf4): 0x6800355c 0x09000ff0" in out, "usb shows the PHY's settings")
     out = type_on(box, kbd, "echo Comsat{CTRL-u}echo typed\r")
-    check("echo Comsat^C" in out and "\r\ntyped\r\n" in out,
-          "Ctrl with a letter is its control code (Ctrl-U clears the line)")
+    check("echo Comsat\r\x1b[K" + PROMPT.decode() + "echo typed\r\ntyped\r\n" in out,
+          "Ctrl with a letter is its control code (Ctrl-U takes out what was typed: the line drawn again empty, "
+          "only the next one runs)")
     # the keyboard reset behind the demo's back (on the box the display set-up's stores did that):
     # it answers at address 0 only, unconfigured, until it is set up again
     kbd.address, kbd.configuration = 0, 0

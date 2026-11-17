@@ -193,12 +193,18 @@ static void disarm(void)                /* (its interrupt endpoint no longer rea
 
 void kbd_stop(void)
 {
+    int had_d = active && mode == MODE_INTERRUPT && armed && via_d;
     if (active && mode == MODE_INTERRUPT && armed)
         disarm();
     active = 0;
     armed = 0;
     repeat_key = 0;
     q_head = q_tail = 0;
+    for (int i = 0; i < 8; i++)
+        held[i] = 0;                    /* (no key of a keyboard that is gone is still held: a game asks
+                                           kbd_held) */
+    if (had_d)
+        mouse_retake_epd();             /* (endpoint D is free: a mouse that gave it up has it back) */
 }
 
 /* after SET_CONFIGURATION: the keyboard's device (its address), interface and

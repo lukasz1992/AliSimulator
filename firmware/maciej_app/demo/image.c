@@ -341,7 +341,12 @@ static const char *inflate_run(struct inflate *z, struct huff *lit, struct huff 
     static const u8 order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
     u8 lengths[320];
     int last;
+    u32 blocks = 0;
     do {
+        /* (blocks that make no output never reach emit's look at image_poll: a megabyte of empty blocks is
+           seconds of work) */
+        if (!(++blocks & 63) && !z->stop && stop_asked())
+            z->stop = 2;
         last = zbits(z, 1);
         int type = zbits(z, 2);
         if (last < 0 || type < 0)
@@ -418,6 +423,49 @@ static const char *inflate_run(struct inflate *z, struct huff *lit, struct huff 
     } while (!last && !z->stop);
     flush(z);
     return 0;
+}
+
+/* image_inflate: raw deflate data (a zip member's) into one buffer */
+struct to_buffer {
+    u8 *dst;
+    u32 cap, n;
+    int over;
+    int *stop;                          /* the inflate's: set when the buffer is full (the rest is not unpacked:
+                                           a small file can hold hundreds of megabytes) */
+};
+
+static void to_buffer(void *ctx, const u8 *p, u32 n)
+{
+    struct to_buffer *b = ctx;
+    if (b->n + n > b->cap) {
+        b->over = 1;
+        *b->stop = 1;
+        n = b->cap - b->n;
+    }
+    for (u32 i = 0; i < n; i++)
+        b->dst[b->n + i] = p[i];
+    b->n += n;
+}
+
+const char *image_inflate(const u8 *src, u32 len, u8 *dst, u32 cap, u32 *made)
+{
+    static u8 window[0x8000];
+    static struct huff lit, dist;
+    struct inflate z;
+    struct to_buffer b = {dst, cap, 0, 0, &z.stop};
+    zero(&z, sizeof(z));
+    z.in = src;
+    z.end = src + len;
+    z.window = window;
+    z.out = to_buffer;
+    z.ctx = &b;
+    const char *why = inflate_run(&z, &lit, &dist);
+    if (!why && z.stop == 2)
+        why = IMAGE_STOPPED;
+    if (!why && b.over)
+        why = "it unpacks to more than there is room for";
+    *made = b.n;
+    return why;
 }
 
 /* ======================================================================= PNG */
@@ -875,6 +923,8 @@ static const char *gif_decode(const u8 *d, u32 size, struct arena *a, image_row_
                     }
                 }
             }
+            if (y >= h)
+                break;                  /* (every row is there: more data would be decoded for nothing) */
         }
         for (u32 r = 0; r < sh; r++) {
             for (u32 c = 0; c < sw; c++) {

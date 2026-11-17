@@ -299,7 +299,8 @@ int mp2_resample(const s16 *in, int n, u32 rate, s16 *out)
             break;
         s32 a = at ? in[at - 1] : last, c = in[at];
         u32 f = phase & 0xFFFF;
-        out[k++] = (s16)(a + (((c - a) * (s32)f) >> 16));
+        out[k++] = (s16)(a + (((c - a) * (s32)(f >> 1)) >> 15));    /* (15 bits of f: 65535 x 65535 would
+                                                                       not fit in 32) */
         phase += step;
     }
     phase -= (u32)n << 16;

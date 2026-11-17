@@ -106,7 +106,11 @@ static u8 pad_now;
 static u16 dot;                         /* the picture chip's place in its line, 0..455 */
 static u8 line, ppu_mode, mode_read, stat_line, win_trig, win_line, frame_done;
 static u32 off_ticks;
+static u32 call_ticks;                  /* this gb_frame call's ticks (a program that keeps switching the picture
+                                           on and off ends neither the frame nor a frame's time of darkness) */
 static u16 screen[GB_W * GB_H];
+static u8 screen_blank;                 /* screen[] is the switched-off picture's one colour, blank_colour */
+static u16 blank_colour;
 
 static void map_banks(void)
 {
@@ -290,6 +294,7 @@ static void tile_span(u16 *out, u8 *num, int x, int end, u16 map, u8 px, u8 r)
 static void draw_line(int y)
 {
     u8 lcdc = io[LCDC];
+    screen_blank = 0;
     u8 num[GB_W];
     u16 bg[GB_W];
     u16 *out = screen + y * GB_W;
@@ -358,6 +363,7 @@ static void draw_line(int y)
 static void ppu_tick(void)
 {
     mode_read = ppu_mode;               /* (a read of STAT sees the mode a cycle late; its interrupts do not wait) */
+    call_ticks += dstep;
     if (!(io[LCDC] & 0x80)) {
         off_ticks += dstep;
         return;
@@ -421,8 +427,13 @@ static void lcd_switch(u8 was, u8 now)
             if (hdma_hblank && ppu_mode)
                 hdma_due = 1;
             u16 blank = cgb ? 0x7FFF : dmg_col[0];          /* (a switched-off screen is its lightest) */
-            for (unsigned i = 0; i < GB_W * GB_H; i++)
-                screen[i] = blank;
+            if (!screen_blank || blank != blank_colour) {   /* (not again when it is that already: a loop
+                                                               switching on and off filled it every time) */
+                for (unsigned i = 0; i < GB_W * GB_H; i++)
+                    screen[i] = blank;
+                screen_blank = 1;
+                blank_colour = blank;
+            }
         } else {
             off_ticks = 0;
             win_trig = io[WY] == 0;
@@ -1295,6 +1306,8 @@ void gb_reset(void)
         dmg_col[i] = (u16)(gb_rgb[i][0] >> 3 | (gb_rgb[i][1] >> 3) << 5 | (gb_rgb[i][2] >> 3) << 10);
     for (unsigned i = 0; i < GB_W * GB_H; i++)
         screen[i] = cgb ? 0x7FFF : dmg_col[0];
+    screen_blank = 1;
+    blank_colour = cgb ? 0x7FFF : dmg_col[0];
     for (int i = 0; i < 64; i++)
         bg_pal[i] = ob_pal[i] = 0xFF;   /* (the Color's start-up program leaves them white) */
     for (int i = 0; i < 32; i++)
@@ -1344,7 +1357,11 @@ void gb_frame(u8 pad, u16 *picture)
         io[IF] |= 0x10;                 /* a button went down */
     pad_now = pad;
     frame_done = 0;
-    while (!frame_done && !jammed) {
+    /* (a frame is 70224 ticks; one that begins with the picture switched on in mid-frame is under two.  A
+       program that keeps switching it on and off reaches neither line 144 nor a frame's time of darkness: the
+       call ends after three frames' time all the same) */
+    call_ticks = 0;
+    while (!frame_done && !jammed && call_ticks < 3 * 70224) {
         step();
         if (off_ticks >= 70224) {       /* the picture is switched off: a frame's time all the same */
             off_ticks -= 70224;

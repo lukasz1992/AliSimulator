@@ -112,7 +112,8 @@ enum { C2K, C4K, CF8, CF6, CF4, CFE, CE0, C3F, CE7, CFA };
 static struct {
     const u8 *rom;
     u32 size;
-    u8 type, superchip, banks;
+    u8 type, superchip;
+    u16 banks;                          /* (a 512 KB 3F cartridge has 256 of 2 KB) */
     u16 slow_below, slow_from;          /* (address & 0xFFF) under / from which a read is more than ROM */
     u16 hot_first, hot_last;            /* the bank switching addresses (F8 F6 F4 FA) */
     u8 bank[3];                         /* E0: the three switchable 1K slots; E7: [0] the 2K bank, [1] the RAM bank */
@@ -1605,7 +1606,7 @@ const char *a26_load(u8 *image, u32 size)
         cart.slow_from = cart.hot_first;
     if (sc)
         cart.slow_below = 0x100;
-    cart.banks = (u8)(type == C3F || type == CE7 ? size / 2048 : type == CE0 ? 8 : size / 4096);
+    cart.banks = (u16)(type == C3F || type == CE7 ? size / 2048 : type == CE0 ? 8 : size / 4096);
     char *p = text(info, names[type]);
     if (sc)
         p = text(p, " + Superchip");

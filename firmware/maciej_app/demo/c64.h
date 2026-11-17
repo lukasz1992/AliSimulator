@@ -2,7 +2,7 @@
    the two CIAs (keyboard, joysticks, timers, the VIC's bank), the SID's
    registers a program reads back (no sound), and its files: programs
    (.prg), tapes (.t64) and disks (.d64) loaded through a trap in the
-   KERNAL's LOAD.  Nothing in it knows the box: the three ROMs and a file in
+   KERNAL's LOAD, and cartridges (.crt).  Nothing in it knows the box: the three ROMs and a file in
    RAM go in, pictures of 15-bit colours come out (play.c puts them on the TV
    and reads the keys; a PC harness runs the same file). */
 #ifndef DEMO_C64_H
@@ -34,10 +34,15 @@ typedef signed int s32;
    first program), then RUN -- or SYS to its address when it does not load where BASIC programs go.  A LOAD
    from device 8 (or 1) finds the file's programs by name (* and ? as the 1541 takes them; "$" is the
    directory), so a game that loads more parts through the KERNAL loads them too.  file 0: BASIC alone.
-   0, or why it cannot run */
+   Or a cartridge (.crt, known by its header "C64 CARTRIDGE   ", whatever its name): plugged in, the
+   machine starts in it at bank 0 -- the normal 8K, 16K and Ultimax ones, Final Cartridge III, Simons'
+   BASIC, Ocean type 1, Fun Play / Power Play, Super Games, C64 Game System / System 3, Dinamic, Magic Desk
+   / Domark / HES Australia, EasyFlash (its RAM too; writes to its flash are lost) and RGCD.  The file is
+   used where it is (kept until the next c64_load).  0, or why it cannot run */
 const char *c64_load(const u8 *kernal8k, const u8 *basic8k, const u8 *chargen4k, const u8 *file, u32 size,
                      const char *name);
-void c64_reset(void);                           /* the machine as at power-on (the file typed for again) */
+void c64_reset(void);                           /* the machine as at power-on (the file typed for again; a
+                                                   cartridge at its bank 0) */
 /* one frame: C64_W x C64_H colours (0bbbbbgggggrrrrr; 0: no picture kept).  matrix[a] bit b: the key at
    the keyboard's column a (CIA 1 port A bit a, driven low to scan) and row b (port B bit b) is held --
    column 0: DEL RETURN CRSR-RIGHT F7 F1 F3 F5 CRSR-DOWN; 1: 3 W A 4 Z S E LEFT-SHIFT; 2: 5 R D 6 C F T X;
@@ -55,7 +60,8 @@ void c64_keys_from_hid(const u8 *usages, int n, u8 matrix[8]);
 void c64_type(const char *text);                /* characters to type, each pressed for a few frames (from a
                                                    serial console, where only typed characters are known) */
 int c64_typing(void);                           /* characters still to type */
-const char *c64_info(void);                     /* "a .t64 tape, 2 files: DIZZY 4+ (42 KB)" */
+const char *c64_info(void);                     /* "a .t64 tape, 2 files: DIZZY 4+ (42 KB)", "a cartridge
+                                                   (EasyFlash, 64 banks): NAME (1024 KB)" */
 u8 *c64_save_ram(u32 *size, int *battery);      /* (no cartridge RAM: size 0) */
 int c64_save_changed(void);
 u32 c64_cpu_cycles(void);                       /* 6510 cycles since the reset (985248 a second) */

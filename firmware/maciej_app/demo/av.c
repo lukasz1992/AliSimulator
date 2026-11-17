@@ -383,8 +383,8 @@ static int frames_setup(void)
     y_size = ((seq.w + 31u) & ~31u) * ((seq.h + 15u) & ~15u);
     c_size = ((seq.w + 31u) & ~31u) * (((seq.h + 31u) & ~31u) / 2);
     u32 each = y_size + c_size;
-    if (seq.w > 1920 || seq.h > 1152 || AV_FRAMES_PHYS + FRAMES * each > AV_FRAMES_END)
-        return -1;
+    if (seq.w < 16 || seq.h < 16 || seq.w > 1920 || seq.h > 1152 || AV_FRAMES_PHYS + FRAMES * each > AV_FRAMES_END)
+        return -1;                      /* (under a macroblock: a damaged header -- the scaler divides by them) */
     for (int i = 0; i < FRAMES; i++) {
         frm[i].y = AV_FRAMES_PHYS - AV_WINDOW_PHYS + (u32)i * each;
         frm[i].c = frm[i].y + y_size;
@@ -974,7 +974,10 @@ static void ts_section(const u8 *p, int n, int pid)
             int es_info = (p[i + 3] & 0x0F) << 8 | p[i + 4];
             if (!video_pid && (type == 0x01 || type == 0x02 || type == 0x1B || type == 0x10 || type == 0x24))
                 video_pid = epid, video_type = type;
-            else if (!audio_pid && (type == 0x03 || type == 0x04 || type == 0x0F || type == 0x81 || type == 0x06))
+            else if ((type == 0x03 || type == 0x04) && (!audio_pid || (audio_type != 0x03 && audio_type != 0x04)))
+                audio_pid = epid, audio_type = type;    /* (MPEG audio, the kind decoded here: before an AC-3 or
+                                                           a private stream -- teletext -- listed ahead of it) */
+            else if (!audio_pid && (type == 0x0F || type == 0x81 || type == 0x06))
                 audio_pid = epid, audio_type = type;
             i += 5 + es_info;
         }
@@ -1137,13 +1140,16 @@ static int feed(void)
 
 /* ---- sound ---- */
 static int sound_on;
-static s16 pcm[1152], pcm48[1152 * 2 + 4];
+static s16 pcm[1152], pcm48[1152 * 3 + 8];     /* (16 kHz sound: 1152 samples are 3456 at 48 kHz) */
 static u8 aframe[1800];
 
 static void sound_service(void)
 {
-    if (!sound_on)
+    if (!sound_on) {
+        aes.rd = aes.wr;                /* (not played: dropped -- kept, it would fill its buffer and want_data
+                                           would let nothing more be read: 'play -x' never ended) */
         return;
+    }
     for (int k = 0; k < 4; k++) {
         /* a frame header at the read position (else: look for one) */
         while (fifo_used(&aes) >= 4) {
@@ -1181,7 +1187,10 @@ static void sound_service(void)
 }
 
 /* ---- keys: Esc / Ctrl-C (UART, telnet, USB keyboard), the remote's EXIT end it ---- */
-static int stop_asked(void)
+static int stop_seen;                   /* one was read: every later look says so (the wait for the next frame
+                                           reads the key, the player's loop asks again after it) */
+
+static int stop_key(void)
 {
     int c;
     struct ir_event ev;
@@ -1200,6 +1209,13 @@ static int stop_asked(void)
         if (c == 3 || c == 27 || c == 'q')
             return 1;
     return 0;
+}
+
+static int stop_asked(void)
+{
+    if (!stop_seen && stop_key())
+        stop_seen = 1;
+    return stop_seen;
 }
 
 /* ---- the player ---- */
@@ -1281,10 +1297,16 @@ int av_play(int argc, char **argv)
         uprintf("usage: play [-n frames] [-x] [-k] [-v] [-q] [-1] <file.ts|.mpg|.m2v>\n");
         return -1;
     }
+    if (ftp_disk_busy() || http_disk_busy()) {      /* (disk.c has one reader: taken, their download would
+                                                       end as if the file did) */
+        uprintf("play: the FTP server or the web page is moving a file now; try again\n");
+        return -1;
+    }
     u64 size = 0;
     if (disk_stream_open(path, &size) < 0)
         return -1;
     reset_state();
+    stop_seen = 0;
     int got = disk_stream_read(chunk, sizeof(chunk));
     if (got < 4) {
         uprintf("play: %s: too short\n", path);
@@ -1321,7 +1343,12 @@ int av_play(int argc, char **argv)
     ve_reset();
     mp2_reset();
     sound_on = !fast && snd_init(0) == 0;
-    osd_was_on = gfx_enabled();
+    if (de_on)
+        de_restore();                   /* (a picture 'play -k' left: it goes; the OSD it hid is still owed --
+                                           osd_was_on stays as that play found it -- and comes back at this
+                                           one's end) */
+    else
+        osd_was_on = gfx_enabled();
     de_on = 0;
     u32 period_us = 40000;
     u64 next_show = 0;
@@ -1476,8 +1503,20 @@ int av_play(int argc, char **argv)
         if (osd_was_on)
             gfx_enable(1);
     } else if (de_on)
-        uprintf("the last picture stays on the TV ('av off' takes it away)\n");
+        uprintf("the last picture stays on the TV ('av off', Esc, Ctrl-C or the remote's EXIT takes "
+                "it away)\n");
     return failed ? -1 : 0;
+}
+
+/* a picture kept on the TV ('play -k', 'av show') hides the OSD: Esc on the USB keyboard / the remote's EXIT
+   (main.c) take it away; 1 if there was one */
+int av_dismiss(void)
+{
+    if (!de_on)
+        return 0;
+    de_restore();
+    gfx_enable(1);
+    return 1;
 }
 
 void play_command(int argc, char **argv)
@@ -1508,6 +1547,10 @@ static int write_picture(const char *path, const volatile u8 *y, const volatile 
 {
     u32 tiles = (w + 31) / 32;
     int raw = ends_with(path, ".yuv");
+    if (ftp_disk_busy() || http_disk_busy()) {      /* (disk.c's one writer is theirs) */
+        uprintf("av shot: the FTP server or the web page is moving a file now; try again\n");
+        return 0;
+    }
     if (disk_upload_open(path, 0) < 0)
         return 0;
     int ok = 1;

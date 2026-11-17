@@ -434,16 +434,17 @@ def type_on(box, kbd, text, extra=0.8, **timing):
     return box.run(kbd.type(text, **timing) + extra)
 
 
-USB_DMA_PHYS = 0x00F00400            # where the demo has the controller put a received packet (hw.h)
 SPEED_TEXT = {"low": "low speed (1.5 Mbit/s)", "full": "full speed (12 Mbit/s)", "high": "high speed (480 Mbit/s)"}
 GET_REPORT = "a101000100000800"      # the SETUP of GET_REPORT (input report, 8 bytes)
+CLEAR_HALT_81 = "0201000081000000"   # the SETUP of CLEAR_FEATURE(ENDPOINT_HALT) for endpoint 0x81: its toggle DATA0
 
 
 def check_keyboard_basics(box, kbd, label, speed="full"):
     """A just plugged-in VirtualKeyboard: enumerated, recognised, typing into the command line --
-    its reports read from its interrupt endpoint (an IN on the controller's endpoint B, received
-    into RAM by DMA)."""
+    its reports read from its interrupt endpoint, which the controller's endpoint D polls by itself
+    (the packets come out of that endpoint's FIFO; endpoints B and C send the keyboard nothing)."""
     wmark, smark, pmark = len(box.usb.writes), len(box.usb.setups), len(box.usb.interrupt_packets)
+    tokens, polls = box.usb.in_tokens, box.usb.epd_polls
     out = box.run(2.5)
     expected = ["[usb] device connected", f"USB device 1209:0002, USB 1.10, endpoint 0: 8 bytes, {SPEED_TEXT[speed]}",
                 "product: Virtual USB keyboard", "interface 0: class 03 (HID), subclass 01, protocol 01, 1 endpoints",
@@ -456,27 +457,31 @@ def check_keyboard_basics(box, kbd, label, speed="full"):
     check(kbd.protocol == 0 and kbd.idle == 0 and "210b000000000000" in setups and "210a000000000000" in setups,
           f"{label}: the boot protocol selected (SET_PROTOCOL 0), reports only on a change (SET_IDLE 0)")
     writes = [(o, s, v) for _t, o, s, v in box.usb.writes[wmark:]]
-    start = next((i for i, (o, _s, v) in enumerate(writes) if o == 0x32 and v & 0x0C == 0x0C), None)
+    start = next((i for i, (o, _s, v) in enumerate(writes) if o == 0x2B and v & 0x08), None)
     before = writes[:start] if start is not None else []
-    strobes = [v for o, _s, v in before if o == 0x60]
-    want = [(0x84, 1, 0x02), (0x16, 1, 0x84), (0x40, 4, USB_DMA_PHYS), (0x38, 1, 8), (0x68, 1, 0x80)]
-    check(start is not None and all(w in before for w in want) and strobes[-2:] == [0x20, 0x10]
-          and any(o == 0x30 and v & 0xF0 == 0x80 for o, _s, v in before)        # (bits 0..3: endpoint A's)
-          and any(o == 0x17 and v & 0x01 for o, _s, v in before),
-          f"{label}: an IN started on the controller's endpoint B as hcd_s3602_bulkin_start does: the keyboard's "
-          "address (+0x84 = 1 << 1) and endpoint 1 (+0x16 = 0x84), 8-byte packets (+0x30), the packet by DMA into "
-          f"the RAM at 0x{USB_DMA_PHYS:08x} (+0x40, +0x38 = 8, +0x68 = 0x80, the +0x60 strobes), then +0x32 bits 2 "
-          "and 3 -- after the data toggle's reset (+0x17 bit 0 pulsed)"
-          + ("" if start is not None else f": {[w for w in want if w not in before]}"))
-    check(not any(o in (0x2B, 0x31, 0x86, 0xA2) for o, _s, _v in writes),
-          f"{label}: endpoint C, the SDK's interrupt endpoint, is left alone (on a real S3811 it sends a low-speed "
-          "device nothing)")
+    want = [(0x89, 1, 0x00), (0x88, 1, 0x02), (0x22, 1, 0xC4), (0x2E, 1, 0x77), (0xA3, 1, 7)]
+    missing = [w for w in want if w not in before]
+    check(start is not None and not missing
+          and any(o == 0x31 and v & 0x70 == 0x00 for o, _s, v in before)        # (bits 0..2: endpoint C's)
+          and any(o == 0x23 and v & 0x01 for o, _s, v in before) and CLEAR_HALT_81 in setups
+          and box.usb.epd_polls > polls,
+          f"{label}: the controller's endpoint D set polling as hcd_s3602_IntInD_start does: the keyboard's "
+          "address (+0x88 = 1 << 1; no translator, +0x89 = 0) and endpoint 1 (+0x22 = 0xC4), 8-byte packets "
+          "(+0x31 bits 4..6), flags 3 enabled (+0x2E = 0x77), a token every 8 ms for the endpoint's 10 (+0xA3 = "
+          "7), then +0x2B bit 3 -- after both data toggles were put to DATA0 (CLEAR_FEATURE(ENDPOINT_HALT), +0x23 "
+          "bit 0 pulsed)" + (f": {missing}" if missing else ""))
+    check(box.usb.in_tokens == tokens
+          and not any((o == 0x2B and v & 0x20) or o in (0x86, 0x87, 0xA2) for o, _s, v in writes),
+          f"{label}: endpoints B and C are left alone: no IN token from endpoint B, and endpoint C -- the SDK's "
+          "interrupt endpoint -- never set polling (+0x2B bit 5, +0x86, +0xA2; on a real S3811 it sends a "
+          "low-speed device nothing)")
     out = type_on(box, kbd, "ping\r")
     setups = [p.hex() for _t, p in box.usb.setups[smark:]]
     reports = len(box.usb.interrupt_packets) - pmark
-    check("ping\r\npong v4" in out and reports == 10 and GET_REPORT not in setups and box.usb.toggle_drops == 0,
+    check("ping\r\npong v4" in out and reports == 10 and GET_REPORT not in setups and box.usb.toggle_drops == 0
+          and box.usb.in_tokens == tokens,
           f"{label}: ping typed on the keyboard -> pong v4, from its interrupt endpoint ({reports} reports: five "
-          "keys down and up; no GET_REPORT, none dropped for its data toggle)")
+          "keys down and up, each out of endpoint D's FIFO; no GET_REPORT, none dropped for its data toggle)")
 
 
 def check_hub(box):
@@ -527,9 +532,10 @@ def check_hub(box):
     wmark, drops = len(box.usb.writes), box.usb.toggle_drops
     out = type_on(box, kbd, "ping\r")
     writes = [(o, v) for _t, o, _s, v in box.usb.writes[wmark:]]
-    check("ping\r\npong v4" in out and (0x84, 0x09) in writes and (0x85, 0x61) in writes and box.usb.toggle_drops == drops,
-          "ping typed on the keyboard behind the hub -> pong v4: the IN on endpoint B goes through the translator "
-          "too (+0x84 = 4 << 1 | 1, +0x85 = 0x61)")
+    check("ping\r\npong v4" in out and (0x88, 0x09) in writes and (0x89, 0x61) in writes
+          and (0x84, 0x09) not in writes and box.usb.toggle_drops == drops,
+          "ping typed on the keyboard behind the hub -> pong v4: endpoint D's tokens go through the translator "
+          "too (+0x88 = 4 << 1 | 1, +0x89 = 0x61); endpoint B is never aimed at the keyboard")
     box.command("testscreen")
     rgb = box.screen("v4_usb_hub_screen.png", "a USB hub with a keyboard, a stick and a second hub")
     label = np.abs(rgb[590:606] - shown(150, 190, 255)).sum(axis=2) < 30
@@ -556,8 +562,9 @@ def check_hub(box):
     wmark = len(box.usb.writes)
     out = type_on(box, kbd2, "ping\r")
     writes = [(o, v) for _t, o, _s, v in box.usb.writes[wmark:]]
-    check("ping\r\npong v4" in out and (0x84, 0x0B) in writes and (0x85, 0x11) in writes,
-          "and types: a full-speed device through the translator (+0x85 = 0x11: port 2, hub 1, not low speed)")
+    check("ping\r\npong v4" in out and (0x88, 0x0B) in writes and (0x89, 0x11) in writes,
+          "and types: a full-speed device through the translator (endpoint D's +0x88 = 5 << 1 | 1, +0x89 = 0x11: "
+          "port 2, hub 1, not low speed)")
     # the low-speed keyboard into the second hub: that hub's translator
     hub2.plug(2, kbd, "low")
     out = box.run(6.0)
@@ -570,8 +577,9 @@ def check_hub(box):
     out += type_on(box, kbd, "ping\r")
     writes = [(o, v) for _t, o, _s, v in box.usb.writes[wmark:]]
     check("[usb] hub 1 port 2: device removed (1209:0002 Virtual USB keyboard)" in out and "ping\r\npong v4" in out
-          and (0x85, 0x52) in writes,
-          "with the other keyboard unplugged it types from behind both hubs (+0x85 = 0x52: low speed, port 2, hub 2)")
+          and (0x88, 0x09) in writes and (0x89, 0x52) in writes,
+          "with the other keyboard unplugged it types from behind both hubs (endpoint D's +0x89 = 0x52: low speed, "
+          "port 2, hub 2)")
     # the second hub unplugged: it and what was behind it are gone
     hub.unplug(1)
     out = box.run(6.0)
@@ -613,8 +621,9 @@ def check_disks(box):
     other), a card reader with a FAT16 card (TEST UNIT READY first answered 'the medium may have
     changed', as the real one's), a full-speed FAT12 stick without a partition table (a sector in
     eight 64-byte packets), and the keyboard -- 'disks', 'ls', 'cat', 'sector' on each, the keyboard
-    typing between them (endpoint B shared: both data toggles kept in step), a card reader without
-    a card, a stick pulled out."""
+    typing between them (it has endpoint D; the disks share endpoints A and B, whose data toggles are
+    put in step with each disk's before its command), a card reader without a card, a stick pulled
+    out."""
     import fat_image
     stick = VirtualStick(fat_image.build(DISK_FILES, fat=32, size_mb=40, label="STICK32",
                                          fragmented=("Docs/A long file name.txt",)))
@@ -736,10 +745,11 @@ def pointer_at(box):
 
 def check_mouse(box):
     """A USB mouse as on the real box: a low-speed mouse on the second hub's port 4, the low-speed
-    keyboard on the first hub's port 4, a stick on the second hub -- the mouse's interrupt endpoint
-    polled by the controller's endpoint D (the SDK's hcd_s3602_IntInD_start), so the keyboard keeps
-    endpoint B: the pointer on the TV moves, the buttons click and paint, the wheel turns, while the
-    keyboard types and the stick's transfers come and go -- none of them disturbs another."""
+    keyboard on the first hub's port 4, a stick on the second hub -- the keyboard's interrupt endpoint
+    polled by the controller's endpoint D (the SDK's hcd_s3602_IntInD_start: a keyboard gets it first,
+    a report it lost would be a key that repeats), so the mouse's is read through endpoint B, one IN
+    at a time: the pointer on the TV moves, the buttons click and paint, the wheel turns, while the
+    keyboard types and the stick's transfers come and go -- none of them loses anything here."""
     import fat_image
     hub, hub2 = VirtualHub(4), VirtualHub(4)
     mouse = VirtualMouse()
@@ -750,7 +760,7 @@ def check_mouse(box):
     hub2.plug(4, mouse, "low")
     hub.plug(4, kbd, "low")
     box.command("testscreen")                                # (the pointer paints on the test screen)
-    wmark, smark, drops = len(box.usb.writes), len(box.usb.setups), box.usb.toggle_drops
+    wmark, drops, polls = len(box.usb.writes), box.usb.toggle_drops, box.usb.epd_polls
     box.usb.attach("high", hub)
     out = box.run(12.0)
     expected = ["USB device 1209:0004, USB 1.10, endpoint 0: 8 bytes, low speed (1.5 Mbit/s)",
@@ -765,28 +775,34 @@ def check_mouse(box):
           "a mouse behind the second hub (as on the box), with a keyboard and a stick: enumerated, recognised as a "
           f"boot mouse, the boot protocol selected and reports only on a change (SET_IDLE 0){missing or ''}")
     writes = [(o, v) for _t, o, _s, v in box.usb.writes[wmark:]]
-    setups = [p.hex() for _t, p in box.usb.setups[smark:]]
-    want = [(0x89, 0x62), (0x88, 0x09), (0x22, 0xC4), (0x2E, 0x77), (0xA3, 7)]
-    check(all(w in writes for w in want) and any(o == 0x2B and v & 0x08 for o, v in writes)
-          and any(o == 0x23 and v & 0x01 for o, v in writes) and "0201000081000000" in setups
-          and box.usb.epd_polls > 0,
-          "its endpoint polled by the controller's endpoint D as hcd_s3602_IntInD_start sets it up: the mouse "
-          "through hub 2's translator (+0x89 = 0x62: low speed, port 4, hub 2; +0x88 = 4 << 1 | 1), interrupt "
-          "endpoint 1 (+0x22 = 0xC4), flags 3 enabled (+0x2E = 0x77), every 8 ms (+0xA3 = 7 for its 10 ms), +0x2B "
-          "bit 3 -- both data toggles DATA0 first (CLEAR_FEATURE(ENDPOINT_HALT), +0x23 bit 0 pulsed)"
-          + ("" if all(w in writes for w in want) else f": {[w for w in want if w not in writes]}"))
+    want = [(0x89, 0x61), (0x88, 0x0B), (0x22, 0xC4), (0x2E, 0x77), (0xA3, 7),      # endpoint D: the keyboard
+            (0x85, 0x62), (0x84, 0x09), (0x16, 0x84)]                              # endpoint B: the mouse
+    missing = [w for w in want if w not in writes]
+    check(not missing and any(o == 0x2B and v & 0x08 for o, v in writes) and (0x88, 0x09) not in writes
+          and any(o == 0x23 and v & 0x01 for o, v in writes) and getattr(kbd, "halt_clears", 0) >= 1
+          and any(o == 0x17 and v & 0x01 for o, v in writes) and not getattr(mouse, "halt_clears", 0)
+          and box.usb.epd_polls > polls,
+          "the keyboard has the controller's endpoint D, set up as hcd_s3602_IntInD_start does and through hub 1's "
+          "translator (+0x89 = 0x61: low speed, port 4, hub 1; +0x88 = 5 << 1 | 1), interrupt endpoint 1 (+0x22 = "
+          "0xC4), flags 3 enabled (+0x2E = 0x77), every 8 ms (+0xA3 = 7 for its 10 ms), +0x2B bit 3, both its data "
+          "toggles DATA0 first (CLEAR_FEATURE(ENDPOINT_HALT), +0x23 bit 0 pulsed) -- so the mouse is read through "
+          "endpoint B's IN, through hub 2's translator (+0x85 = 0x62: low speed, port 4, hub 2; +0x84 = 4 << 1 | 1; "
+          "endpoint 1, +0x16 = 0x84), endpoint D never aimed at it; its toggle is DATA0 since its configuration (no "
+          "CLEAR_FEATURE to it), endpoint B's put there (+0x17 bit 0 pulsed)"
+          + (f": {missing}" if missing else ""))
     check(pointer_at(box) == (640, 360) and fb_pixel(box.sim, 640, 360) == rgb555(0, 0, 0)
           and fb_pixel(box.sim, 641, 362) == rgb555(255, 255, 255),
           "the pointer (a black and white arrow) is drawn in the middle of the TV picture")
-    polls = box.usb.epd_polls
+    tokens = box.usb.in_tokens
     box.run(mouse.move(60, 30, over=0.6) + 0.5)
     writes = [(o, v) for _t, o, _s, v in box.usb.writes[wmark:]]
+    tokens = box.usb.in_tokens - tokens
     check(pointer_at(box) == (700, 390) and fb_pixel(box.sim, 700, 390) == rgb555(0, 0, 0)
-          and fb_pixel(box.sim, 641, 362) != rgb555(255, 255, 255) and (0x84, 0x09) not in writes
-          and box.usb.toggle_drops == drops and box.usb.epd_polls - polls >= 60,
+          and fb_pixel(box.sim, 641, 362) != rgb555(255, 255, 255) and (0x88, 0x09) not in writes
+          and box.usb.toggle_drops == drops and tokens >= 60,
           "the mouse moved by (60, 30): the pointer follows to 700,390 (the picture under its old place put back), "
-          f"every report through endpoint D ({box.usb.epd_polls - polls} polls in 1.1 s; endpoint B never aimed at "
-          "the mouse, nothing dropped)")
+          f"every report through endpoint B's IN ({tokens} tokens in 1.1 s: asked again every millisecond while the "
+          "mouse has nothing to say; endpoint D never aimed at the mouse, nothing dropped)")
     mouse.click(1)
     out = box.run(0.7)
     check("[usb] mouse: left down at 700,390" in out and "[usb] mouse: left up at 700,390" in out,
@@ -811,18 +827,21 @@ def check_mouse(box):
           "the right button picks the next paint colour (red); the wheel is told")
     status = box.command("usb mouse")
     check("mouse: device 4, interface 0, interrupt endpoint 81 (8 bytes, every 10 ms)" in status
-          and "read through endpoint D, polled every 8.0 ms;" in status and " 0 dropped for their data toggle" in status
+          and "read through endpoint B, which disk and network transfers share (endpoint D polls device 5); 0 reports "
+              "dropped for their data toggle" in status
           and "pointer at 740,390, buttons 00, wheel 2; paint colour red" in status,
-          "usb mouse: the device, read through endpoint D every 8 ms, the pointer, the buttons, the wheel, the colour")
-    # the keyboard types on endpoint B while the mouse moves on endpoint D
+          "usb mouse: the device, read through endpoint B (endpoint D polls device 5, the keyboard), the pointer, the "
+          "buttons, the wheel, the colour")
+    # the keyboard types on endpoint D while the mouse moves on endpoint B
     mouse.move(-100, -50, over=2.0)
     out = type_on(box, kbd, "ping\r", extra=1.5)
     status = box.command("usb kbd")
     check("ping\r\npong v4" in out and pointer_at(box) == (640, 340) and box.usb.toggle_drops == drops
-          and "(an IN pending on the controller's endpoint B)" in status,
-          "typing while the mouse moves: the keyboard keeps endpoint B to itself (no turns), every key and every "
+          and "through the controller's endpoint D (it polls by itself, every 8000 us); 0 reports dropped" in status
+          and " 0 errors" in status,
+          "typing while the mouse moves: the keyboard on endpoint D, the mouse on endpoint B, every key and every "
           "movement arrives (pointer at 640,340), nothing dropped")
-    # a disk's transfers on endpoints A and B meanwhile: endpoint D carries on
+    # a disk's transfers on endpoints A and B meanwhile: they end the mouse's IN, which starts again after them
     mouse.move(30, 0, over=0.8)
     out = box.command("ls 3:", timeout=60) + box.command("cat 3:/mouse.txt", timeout=60)
     box.run(1.5)
@@ -831,19 +850,21 @@ def check_mouse(box):
     check("MOUSE.TXT" in out and "squeak\r\n" in out and 670 <= x <= 700 and y == 340 and not stalled
           and box.usb.toggle_drops == drops,
           f"ls and cat on the stick while the mouse moves: both work, the movement arrives (pointer at {x},{y}: "
-          "reports wait in endpoint D's FIFO while a command runs), nothing dropped")
-    # unplugged: the pointer goes, endpoint D stops; plugged in again: it comes back in the middle
-    wmark = len(box.usb.writes)
+          "what the mouse could not report while a command ran it reports afterwards), nothing dropped")
+    # unplugged: the pointer goes, endpoint B's IN ends -- endpoint D polls the keyboard on; plugged in again:
+    # it comes back in the middle
+    wmark, tokens, polls = len(box.usb.writes), box.usb.in_tokens, box.usb.epd_polls
     hub2.unplug(4)
     out = box.run(3.0)
     after = [(o, v) for _t, o, _s, v in box.usb.writes[wmark:]]
-    last_a3 = [v for o, v in after if o == 0xA3]
-    last_2b = [v for o, v in after if o == 0x2B]
+    tokens = box.usb.in_tokens - tokens
     check("[usb] hub 2 port 4: device removed (1209:0004 Virtual USB mouse)" in out and "mouse:" not in out
           and "no USB mouse" in box.command("usb mouse") and fb_pixel(box.sim, x + 1, y + 2) != rgb555(255, 255, 255)
-          and last_a3[-1:] == [0] and last_2b and not last_2b[-1] & 0x08,
-          "the mouse unplugged: removed without an error line, the pointer gone, endpoint D stopped (+0xA3 = 0, "
-          "+0x2B bit 3 cleared)")
+          and any(o == 0x17 and v & 0x10 for o, v in after) and tokens <= 3
+          and mmio(box.sim, 0x320A3, 1) == 7 and mmio(box.sim, 0x3202B, 1) & 0x08 and box.usb.epd_polls - polls > 300,
+          "the mouse unplugged: removed without an error line, the pointer gone, endpoint B's IN ended (its FIFO "
+          f"reset, +0x17 bit 4; {tokens} more of its tokens) -- and endpoint D polls the keyboard on (+0xA3 = 7, "
+          "+0x2B bit 3 still set)")
     mouse2 = VirtualMouse()
     hub2.plug(4, mouse2, "low")
     out = box.run(6.0)
@@ -899,9 +920,11 @@ def check_many_devices(box):
     box.run(mouse.move(30, 0, over=0.3) + 0.5)
     writes = [(o, v) for _t, o, _s, v in box.usb.writes[wmark:]]
     out = type_on(box, kbd2, "ping\r")
-    check((0x88, 0x11) in writes and pointer_at(box) == (670, 360) and "ping\r\npong v4" in out,
-          "the mouse at address 8 is polled by endpoint D (+0x88 = 8 << 1 | 1) and moves the pointer; the first "
-          "keyboard types")
+    check((0x84, 0x11) in writes and (0x85, 0x59) in writes and (0x88, 0x09) in writes and (0x89, 0x12) in writes
+          and (0x88, 0x11) not in writes and pointer_at(box) == (670, 360) and "ping\r\npong v4" in out,
+          "the mouse at address 8 is read through endpoint B (+0x84 = 8 << 1 | 1, +0x85 = 0x59: low speed, port 3, "
+          "hub 1) and moves the pointer; the first keyboard, which endpoint D polls (+0x88 = 4 << 1 | 1, +0x89 = "
+          "0x12: port 2, hub 2, not low speed), types")
     box.usb.detach()
     box.run(0.6)
 
@@ -1303,6 +1326,57 @@ def check_dos(box):
           and hue(held[0]) == "blue" and set(sides) == {rgb555(0, 0, 0)},
           "dos: a .com made here runs: the picture red over 960 x 600 in the middle of the screen, black around "
           f"it; blue while Space (the pad's B) is held {[hex(v) for v in plain + held + sides]}")
+    box.usb.detach()
+    box.run(0.6)
+
+
+def tiny_md_cartridge():
+    """A 1 KB Mega Drive cartridge made here: its header ("SEGA MEGA DRIVE", the regions JUE), its reset going to
+    0x200: the VDP's picture on (mode 5, H40), the background colour (CRAM 0) red over the whole picture (every
+    tile is tile 0: transparent), then it waits for the pad's B (TH high, bit 4: the player's A, X on the
+    keyboard) and makes it blue."""
+    rom = bytearray(0x400)
+    rom[0:8] = bytes.fromhex("00FFFE00 00000200")             # the stack, the reset's PC
+    rom[0x100:0x110] = b"SEGA MEGA DRIVE "
+    rom[0x120:0x150] = rom[0x150:0x180] = b"ALI TEST".ljust(48)
+    rom[0x1F0:0x200] = b"JUE".ljust(16)
+    code = bytes.fromhex(
+        "41F9 00C00004"                         # lea $C00004,a0 (the VDP's control port)
+        "30BC 8144 30BC 8C81 30BC 8700"         # registers 1 = 0x44 (picture on), 12 = 0x81 (H40), 7 = 0
+        "20BC C0000000 317C 000E FFFC"          # CRAM 0 = 0x00E: red
+        "13FC 0040 00A10009 13FC 0040 00A10003"     # wait: TH an output, high
+        "0839 0004 00A10003 66E6"               # btst #4,$A10003 (B, 0 pressed); bne wait
+        "20BC C0000000 317C 0E00 FFFC 60FE")    # CRAM 0 = 0xE00: blue; bra *
+    rom[0x200:0x200 + len(code)] = code
+    return bytes(rom)
+
+
+def check_md(box):
+    """The Mega Drive player ('megadrive'): a cartridge made here (tiny_md_cartridge) -- its 320 x 224 picture
+    three times as large (960 x 672) in the middle of the screen, red; blue with the pad's B (the player's A)
+    held by a test script."""
+    import fat_image
+    stick = VirtualStick(fat_image.build({"MD/T.MD": tiny_md_cartridge()}, fat=12, size_mb=1, partition=False))
+    box.usb.attach("high", stick)
+    box.run(4.0)
+    sim = box.sim
+    seen = []
+    for script in ("", "-k 0:01 "):
+        out = box.keys(f"megadrive {script}1:/MD/T.MD\r".encode(), until=b"Esc ends", timeout=30)
+        box.run(1.0)
+        inside = [fb_pixel(sim, x, y) for x, y in ((160, 24), (640, 360), (1119, 695))]
+        outside = [fb_pixel(sim, x, y) for x, y in ((159, 360), (1120, 360), (640, 23), (640, 696))]
+        seen.append((inside, outside, out))
+        box.keys(b"\x03", timeout=10)
+
+    def hue(v):
+        r, b = (v >> 10) & 31, v & 31
+        return "red" if r > b + 8 else "blue" if b > r + 8 else ""
+    (plain, sides, out), (held, _, _) = seen
+    check("ALI TEST, ROM 1 KB, NTSC (U)" in out and len(set(plain)) == 1 and hue(plain[0]) == "red"
+          and len(set(held)) == 1 and hue(held[0]) == "blue" and set(sides) == {rgb555(0, 0, 0)},
+          "megadrive: a cartridge made here runs: the picture red over 960 x 672 in the middle of the screen, "
+          f"black around it; blue while the pad's B is held {[hex(v) for v in plain + held + sides]}")
     box.usb.detach()
     box.run(0.6)
 
@@ -2113,17 +2187,20 @@ def run(args):
           "and the USB box names the keyboard ('Keyboard 1209:0002 Virtual USB keyboard')")
     type_on(box, kbd, "{ESC}")
     out = box.command("usb kbd")
-    check("read from its interrupt endpoint (an IN pending on the controller's endpoint B)" in out
+    check("read from its interrupt endpoint through the controller's endpoint D (it polls by itself, every 8000 us); "
+          "0 reports dropped for their data toggle" in out
           and " 0 errors" in out and "interface 0, interrupt endpoint 81 (8 bytes, every 10 ms)" in out,
-          "usb kbd: the keyboard read from its interrupt endpoint, no errors")
-    tokens = box.usb.in_tokens
+          "usb kbd: the keyboard read from its interrupt endpoint through endpoint D, no errors")
+    tokens, polls = box.usb.in_tokens, box.usb.epd_polls
     box.run(1.0)
-    polls = box.usb.in_tokens - tokens
-    check(900 <= polls <= 1100, f"while no key changes the controller asks again every millisecond ({polls} IN tokens "
-                                "in 1 s: +0xA8 = 1, one per frame)")
+    polls = box.usb.epd_polls - polls
+    check(115 <= polls <= 135 and box.usb.in_tokens == tokens,
+          f"while no key changes endpoint D asks again every 8 ms ({polls} IN tokens in 1 s: +0xA3 = 7, one every "
+          "2^6 microframes), endpoint B not at all")
     out = box.command("usb ctl 0x80 6 0x0100 0 18")
     check("18 bytes:" in out and "12 01 10 01 00 00 00 08 09 12 02 00" in out,
-          "a control request goes through while the IN is pending (usb ctl: GET_DESCRIPTOR, the device's 18 bytes)")
+          "a control request goes through while endpoint D polls the keyboard (usb ctl: GET_DESCRIPTOR, the device's "
+          "18 bytes)")
     smark = len(box.usb.setups)
     out = box.command("usb kbd report")
     check("read with GET_REPORT over endpoint 0 every 16 ms" in out, "usb kbd report: GET_REPORT over endpoint 0 instead")
@@ -2144,7 +2221,7 @@ def run(args):
     box.usb.detach()
     out = box.run(0.6)
     check("[usb] device removed" in out and "keyboard:" not in out and "no USB keyboard" in box.command("usb kbd"),
-          "unplugged with the IN pending: the keyboard is gone, without an error line")
+          "unplugged while endpoint D polls it: the keyboard is gone, without an error line")
     # a full-speed keyboard whose GET_REPORT carries its keys: both ways of reading it type
     kbd = VirtualKeyboard()
     box.usb.attach("full", kbd)
@@ -2209,6 +2286,7 @@ def run(args):
     check_c64(box)
     check_amiga(box)
     check_dos(box)
+    check_md(box)
     check_play(box)
 
     # ---- a shell on the USB disks: cd, mkdir, rm, ... ------------------------------

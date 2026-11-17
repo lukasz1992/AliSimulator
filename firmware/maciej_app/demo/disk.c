@@ -627,7 +627,10 @@ static void mount(struct disk *k, struct volume *v)
         return;
     }
     v->clusters = (total - meta) / v->spc;
-    v->fat = v->clusters < 4085 ? 12 : v->clusters < 65525 ? 16 : 32;
+    /* (FAT32 as it is laid out -- its FAT's size in the 32-bit field, no fixed root -- whatever its cluster
+       count: mkfs.fat -F 32 makes volumes under 65525 clusters, which Windows and Linux read as FAT32; by the
+       count alone they were FAT16 with an empty root) */
+    v->fat = (!le16(b + 22) && !root_entries) ? 32 : v->clusters < 4085 ? 12 : v->clusters < 65525 ? 16 : 32;
     v->root_cluster = v->fat == 32 ? le32(b + 44) : 0;
     v->fats = (u8)fats;
     v->fat_size = fat_size;
@@ -1687,6 +1690,10 @@ static int dir_walk(struct disk *k, const struct volume *v, u32 cluster, u32 dir
     e.size_hi = 0;
     if (!cluster && v->fat == 32)
         cluster = v->root_cluster;
+    if (cluster && (cluster < 2 || cluster >= v->clusters + 2)) {
+        fail_why = "a directory's first cluster is outside the volume (a damaged entry)";
+        return -1;
+    }
     for (;;) {
         u32 lba;
         if (!cluster) {
@@ -1714,6 +1721,11 @@ static int dir_walk(struct disk *k, const struct volume *v, u32 cluster, u32 dir
             }
             if ((d[11] & 0x3F) == 0x0F) {   /* a part of a long name (they come last part first) */
                 u8 seq = d[0] & 0x1F;
+                if (!seq) {                 /* (no part has number 0: its 13 characters would go in front of
+                                               the name's buffer) */
+                    long_ok = 0;
+                    continue;
+                }
                 if (d[0] & 0x40) {
                     long_ok = seq >= 1;
                     sum = d[13];
@@ -1880,7 +1892,7 @@ static int walk_path(struct disk *k, const struct volume *v, u32 dir, const char
 {
     static struct find f;
     char p[PATH_MAX];
-    int plen = 0;
+    int plen = 0, over = 0;             /* (over: the path's text is longer than p[] holds) */
     for (; from[plen] && plen < PATH_MAX - 1; plen++)
         p[plen] = from[plen];
     p[plen] = 0;
@@ -1950,16 +1962,25 @@ static int walk_path(struct disk *k, const struct volume *v, u32 dir, const char
             if (plen > 1)
                 plen--;
             p[plen] = 0;
+        } else if (plen + (plen > 1) + path_len(out->name) > PATH_MAX - 1) {
+            over = 1;
         } else {
-            if (plen > 1 && plen < PATH_MAX - 1)
+            if (plen > 1)
                 p[plen++] = '/';
-            for (const char *s = out->name; *s && plen < PATH_MAX - 1; s++)
+            for (const char *s = out->name; *s; s++)
                 p[plen++] = *s;
             p[plen] = 0;
         }
         path += len;
     }
     if (out_path) {
+        /* (cut to fit, the text named a directory above the one reached: 'cd' showed -- and the explorer
+           deleted in -- the wrong one, a new file went into it) */
+        if (over) {
+            if (!quiet)
+                uprintf("the path is too long: %u characters at most after the volume\n", PATH_MAX - 1);
+            return -1;
+        }
         for (int i = 0; i <= plen; i++)
             out_path[i] = p[i];
     }
@@ -2481,10 +2502,27 @@ void disk_sector(const char *arg)
    its '.' and '..' before its entry links it in, and an entry is deleted
    before its clusters are freed (cut off half way, a volume keeps at most a
    lost cluster); a FAT32 volume's FSInfo counts are made unknown at its
-   first change (the next system to mount it counts again).  The box has no
-   clock: what is made is dated FAT_DATE / FAT_TIME. */
+   first change (the next system to mount it counts again).  What is made
+   is dated by the clock once NTP set it (net.c), in Polish time as FAT
+   keeps local time; until then FAT_DATE / FAT_TIME. */
 #define FAT_DATE ((u16)(((2026 - 1980) << 9) | (11 << 5) | 13))   /* 2026-11-13 */
 #define FAT_TIME ((u16)(12 << 11))                                 /* 12:00 */
+
+static void fat_stamp(u16 *date, u16 *time)
+{
+    u32 t = net_clock_utc(), y, m, d;
+    *date = FAT_DATE;
+    *time = FAT_TIME;
+    if (!t)
+        return;
+    t += summer_time(t) ? 7200 : 3600;
+    civil(t / 86400, &y, &m, &d);
+    if (y < 1980 || y > 2107)
+        return;
+    u32 s = t % 86400;
+    *date = (u16)((y - 1980) << 9 | m << 5 | d);
+    *time = (u16)((s / 3600) << 11 | (s / 60 % 60) << 5 | (s % 60) / 2);
+}
 
 static u8 wbuf[SECTOR], wbuf2[SECTOR];  /* sectors being changed */
 static u8 zeros[8 * SECTOR];
@@ -2696,6 +2734,9 @@ static int dir_iter_next(struct disk *k, const struct volume *v, struct dir_iter
         *lba = v->root_start + it->index++;
         return 1;
     }
+    if (it->cluster < 2 || it->cluster >= v->clusters + 2)
+        return -1;                      /* (a damaged entry's first cluster: its "sectors" are the FAT's own or
+                                           another volume's -- nothing is written through it) */
     if (it->index && !(it->index % v->spc)) {
         u32 n;
         if (fat_get(k, v, it->cluster, &n) < 0)
@@ -2865,61 +2906,77 @@ static int short_form(const char *name, u8 *sfn, u8 *nt)
     return ok;
 }
 
-/* "BASE.EXT" of an 8.3 name */
-static void sfn_text(const u8 *sfn, char *out)
+/* the "~n" tails a directory's 8.3 names have that begin as `sfn` does and end in its extension: the
+   highest n.  ("IMG_2026" gives IMG_20~1 .. IMG_20~9, IMG_2~10 .. IMG_2~99, IMG_~100 ...: the part before
+   the tail is as much of the base as the tail leaves of its eight characters) */
+struct tails {
+    const u8 *sfn;                      /* the name wanted: 11 characters, no tail */
+    int base;                           /* its base's length */
+    u32 highest;
+};
+
+static int tail_fn(const struct entry *e, void *ctx)
 {
-    int n = 0;
-    for (int i = 0; i < 8 && sfn[i] != ' '; i++)
-        out[n++] = (char)sfn[i];
-    if (sfn[8] != ' ') {
-        out[n++] = '.';
-        for (int i = 8; i < 11 && sfn[i] != ' '; i++)
-            out[n++] = (char)sfn[i];
+    struct tails *t = ctx;
+    const char *s = e->short_name;
+    int n = 0, tilde = -1;
+    for (; s[n] && s[n] != '.'; n++)
+        if (s[n] == '~')
+            tilde = n;
+    if (tilde < 1 || tilde == n - 1)
+        return 0;
+    u32 v = 0;
+    for (int i = tilde + 1; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9')
+            return 0;
+        v = v * 10 + (u32)(s[i] - '0');
     }
-    out[n] = 0;
+    int keep = 7 - (n - tilde - 1) < t->base ? 7 - (n - tilde - 1) : t->base;
+    if (tilde != keep)
+        return 0;
+    for (int i = 0; i < keep; i++)
+        if ((u8)s[i] != t->sfn[i])
+            return 0;
+    const char *x = s[n] == '.' ? s + n + 1 : "";
+    for (int i = 0; i < 3; i++)
+        if ((u8)(*x ? *x++ : ' ') != t->sfn[8 + i])
+            return 0;
+    if (!*x && v > t->highest)
+        t->highest = v;
+    return 0;
 }
 
 /* the slots of a new entry `name` (attribute, first cluster, size) for
    directory `dir`: its long name's parts when it needs them (the last
-   first), then the 8.3 entry -- "BASIS~n" with an n no entry there has.
-   Their number; -1 (said why) */
+   first), then the 8.3 entry -- "BASIS~n", n one more than the highest
+   such name there has.  Their number; -1 (said why) */
 static int make_entry(struct disk *k, const struct volume *v, u32 dir, const char *name, u8 attr, u32 cluster,
                       u32 size, u8 (*ents)[32])
 {
-    static struct find f;
     u8 sfn[11], nt;
     int n = 0, len = path_len(name);
     int fits = short_form(name, sfn, &nt);
     if (!fits) {
-        int base = 0, found = 0;
+        /* (one walk for the highest tail there is.  It was a walk for each of ~1 .. ~99 until one was free:
+           the hundredth photo of a camera's folder -- IMG_2026... -- was refused, the 99th cost 99 walks) */
+        int base = 0;
         while (base < 8 && sfn[base] != ' ')
             base++;
-        for (int t = 1; t < 100 && !found; t++) {
-            u8 try[11];
-            char tail[4], cand[13];
-            int tl = usnprintf(tail, sizeof(tail), "~%d", t), keep = 8 - tl < base ? 8 - tl : base;
-            for (int i = 0; i < 11; i++)
-                try[i] = sfn[i];
-            for (int i = 0; i < tl; i++)
-                try[keep + i] = (u8)tail[i];
-            for (int i = keep + tl; i < 8; i++)
-                try[i] = ' ';
-            sfn_text(try, cand);
-            int r = find_in(k, v, dir, NO_SEQ, cand, path_len(cand), &f);
-            if (r < 0) {
-                uprintf("a sector did not read: %s\n", io_error());
-                return -1;
-            }
-            if (!r) {
-                for (int i = 0; i < 11; i++)
-                    sfn[i] = try[i];
-                found = 1;
-            }
+        struct tails tails = {sfn, base, 0};
+        if (dir_walk(k, v, dir, NO_SEQ, tail_fn, &tails) < 0) {
+            uprintf("a sector did not read: %s\n", io_error());
+            return -1;
         }
-        if (!found) {
+        if (tails.highest >= 999999) {
             uprintf("no 8.3 name left for '%s'\n", name);
             return -1;
         }
+        char tail[8];
+        int tl = usnprintf(tail, sizeof(tail), "~%u", tails.highest + 1), keep = 8 - tl < base ? 8 - tl : base;
+        for (int i = 0; i < tl; i++)
+            sfn[keep + i] = (u8)tail[i];
+        for (int i = keep + tl; i < 8; i++)
+            sfn[i] = ' ';
         int parts = (len + 12) / 13;
         u8 sum = lfn_checksum(sfn);
         for (int p = parts; p >= 1; p--) {
@@ -2942,12 +2999,14 @@ static int make_entry(struct disk *k, const struct volume *v, u32 dir, const cha
         d[i] = sfn[i];
     d[11] = attr;
     d[12] = fits ? nt : 0;
-    put16(d + 14, FAT_TIME);            /* created */
-    put16(d + 16, FAT_DATE);
-    put16(d + 18, FAT_DATE);            /* accessed */
+    u16 date, time;
+    fat_stamp(&date, &time);
+    put16(d + 14, time);                /* created */
+    put16(d + 16, date);
+    put16(d + 18, date);                /* accessed */
     put16(d + 20, (u16)(v->fat == 32 ? cluster >> 16 : 0));
-    put16(d + 22, FAT_TIME);            /* written */
-    put16(d + 24, FAT_DATE);
+    put16(d + 22, time);                /* written */
+    put16(d + 24, date);
     put16(d + 26, (u16)cluster);
     put32(d + 28, size);
     return n;
@@ -2965,8 +3024,11 @@ static int name_char(char c)
 }
 
 /* "a/b/name": "a/b" into parent, "name" into name (trailing '/', spaces and
-   dots dropped, as Windows does); 0 when there is no name or it has a
-   character a FAT name may not have */
+   dots dropped, as Windows does); 1, 0 when there is no name or it has a
+   character a FAT name may not have, -1 the directory part is longer than
+   parent holds, -2 the name is longer than name does.  (Too long was cut:
+   a file then got a shorter name, or -- the cut at a '/' -- went into a
+   directory above the one named, over a file of its name there) */
 static int split_path(const char *path, char *parent, char *name)
 {
     int len = path_len(path), cut;
@@ -2974,12 +3036,16 @@ static int split_path(const char *path, char *parent, char *name)
         len--;
     for (cut = len; cut > 0 && path[cut - 1] != '/' && path[cut - 1] != '\\'; cut--)
         ;
-    int pl = cut < PATH_MAX - 1 ? cut : PATH_MAX - 1;
+    if (cut > PATH_MAX - 1)
+        return -1;
+    if (len - cut > NAME_MAX - 1)
+        return -2;
+    int pl = cut;
     for (int i = 0; i < pl; i++)
         parent[i] = path[i];
     parent[pl] = 0;
     int nl = 0;
-    for (int i = cut; i < len && nl < NAME_MAX - 1; i++)
+    for (int i = cut; i < len; i++)
         name[nl++] = path[i];
     while (nl > 0 && (name[nl - 1] == ' ' || name[nl - 1] == '.'))
         nl--;
@@ -3208,13 +3274,16 @@ static u64 mul64(u64 a, u32 b)
     return (u64)(u32)a * b + (((u64)(u32)(a >> 32) * b) << 32);
 }
 
-/* the time new files get: the box has no clock of its own -- FAT's fixed date and time (Polish time), as
-   NTFS counts it (100 ns since 1601, UTC) */
+/* the time new files get, as NTFS counts it (100 ns since 1601, UTC): the clock's once NTP set it, else
+   FAT's fixed date and time (Polish time) */
 static u64 nw_now(void)
 {
-    u32 local = days_of(1980 + (FAT_DATE >> 9), (FAT_DATE >> 5) & 15, FAT_DATE & 31) * 86400u
-                + (FAT_TIME >> 11) * 3600u + ((FAT_TIME >> 5) & 63) * 60u;
-    u32 utc = local - (summer_time(local - 7200) ? 7200 : 3600);
+    u32 utc = net_clock_utc();
+    if (!utc) {
+        u32 local = days_of(1980 + (FAT_DATE >> 9), (FAT_DATE >> 5) & 15, FAT_DATE & 31) * 86400u
+                    + (FAT_TIME >> 11) * 3600u + ((FAT_TIME >> 5) & 63) * 60u;
+        utc = local - (summer_time(local - 7200) ? 7200 : 3600);
+    }
     return mul64((u64)utc + 11644473600ull, 10000000u);
 }
 
@@ -5574,7 +5643,14 @@ static int new_place(const char *arg, const char *verb, struct disk **pk, struct
     const char *path = locate(arg, pk, pv, &dir, &from);
     if (!path || read_only(*pk, *pv, verb))
         return -1;
-    if (!split_path(path, pdir, name)) {
+    int split = split_path(path, pdir, name);
+    if (split < 0) {
+        uprintf(split == -1 ? "%s: the path is too long (%u characters at most before the name)\n"
+                            : "%s: the name is too long (%u characters at most)\n", verb,
+                split == -1 ? PATH_MAX - 1 : NAME_MAX - 1);
+        return -1;
+    }
+    if (!split) {
         uprintf((*pv)->fs == FS_NTFS ? "%s: not a name Windows takes (no \\ / : * ? \" < > |): '%s'\n"
                                      : "%s: not a name for a FAT volume: '%s'\n", verb, arg);
         return -1;
@@ -5630,12 +5706,14 @@ static int make_dir_at(const char *arg)
             d[i] = i < dots ? '.' : ' ';
         u32 to = dots == 1 ? c : parent.cluster;    /* ('..' of a directory in the root: 0) */
         d[11] = 0x10;
-        put16(d + 14, FAT_TIME);
-        put16(d + 16, FAT_DATE);
-        put16(d + 18, FAT_DATE);
+        u16 date, time;
+        fat_stamp(&date, &time);
+        put16(d + 14, time);
+        put16(d + 16, date);
+        put16(d + 18, date);
         put16(d + 20, (u16)(v->fat == 32 ? to >> 16 : 0));
-        put16(d + 22, FAT_TIME);
-        put16(d + 24, FAT_DATE);
+        put16(d + 22, time);
+        put16(d + 24, date);
         put16(d + 26, (u16)to);
     }
     int n;
@@ -5844,10 +5922,12 @@ static int entry_set(struct disk *k, const struct volume *v, u32 lba, u16 off, u
         return -1;
     u8 *d = wbuf + off;
     d[11] |= 0x20;
-    put16(d + 18, FAT_DATE);
+    u16 date, time;
+    fat_stamp(&date, &time);
+    put16(d + 18, date);
     put16(d + 20, (u16)(v->fat == 32 ? cluster >> 16 : 0));
-    put16(d + 22, FAT_TIME);
-    put16(d + 24, FAT_DATE);
+    put16(d + 22, time);
+    put16(d + 24, date);
     put16(d + 26, (u16)cluster);
     put32(d + 28, size);
     return write_sectors(k, lba, 1, wbuf);
@@ -6287,7 +6367,9 @@ static int wf_open(struct wfile *f, const char *arg, int append, const char *ver
     f->ent_lba = e.slot_lba[e.slots - 1];
     f->ent_off = e.slot_off[e.slots - 1];
     if (append && e.size) {             /* its last cluster (one after it, if any, freed) */
-        u32 csize = (u32)v->spc * SECTOR, need = (e.size + csize - 1) / csize, c = e.cluster;
+        u32 csize = (u32)v->spc * SECTOR, need = e.size / csize + (e.size % csize != 0), c = e.cluster;
+                                        /* (not (size + csize - 1) / csize: within a cluster of 4 GB that wraps
+                                           to 0, and the file's chain was cut after its first cluster) */
         for (u32 i = 1; i < need && c; i++)
             c = next_cluster(k, v, c);
         if (c < 2) {
@@ -6328,8 +6410,12 @@ static int is_dots(const char *n)
     return n[0] == '.' && (!n[1] || (n[1] == '.' && !n[2]));
 }
 
-/* the path `to` names, a directory there: with "/name" added (into it) */
-static const char *target_of(const char *to, const char *name)
+/* the path `to` names, a directory there: with "/name" added (into it); 0 (said why).  self: the entry
+   being renamed, when `to` may name it in another spelling ('mv Photos photos': the directory itself, not one
+   to move it into) */
+static int same_entry(const struct entry *a, const struct entry *b);
+
+static const char *target_of(const char *to, const char *name, const struct entry *self)
 {
     static char t[PATH_MAX + NAME_MAX + 2];
     static struct entry d;
@@ -6337,20 +6423,32 @@ static const char *target_of(const char *to, const char *name)
     struct volume *v;
     u32 dir;
     const char *from;
-    int n = 0;
-    for (; to[n] && n < PATH_MAX; n++)
+    int n = 0, max = (int)sizeof(t) - 1;
+    for (; to[n] && n < max; n++)
         t[n] = to[n];
     t[n] = 0;
+    if (to[n]) {                        /* (it was cut after 96 characters, whatever they were: the file went to
+                                           a shorter name or into another directory.  What a path's directory
+                                           part and its name may be is new_place's to say) */
+        uprintf("the path is too long\n");
+        return 0;
+    }
     const char *path = locate(to, &k, &v, &dir, &from);
     if (!path)
         return 0;
     quiet = 1;
     int is_dir = walk_path(k, v, dir, from, path, &d, 0) == 0 && (d.attr & 0x10);
     quiet = 0;
+    if (is_dir && self && same_entry(&d, self))
+        is_dir = 0;
     if (is_dir) {
+        if (n + 1 + path_len(name) > max) {
+            uprintf("the path is too long\n");
+            return 0;
+        }
         if (n && t[n - 1] != '/' && t[n - 1] != ':')
             t[n++] = '/';
-        for (const char *s = name; *s && n < PATH_MAX + NAME_MAX; s++)
+        for (const char *s = name; *s; s++)
             t[n++] = *s;
         t[n] = 0;
     }
@@ -6384,7 +6482,7 @@ static int copy_file(const char *src, const char *dst)
         uprintf("cp: a directory (cp copies files): %s\n", se.name);
         return -1;
     }
-    const char *target = target_of(dst, se.name);
+    const char *target = target_of(dst, se.name, 0);
     if (!target)
         return -1;
     const char *tpath = locate(target, &tk, &tv, &dir, &from);
@@ -6473,7 +6571,7 @@ void disk_mv(const char *src, const char *dst)
         uprintf("not that one: '%s'\n", src);
         return;
     }
-    const char *target = target_of(dst, se.name);
+    const char *target = target_of(dst, se.name, &se);
     if (!target)
         return;
     int there = new_place(target, "mv", &tk, &tv, &parent, name, &te);
@@ -6560,9 +6658,16 @@ moved:
                 new_path[m++] = '/';
             for (const char *s = name; *s && m < PATH_MAX - 1; s++)
                 new_path[m++] = *s;
-            for (const char *s = cwd.path + ol; *s && m < PATH_MAX - 1; s++)
-                new_path[m++] = *s;
+            const char *rest = cwd.path + ol;
+            for (; *rest && m < PATH_MAX - 1; rest++)
+                new_path[m++] = *rest;
             new_path[m] = 0;
+            if (*rest || pl + (pl > 1) + path_len(name) + path_len(cwd.path + ol) > PATH_MAX - 1) {
+                cwd.k = 0;              /* (its new path is longer than a path's text: none, rather than a
+                                           text that names another directory) */
+                uprintf("mv: the current directory's path is too long now: back to none ('cd' chooses one)\n");
+                return;
+            }
             for (int i = 0; i <= m; i++)
                 cwd.path[i] = new_path[i];
             cwd_text_set();
@@ -6815,6 +6920,15 @@ int disk_stream_open(const char *arg, u64 *size)
     stream_gen = k->gen;
     *size = stream.size;
     return 0;
+}
+
+static u64 reader_seek(struct reader *r, u64 pos);
+
+/* right after disk_stream_open: the reader moved on towards `pos` -- to the start of the cluster (FAT) or the
+   sector (NTFS) that holds it; where it is now (the bytes from there to pos are the caller's to leave out) */
+u64 disk_stream_seek(u64 pos)
+{
+    return stream.k ? reader_seek(&stream, pos) : 0;
 }
 
 /* its next bytes (max: a multiple of 512, 4096 at most): how many, 0 at its end, -1 (said why) */
@@ -7143,7 +7257,7 @@ void disk_cp_r(const char *src, const char *dst)
     }
     if (entry_ok(k, v, &e, "cp -r") < 0)        /* (before the copy's directory is made) */
         return;
-    const char *target = target_of(dst, e.name);
+    const char *target = target_of(dst, e.name, 0);
     if (!target)
         return;
     int i = 0;

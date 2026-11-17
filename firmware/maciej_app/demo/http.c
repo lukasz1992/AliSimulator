@@ -558,6 +558,7 @@ static void info(struct client *cl, int in_cmd)
 static void request(struct client *cl, int in_cmd)
 {
     requests++;
+    cl->moved_at = now_ms();            /* (the body's and the response's clocks start here) */
     char *h = cl->head;
     h[cl->body_at - 2] = 0;                             /* (the blank line's CR LF) */
     char *method = h, *target = h, *version = 0;
@@ -577,18 +578,23 @@ static void request(struct client *cl, int in_cmd)
         *query++ = 0;
     /* the header lines */
     u64 length = 0;
-    int has_length = 0, chunked = 0;
+    int has_length = 0, chunked = 0, bad_length = 0;
     cl->keep = starts(version, "HTTP/1.1");
     for (char *p = version; *p; p++) {
         if (p[0] == '\r' && p[1] == '\n') {
             char *l = p + 2;
             if (starts_nocase(l, "content-length:")) {
                 char *v = l + 15;
+                int digits = 0;
                 while (*v == ' ')
                     v++;
                 length = 0;
-                while (*v >= '0' && *v <= '9')
-                    length = length * 10 + (u64)(*v++ - '0');
+                for (; *v >= '0' && *v <= '9'; v++, digits++)
+                    length = length * 10 + (u64)(*v - '0');
+                while (*v == ' ')
+                    v++;
+                if (!digits || digits > 15 || (*v && *v != '\r'))
+                    bad_length = 1;     /* ("-5", "abc": read as 0, a PUT emptied its file and answered OK) */
                 has_length = 1;
             } else if (starts_nocase(l, "connection:")) {
                 char *v = l + 11;
@@ -612,6 +618,12 @@ static void request(struct client *cl, int in_cmd)
     int get = same(method, "GET") || same(method, "HEAD"), post = same(method, "POST"), put = same(method, "PUT");
     cl->body = B_DISCARD;                               /* (a body nobody uses: read and dropped) */
     cl->body_left = has_length ? length : 0;
+    if (bad_length) {
+        cl->keep = 0;
+        cl->body_left = 0;
+        fail(cl, 400, "Content-Length is not a number");
+        return;
+    }
     if (chunked) {
         cl->keep = 0;
         fail(cl, 411, "Send a Content-Length (no chunked bodies)");
@@ -619,6 +631,9 @@ static void request(struct client *cl, int in_cmd)
     }
     char path[PATH_MAX_], to[PATH_MAX_], v[16];
     if (param(query, "p", path, sizeof(path)) < 0 || param(query, "to", to, sizeof(to)) < 0) {
+        if (cl->body_left)
+            cl->keep = 0;               /* (its body is not read: what follows it on the connection is no
+                                           request) */
         fail(cl, 400, "The path is too long");
         return;
     }
@@ -823,6 +838,16 @@ static const char *body_pump(struct client *cl, int in_cmd)
     return 0;
 }
 
+/* nothing of a response could be sent now: 0 (wait) -- or, when nothing went for a minute, the client is given
+   up: one that stopped reading (its window closed, its socket kept) held its slot for as long as it liked, six
+   of them the whole page */
+static int stalled(struct client *cl)
+{
+    if (now_ms() - cl->moved_at > STALL_MS)
+        drop(cl, 1);
+    return 0;
+}
+
 /* the response sent: 1 when all of it went */
 static int send_pump(struct client *cl, int in_cmd, const char **say)
 {
@@ -831,23 +856,26 @@ static int send_pump(struct client *cl, int in_cmd, const char **say)
         if (out_total == cl->from && now_ms() - cl->since < WAIT_OUT_MS)
             return 0;
         out_answer(cl, cl->from);
+        cl->moved_at = now_ms();
     }
     if (cl->hdr_pos < cl->hdr_len) {
         u32 room = tcp_room(c), n = cl->hdr_len - cl->hdr_pos;
         if (room < n)
-            return 0;
+            return stalled(cl);
         tcp_send(c, cl->hdr + cl->hdr_pos, (int)n);
         cl->hdr_pos = cl->hdr_len;
+        cl->moved_at = now_ms();
     }
     switch (cl->out) {
     case O_MEM:
         while (cl->mem_pos < cl->mem_len) {
             u32 room = tcp_room(c), n = cl->mem_len - cl->mem_pos;
             if (!room)
-                return 0;
+                return stalled(cl);
             if (n > room)
                 n = room;
             cl->mem_pos += (u32)tcp_send(c, cl->mem + cl->mem_pos, (int)n);
+            cl->moved_at = now_ms();
         }
         return 1;
     case O_FILE: {
@@ -896,8 +924,9 @@ static int send_pump(struct client *cl, int in_cmd, const char **say)
                     to[x] = src[x];
             tcp_send(c, chunk, (int)bytes);
             cl->row++;
+            cl->moved_at = now_ms();
         }
-        return cl->row >= h;
+        return cl->row >= h ? 1 : stalled(cl);
     }
     }
     return 1;
@@ -957,6 +986,10 @@ const char *http_poll(int in_cmd)
             continue;
         int st = tcp_status(cl->c);
         if (st == TCP_FAILED || st == TCP_DONE) {
+            if (in_cmd && disk_owner == cl)
+                continue;               /* (its download's or upload's file is closed, an upload's removed --
+                                           disk writes, and the capture of what they say: not inside a command,
+                                           whose own disk work and '> file' they would cut into.  After it) */
             drop(cl, st == TCP_FAILED);
             continue;
         }
@@ -977,6 +1010,7 @@ const char *http_poll(int in_cmd)
                 } else if (cl->head_len >= HEAD_MAX) {
                     cl->keep = 0;
                     cl->body_left = 0;
+                    cl->moved_at = now_ms();            /* (the answer's clock, as request() starts it) */
                     fail(cl, 431, "The request's header is too long");
                 }
             } else if (st == TCP_PEER_DONE || now_ms() - cl->heard > IDLE_MS) {
@@ -988,6 +1022,16 @@ const char *http_poll(int in_cmd)
             const char *s = body_pump(cl, in_cmd);
             if (s)
                 say = s;
+            /* a body that cannot come any more: the client closed its side with less sent than it said (all of
+               that is read), or -- but for an upload, which has its own minute -- nothing came for IDLE_MS.
+               Waited for, an upload given up kept the disks' writer for a minute, typed input its slot for
+               good.  (An upload's file is closed and removed: after a command, not inside it) */
+            if (cl->state == S_BODY && cl->body_left && !(in_cmd && disk_owner == cl) &&
+                ((st == TCP_PEER_DONE && !tcp_unread(cl->c) && cl->head_len <= cl->body_at) ||
+                 (cl->body != B_UPLOAD && now_ms() - cl->moved_at > IDLE_MS))) {
+                drop(cl, 0);
+                continue;
+            }
         }
         if (cl->state == S_SEND) {
             if (cl->body == B_DISCARD && cl->body_left)
@@ -996,6 +1040,10 @@ const char *http_poll(int in_cmd)
                 continue;
             cl->out = O_NONE;
             cl->body = B_NONE;
+            if (cl->keep && cl->head_len > cl->body_at)
+                cl->keep = 0;           /* (more came with the request than it and its body: a second request
+                                           sent ahead.  It is not read from there: the connection ends and the
+                                           client asks it again, instead of waiting for an answer that never came) */
             if (!cl->keep) {
                 tcp_close(cl->c);
                 cl->state = S_FREE;

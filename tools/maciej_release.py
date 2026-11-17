@@ -101,12 +101,17 @@ COMMANDS = {
               "no sound): the keys and the options of nes; battery RAM kept in a .sav file beside it",
         "nes": "[-f frames] [-k script] <file.nes>: a NES game on the TV, 60 frames a second (mappers 0, 1, 2, 3, "
                "4, 7, 11, 34, 66, 71; no sound): arrows / W A S D, X = A, Z = B, Enter = Start, Tab = Select "
-               "(USB keyboard, UART, remote); Ctrl-C or Esc ends; battery RAM kept in a .sav file beside it",
+               "(USB keyboard, UART, remote); Ctrl-C or Esc ends; battery RAM kept in a .sav file beside it. "
+               "Every player also takes its game in a .zip (the largest file in it that is no text or picture) "
+               "or a .gz (the Amiga's .adz too)",
         "sms": "[-f frames] [-k script] <file.sms>: a Sega Master System game on the TV (256 x 192 three times "
                "as large; Sega and Codemasters mappers, cartridge RAM kept in a .sav file; no sound): X = button "
                "2, Z = button 1, Enter = Pause; the other keys and the options of nes",
         "gg": "[-f frames] [-k script] <file.gg>: a Sega Game Gear game on the TV (160 x 144 five times as large): "
               "X = button 2, Z = button 1, Enter = Start; the other keys and the options of nes",
+        "sg": "[-f frames] [-k script] <file.sg|file.sc>: a Sega SG-1000 / SC-3000 game on the TV (256 x 192 "
+              "three times as large; plain ROMs up to 48 KB, Sega mapper above; pads only, no sound): X = button 2, "
+              "Z = button 1, Enter = Pause; the other keys and the options of nes",
         "zx": "[-f frames] [-k script] [file]: a ZX Spectrum 48K on the TV (320 x 240 with its border, three "
               "times as large, 50 frames a second): a snapshot (.sna, .z80) or a tape (.tap, .tzx, loaded at once "
               "with LOAD \"\" typed by itself); no file: BASIC. Its ROM is a file 48.rom (not in the demo) beside "
@@ -114,7 +119,8 @@ COMMANDS = {
               "Kempston joystick too; characters typed on the UART are typed on it; Esc ends",
         "c64": "[-f frames] [-k script] [file]: a Commodore 64 (PAL) on the TV (352 x 240 with its border, "
                "three times as large, 50 frames a second): a program (.prg, .t64) or a disk (.d64), loaded and "
-               "RUN by itself; no file: BASIC. Its ROMs are kernal.rom, basic.rom and chargen.rom (not in the "
+               "RUN by itself, or a cartridge (.crt: normal, Ocean, Magic Desk, EasyFlash, System 3, Dinamic, Fun "
+               "Play, Super Games, RGCD, Simons' BASIC, Final Cartridge III) started in it; no file: BASIC. Its ROMs are kernal.rom, basic.rom and chargen.rom (not in the "
                "demo) beside the program, in c64/ or at the top of its disk. The USB keyboard is the C64's (Tab = "
                "RUN/STOP, PageUp = RESTORE), its arrows joystick 2 (fire: right Ctrl); Esc ends",
         "amiga": "[-f frames] [-k script] [file.adf]: an Amiga 500 (PAL, OCS) on the TV (352 x 272 with its "
@@ -128,13 +134,19 @@ COMMANDS = {
         "dos": "[-f frames] [-k script] <file.exe>: a DOS PC (a 286 AT with a VGA: text, CGA, EGA and 256-colour "
                "modes) on the TV (320 x 200, three times as large) running a DOS program (.exe, .com); the BIOS and "
                "DOS are built in; no sound. The USB keyboard is the PC's (Esc ends the player)",
+        "megadrive": "[-r j|u|e] [-f frames] [-k script] <file>: a Sega Mega Drive / Genesis game on the TV "
+                     "(320 x 224 or 256 x 224, three times as large; .md, .gen, .bin, .smd; NTSC or PAL from the "
+                     "header's region or -r) with its sound (YM2612 and PSG): X = B, Z = A, Tab / Space = C, Enter = "
+                     "Start (USB keyboard, UART, remote); a 3-button pad; cartridge RAM kept in a .sav file beside it",
         "a26": "[-f frames] [-k script] <file.a26>: an Atari 2600 game on the TV (160 x 228, five times as wide "
                "and three times as high; 2K, 4K, F8, F6, F4 and their Superchip RAM, FE, E0, 3F, E7, FA; NTSC; no "
                "sound): arrows, X or Z = fire, Enter = the console's Reset, Tab = Select",
         "rf": "the aerial input: the MxL603 tuner (I2C 0x60) and the S3811's DVB-T demodulator as dump.bin drives "
               "them -- init, tune <MHz|channel> [6|7|8], status (lock, level, quality, errors, the stream's "
               "parameters), scan, services (the multiplex's channel names), ts <s> [file] (the PIDs, or a .ts "
-              "recording), spectrum (the aerial's level across 174..862 MHz as a chart on the TV); DVB-T only, "
+              "recording), spectrum (the aerial's level across 174..862 MHz as a chart on the TV), live [from to] (that chart "
+              "swept again and again, with keys: marker, zoom, move, faster / slower, pause, peak hold, Enter a "
+              "lock tried, Esc ends); DVB-T only, "
               "not DVB-T2",
         "> / >>": "after any command: what it prints goes into a file ('ls > 4:/list.txt'; >> adds to its end); "
                   "\"...\" or '...' keep spaces in a word",

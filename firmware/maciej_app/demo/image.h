@@ -32,5 +32,8 @@ const char *image_decode(u8 *data, u32 size, u8 *work, u32 work_size, image_row_
                                         /* its rows through row(), y = 0 .. height - 1 in order, each width x 3
                                            bytes: 0, or why it stopped (the rows so far were given).  A PNG's
                                            data is gathered in place: the file in RAM is changed */
+const char *image_inflate(const u8 *src, u32 len, u8 *dst, u32 cap, u32 *made);
+                                        /* raw deflate data (RFC 1951, a zip member's) into dst, at most cap
+                                           bytes: 0, or why not; *made: the bytes made (image_poll can stop it) */
 
 #endif

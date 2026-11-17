@@ -248,7 +248,8 @@ const char *serial_attach(u8 device, u8 iface, u8 control, int kind, u8 in_ep, u
         p->iface = iface;
         p->in_ep = in_ep;
         p->out_ep = out_ep;
-        p->maxp = maxp;
+        p->maxp = maxp > sizeof(in) ? (u16)sizeof(in) : maxp;   /* (a packet is read into in[]: an endpoint
+                                                                   that says 513..2047 bytes ran past it) */
         p->baud = 0;
         p->version = 0;
         usnprintf(p->name, sizeof(p->name), "%s", name[0] ? name : chip_name(kind));
@@ -557,9 +558,13 @@ void serial_at(const char *command)
     s.n = s.cont = 0;
     for (int attempt = 0;; attempt++) {
         int k;
-        while ((k = port_read(p, in, 1)) > 0)
+        /* (what came before the command: shown -- for 300 ms at most.  A port that never stops sending, a GPS
+           or a board's log on an adapter, kept this loop for good: the command never went, nothing else ran,
+           and the reads fed the watchdog) */
+        u64 until = now_ms() + 300;
+        while (now_ms() < until && (k = port_read(p, in, 1)) > 0)
             for (int i = 0; i < k; i++)
-                (void)line_char(&s, (char)in[i]);       /* (what came before the command: shown) */
+                (void)line_char(&s, (char)in[i]);
         line_end(&s);
         if (usb_bulk_out(p->device, p->out_ep, p->maxp, cmd, (u32)len, 1000) == 0)
             break;
