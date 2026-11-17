@@ -1381,9 +1381,20 @@ def check_md(box):
     box.run(0.6)
 
 
-def tiny_ts(stream_type):
+# A 32 x 32 H.264 stream of two flat-coloured pictures (an IDR, a P) -- made with
+#   ffmpeg -f lavfi -i color=c=0x3060a0:size=32x32:rate=25 -frames:v 2 -c:v libx264 -profile:v baseline -level 1.0
+#          -x264-params keyint=25:scenecut=0:ref=1 -bsf:v filter_units=remove_types=6 flat32.264
+# (the encoder's SEI left out); ffmpeg decodes it to Y 0x5c, Cb 0xa3, Cr 0x66.
+TINY_H264 = bytes.fromhex(
+    "00000001" "6742c00ada25b011000003000100000300320f1226a0"     # SPS: Baseline 1.0, 2 x 2 macroblocks, 25 frames/s
+    "00000001" "68ce0f2c80"                                       # PPS
+    "000001" "6588840bf118a00023571c00043ca38000856c9d75e0"       # the IDR picture's slice
+    "00000001" "419a202bcb")                                      # the P picture's
+
+
+def tiny_ts(stream_type, es=b""):
     """A transport stream of a PAT, a PMT (program 1 at PID 0x100: one video stream of that type at PID 0x101) and
-    ten packets of that stream (a PES header, zeros)."""
+    ten packets of that stream: a PES header, `es` (the elementary stream's bytes, up to 175), zeros."""
     def crc32_mpeg(b):
         c = 0xFFFFFFFF
         for x in b:
@@ -1406,24 +1417,32 @@ def tiny_ts(stream_type):
     out = packet(0, b"\x00" + pat, True, 0) + packet(0x100, b"\x00" + pmt, True, 0)
     pes = b"\x00\x00\x01\xe0\x00\x00\x80\x00\x00"
     for i in range(10):
-        out += packet(0x101, (pes if not i else b"") + bytes(184 - (len(pes) if not i else 0)), not i, i)
+        body = pes + es if not i else b""
+        out += packet(0x101, body + bytes(184 - len(body)), not i, i)
     return out
 
 
 def check_play(box):
-    """The video player ('play'): the emulator has no MPEG decoder, so only how a file is taken apart -- an H.264
-    stream is named and not played, a file of no stream refused; 'av status' reads the decoder's registers."""
+    """The video player ('play'): the emulator has no MPEG-2 or H.264 decoder, so only how a file is taken apart --
+    an H.264 stream's parameter sets read and its picture set up, then the decoder found silent and the play ended
+    cleanly; a file of no stream refused; 'av status' reads the decoder's registers."""
     import fat_image
-    stick = VirtualStick(fat_image.build({"VIDEO/AVC.TS": tiny_ts(0x1B), "VIDEO/JUNK.TS": bytes(range(256)) * 8},
+    stick = VirtualStick(fat_image.build({"VIDEO/AVC.TS": tiny_ts(0x1B, TINY_H264),
+                                          "VIDEO/JUNK.TS": bytes(range(256)) * 8},
                                          fat=12, size_mb=1, partition=False))
     box.usb.attach("high", stick)
     box.run(4.0)
     avc = shell(box, "play 1:/VIDEO/AVC.TS", timeout=60)
-    junk = shell(box, "play 1:/VIDEO/JUNK.TS", timeout=60)
     status = shell(box, "av status", timeout=30)
-    check("transport stream" in avc and "video PID 0x101 (type 0x1b" in avc and "not MPEG-1/2 (stream type 0x1b)"
-          in avc and "not a transport stream" in junk and "decoder 0xb8004200" in status,
-          f"play: an H.264 .ts named and not played, junk refused, av status {avc!r} {junk!r}")
+    junk = shell(box, "play 1:/VIDEO/JUNK.TS", timeout=60)
+    ok = ("transport stream" in avc and "video PID 0x101 (type 0x1b: H.264), no sound" in avc
+          and "video: H.264 Baseline 1.0, 32 x 32, 25.00 frames/s, pixels 1:1, 1 reference frame," in avc
+          and "play: the H.264 decoder does not answer" in avc and "\n0 pictures decoded" in avc
+          and "H.264 decoder 0xb8004200" in status and "last stream: 32 x 32 (2 x 2 macroblocks)" in status
+          and "not a transport stream" in junk)
+    check(ok, "play: an H.264 .ts: its stream described (SPS: Baseline 1.0, 32 x 32), the emulator's missing decoder "
+              "reported, 'av status' on the H.264 decoder, junk refused"
+              + ("" if ok else f" {avc!r} {status!r} {junk!r}"))
     box.usb.detach()
     box.run(0.6)
 

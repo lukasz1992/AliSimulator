@@ -10,7 +10,10 @@
    (0x803247BC) follows the library's vdec_config_hw_new_picture on the S3811's branches.  Its memory map
    (config at 0x80A7ADD8): frames 0x06C6C200 (17.6 MB), filter 0x07D3B400, VBV 0x07ED4000..0x07FFFEFF.
 
-   How the decoder works (MPEG-1 / MPEG-2 video, the main profile; H.264 is a separate engine, vdec_avc*.o):
+   H.264 video goes to the block's other engine (vdec_avc*.o): avc.c, given the NAL units from the same stream
+   buffer; its frames come back in display order and are shown here through the same layer.
+
+   How the decoder works (MPEG-1 / MPEG-2 video, the main profile):
    the CPU parses the sequence / picture headers and their extensions itself, the hardware decodes the
    slices: it reads the stream from a buffer ("VBV") from a given bit offset for a given number of bits,
    decodes slice after slice (their start codes it finds itself) and stops at the first start code that is
@@ -72,9 +75,10 @@
      the scaler filtered with whatever lay there: a broken picture, also at 1:1.
 
    Sound: MPEG audio Layer II decoded in software (mp2.c; dump.bin does that too: its DECA is ALi's libmpg on
-   the CPU), mixed to mono, through snd.c at 48 kHz.  H.264 / AC-3 streams are told, not played. */
+   the CPU), mixed to mono, through snd.c at 48 kHz.  AC-3 and AAC sound are told, not played. */
 #include "hw.h"
 #include "av.h"
+#include "avc.h"
 #include "mp2.h"
 #include "snd.h"
 
@@ -100,8 +104,8 @@ static void copy(u8 *to, const u8 *from, u32 n)
 }
 
 /* the data cache written back (and its lines dropped) over [p, p + n): what the CPU wrote reaches RAM before
-   a DMA engine reads it */
-static void cache_flush(const void *p, u32 n)
+   a DMA engine reads it (avc.c's too) */
+void av_cache_flush(const void *p, u32 n)
 {
     u32 a = (u32)p & ~15u, end = (u32)p + n;
     for (; a < end; a += 16)
@@ -132,7 +136,7 @@ int av_is_video(const char *name)
 {
     return ends_with(name, ".ts") || ends_with(name, ".m2t") || ends_with(name, ".mpg") ||
            ends_with(name, ".mpeg") || ends_with(name, ".m2v") || ends_with(name, ".vob") ||
-           ends_with(name, ".trp");
+           ends_with(name, ".trp") || ends_with(name, ".264") || ends_with(name, ".h264");
 }
 
 /* ---- FIFOs of elementary stream bytes (linear: the rest moved down when the end is reached) ---- */
@@ -375,8 +379,10 @@ static struct frame frm[FRAMES];
 static u32 y_size, c_size;
 static int nfrm;
 static int older = -1, newer = -1;      /* the references: the one before, the latest I / P */
-static int queue[FRAMES], queued;       /* waiting to be shown, in display order */
+#define QUEUE_MAX 32                    /* (avc.c may let out all its frames at once: at an IDR, at the end) */
+static int queue[QUEUE_MAX], queued;    /* waiting to be shown, in display order */
 static int shown = -1, shown_before = -1;
+static int h264;                        /* the video is H.264: the frames are avc.c's (else frm[]'s) */
 
 static int frames_setup(void)
 {
@@ -470,7 +476,7 @@ static int ve_decode(const u8 *p, u32 n, int recon, int fwd, int bwd)
     for (u32 i = n + 4; i < n + 4 + 2048 + 4; i++)
         vbv[i] = 0;
     u32 len = (n + 4 + 2048 + 3) & ~3u;
-    cache_flush(vbv, len + 4);
+    av_cache_flush(vbv, len + 4);
     /* vdec_config_hw_new_picture (dump.bin 0x803247BC) */
     VE8(0x78) = (u8)(AV_WINDOW_PHYS >> 25);
     for (int i = 0; i < nfrm; i++)
@@ -804,7 +810,9 @@ static u32 de_saved_scale[20];          /* 0x100..0x14C as they were */
 static u32 de_saved_bottom[2];          /* 0x1C8, 0x1CC */
 static int one_to_one;                  /* 'play -1': the picture's own size, not fitted to the screen */
 
-static void de_setup(void)
+/* the layer set up for a w x h picture shown fit_w wide at the screen's height (its aspect ratio); avc_mbw: an
+   H.264 frame (avc.c's layout) that many macroblocks wide, 0 an MPEG-2 one */
+static void de_setup(u32 w, u32 h, u32 fit_w, u32 avc_mbw)
 {
     for (int i = 0; i < 0x10; i++)
         de_saved[i] = DE(0x160 + 4 * i);
@@ -812,16 +820,13 @@ static void de_setup(void)
         de_saved_scale[i] = DE(0x100 + 4 * i);
     de_saved_bottom[0] = DE(0x1C8);
     de_saved_bottom[1] = DE(0x1CC);
-    u32 w = seq.w, h = seq.h, dw, dh;
+    u32 dw, dh;
     if (one_to_one) {
         dw = w < SCREEN_W ? w : SCREEN_W;
         dh = h < SCREEN_H ? h : SCREEN_H;
     } else {                            /* the screen's height, the width by the aspect ratio */
         dh = SCREEN_H;
-        dw = seq.aspect == 2 ? SCREEN_H * 4 / 3 : seq.aspect == 3 ? SCREEN_W : seq.aspect == 4 ? SCREEN_W
-             : w * SCREEN_H / h;
-        if (dw > SCREEN_W)
-            dw = SCREEN_W;
+        dw = fit_w > SCREEN_W ? SCREEN_W : fit_w;
         dw &= ~1u;
     }
     u32 x0 = (SCREEN_W - dw) / 2, y0 = ((SCREEN_H - dh) / 2) & ~1u, x1 = x0 + dw - 1, y1 = y0 + dh - 1;
@@ -843,19 +848,34 @@ static void de_setup(void)
     DE(0x144) = 1;
     DE(0x148) = 1;
     DE(0x174) = 0;
-    DE(0x178) = (w / 8) << 24 | ((w + 31) / 32) << 16 | ((h + 15) / 16) << 8 | ((w + 15) / 16);
+    /* the source's layout: an H.264 frame's tiles are one macroblock wide (vdec_avc_decore's Display_Info: stride
+       (w + 15) / 16, hal_sdhd_mp_size_insource: the low half (w + 15) / 16) */
+    DE(0x178) = avc_mbw ? avc_mbw << 16 | avc_mbw
+                        : (w / 8) << 24 | ((w + 31) / 32) << 16 | ((h + 15) / 16) << 8 | ((w + 15) / 16);
     DE(0x17C) = h << 16 | w;
     DE(0x180) = x0 << 16 | x1;
     DE(0x184) = y0 << 16 | y1;
     DE(0x188) = 0x00108080u;            /* black around it */
-    /* MPEG-2 tiling, not H.264's; the scaler in, four vertical taps; the frame's lines in turn (as fields,
-       mode 0, the screen showed the picture at half its height and what lies after it in RAM below) */
-    DE(0x190) = (DE(0x190) & ~0x000700CEu) | 0x00020000u;
+    /* MPEG-2 tiling, or H.264's (b1: hal_sdhd_h264_mapping_enable); the scaler in, four vertical taps; the frame's
+       lines in turn (as fields, mode 0, the screen showed the picture at half its height and what lies after it
+       in RAM below) */
+    DE(0x190) = (DE(0x190) & ~0x000700CEu) | 0x00020000u | (avc_mbw ? 0x2u : 0);
+}
+
+/* the layer for the stream being played (or played last) */
+static void show_setup(void)
+{
+    if (h264) {
+        const struct avc_info *a = avc_info();
+        de_setup(a->w, a->h, a->h && a->sar_h ? a->w * SCREEN_H / a->h * a->sar_w / a->sar_h : SCREEN_W, a->mbw);
+    } else
+        de_setup(seq.w, seq.h, seq.aspect == 2 ? SCREEN_H * 4 / 3 : seq.aspect == 3 || seq.aspect == 4 ? SCREEN_W
+                                                                 : seq.w * SCREEN_H / seq.h, 0);
 }
 
 static void de_show(int f)
 {
-    u32 y = AV_WINDOW_PHYS + frm[f].y, c = AV_WINDOW_PHYS + frm[f].c;
+    u32 y = h264 ? avc_luma(f) : AV_WINDOW_PHYS + frm[f].y, c = h264 ? avc_chroma(f) : AV_WINDOW_PHYS + frm[f].c;
     DE(0x164) = y;
     DE(0x168) = y;
     DE(0x16C) = c;
@@ -981,9 +1001,19 @@ static void ts_section(const u8 *p, int n, int pid)
                 audio_pid = epid, audio_type = type;
             i += 5 + es_info;
         }
-        uprintf("stream: PMT PID 0x%x, video PID 0x%x (type 0x%02x%s), audio PID 0x%x (type 0x%02x%s)\n", pmt_pid,
-                video_pid, video_type, video_type == 0x1B ? ": H.264, not decoded here" : video_type <= 2 ?
-                ": MPEG-2" : "", audio_pid, audio_type, audio_type == 3 || audio_type == 4 ? ": MPEG audio" : "");
+        uprintf("stream: PMT PID 0x%x, ", pmt_pid);
+        if (video_pid)
+            uprintf("video PID 0x%x (type 0x%02x%s), ", video_pid, video_type, video_type == 0x1B ? ": H.264" :
+                    video_type == 1 ? ": MPEG-1" : video_type == 2 ? ": MPEG-2" : video_type == 0x24 ?
+                    ": HEVC, not decoded here" : "");
+        else
+            uprintf("no video, ");
+        if (audio_pid)
+            uprintf("audio PID 0x%x (type 0x%02x%s)\n", audio_pid, audio_type, audio_type == 3 || audio_type == 4 ?
+                    ": MPEG audio" : audio_type == 0x0F || audio_type == 0x11 ? ": AAC, not decoded here" :
+                    audio_type == 0x81 ? ": AC-3, not decoded here" : "");
+        else
+            uprintf("no sound\n");
     }
 }
 
@@ -1006,7 +1036,7 @@ static void ts_packet(const u8 *p)
     }
     u32 pts;
     int has;
-    if (pid && pid == video_pid && video_type <= 2) {
+    if (pid && pid == video_pid && (video_type <= 2 || video_type == 0x1B)) {
         u8 cc = p[3] & 15;
         if (video_cc != 0xFF && cc != ((video_cc + 1) & 15))
             st.cc_errors++;
@@ -1218,6 +1248,107 @@ static int stop_asked(void)
     return stop_seen;
 }
 
+/* ---- H.264: the video's NAL units from ves, one at a time, to avc.c ---- */
+static int avc_flushed, avc_tail;       /* avc_end called; the end-of-stream NAL unit put after the last one */
+
+/* the frames avc.c lets out (display order) to the queue */
+static void avc_take(void)
+{
+    int f;
+    while (queued < QUEUE_MAX && (f = avc_out()) >= 0)
+        queue[queued++] = f;
+}
+
+/* the next NAL unit in ves (ves.rd at its start code, scan_at where the search for its end goes on): its first
+   byte at *at, n bytes; 1, 0 more data needed, -1 none left */
+static int next_nal(u32 *at, u32 *n)
+{
+    u32 s = find_code(ves.rd);
+    if (s == ~0u) {
+        if (eos)
+            return -1;
+        ves.rd = ves.wr > ves.rd + 3 ? ves.wr - 3 : ves.rd;    /* (no start code yet: what came before one goes) */
+        return 0;
+    }
+    ves.rd = s;
+    u32 e = find_code(scan_at > s + 3 ? scan_at : s + 3);
+    if (e == ~0u) {
+        if (!eos) {
+            scan_at = ves.wr > s + 6 ? ves.wr - 3 : s + 3;
+            return 0;
+        }
+        e = ves.wr;
+    }
+    *at = s + 3;
+    *n = e - *at;
+    return 1;
+}
+
+static int want_data(void);
+
+/* while the engine decodes a slice: a piece of the file read -- only while it fits behind the stream's bytes
+   without moving them (the engine reads them; one piece of a transport stream or an elementary stream puts at
+   most its own size) -- or the sound fed */
+static void while_decoding(void)
+{
+    if (want_data() && ves.wr + sizeof(chunk) <= ves.size && aes.wr + sizeof(chunk) <= aes.size)
+        (void)feed();
+    else if (sound_on)
+        sound_service();
+}
+
+/* one step: 1 a NAL unit taken, 0 waiting (for data, for a free frame), -1 the end with everything out, -2 failed
+   (said) */
+static int h264_step(void)
+{
+    avc_take();
+    if (avc_flushed)
+        return queued ? 0 : -1;
+    if (eos && !avc_tail) {             /* (an end-of-stream NAL unit: the last slice ends at its start code, which
+                                           the engine's start code detector needs) */
+        static const u8 tail[64] = {0, 0, 1, 0x0B};
+        put(&ves, tail, sizeof(tail), 1);
+        avc_tail = 1;
+    }
+    u32 at, n;
+    int r = next_nal(&at, &n);
+    if (r == 0) {
+        if (!eos && fifo_used(&ves) >= 0x00180000u)
+            (void)feed();               /* (a NAL unit longer than the reading ahead goes: more of it now) */
+        return 0;
+    }
+    if (r < 0) {
+        avc_end();
+        avc_flushed = 1;
+        avc_take();
+        return 1;
+    }
+    int got = avc_nal(ves.buf + at, n, ves.wr - at);
+    if (got == AVC_FAIL)
+        return -2;
+    if (got == AVC_FULL) {              /* (the NAL unit stays: given again once frames were shown) */
+        avc_take();
+        if (queued)
+            return 0;
+        uprintf("play: H.264: no frame buffer free\n");
+        return -2;
+    }
+    ves.rd = at + n;
+    scan_at = ves.rd + 3;
+    avc_take();
+    return 1;
+}
+
+/* an H.264 elementary stream: a start code, then an SPS / PPS / AUD / SEI or a slice */
+static int annexb_h264(const u8 *p, int n)
+{
+    int i = !p[0] && !p[1] && !p[2] && n > 4 && p[3] == 1 ? 4 : !p[0] && !p[1] && p[2] == 1 ? 3 : 0;
+    if (!i || i >= n || (p[i] & 0x80))
+        return 0;
+    u32 type = p[i] & 0x1F;
+    return type == 1 || type == 5 || type == 6 || type == 7 || type == 8 || type == 9;
+}
+
 /* ---- the player ---- */
 static int want_data(void)
 {
@@ -1249,7 +1380,9 @@ static void reset_state(void)
     file_end = 0;
     nfrm = 0;
     queued = 0;
+    h264 = avc_flushed = avc_tail = 0;
     older = newer = shown = shown_before = -1;
+    last_shown = -1;                    /* (the frames are this play's now: an earlier play's last is gone) */
     u32 *z = (u32 *)&st;
     for (u32 i = 0; i < sizeof(st) / 4; i++)
         z[i] = 0;
@@ -1262,6 +1395,8 @@ static void show_next(void)
         queue[k - 1] = queue[k];
     queued--;
     de_show(f);
+    if (h264 && shown_before >= 0)
+        avc_release(shown_before);      /* (off the screen now: avc.c may decode into it again) */
     shown_before = shown;
     shown = f;
     last_shown = f;
@@ -1294,7 +1429,7 @@ int av_play(int argc, char **argv)
             path = a;
     }
     if (!path) {
-        uprintf("usage: play [-n frames] [-x] [-k] [-v] [-q] [-1] <file.ts|.mpg|.m2v>\n");
+        uprintf("usage: play [-n frames] [-x] [-k] [-v] [-q] [-1] <file.ts|.mpg|.m2v|.264>\n");
         return -1;
     }
     if (ftp_disk_busy() || http_disk_busy()) {      /* (disk.c has one reader: taken, their download would
@@ -1319,13 +1454,17 @@ int av_play(int argc, char **argv)
         kind = KIND_PS;
     else if (!chunk[0] && !chunk[1] && chunk[2] == 1 && chunk[3] == 0xB3)
         kind = KIND_ES;
-    else {
-        uprintf("play: %s: not a transport stream, a program stream or an MPEG video stream\n", path);
+    else if (annexb_h264(chunk, got)) {
+        kind = KIND_ES;
+        video_type = 0x1B;
+    } else {
+        uprintf("play: %s: not a transport stream, a program stream or an MPEG / H.264 video stream\n", path);
         disk_stream_close();
         return -1;
     }
     uprintf("play: %s, %u bytes, %s\n", path, (u32)size,
-            kind == KIND_TS ? "transport stream" : kind == KIND_PS ? "program stream" : "MPEG video elementary stream");
+            kind == KIND_TS ? "transport stream" : kind == KIND_PS ? "program stream" :
+            video_type == 0x1B ? "H.264 elementary stream" : "MPEG video elementary stream");
     /* (the first chunk taken apart as feed() does) */
     st.bytes_read = (u32)got;
     if (kind == KIND_ES)
@@ -1371,10 +1510,14 @@ int av_play(int argc, char **argv)
             failed = 1;
             break;
         }
-        if (kind == KIND_TS && video_pid && video_type > 2) {
-            uprintf("play: the video is not MPEG-1/2 (stream type 0x%02x): not played\n", video_type);
+        if (kind == KIND_TS && video_pid && video_type > 2 && video_type != 0x1B) {
+            uprintf("play: the video is not MPEG-1/2 or H.264 (stream type 0x%02x): not played\n", video_type);
             failed = 1;
             break;
+        }
+        if (video_type == 0x1B && !h264) {
+            h264 = 1;                   /* (avc.c's engine from now on: the MPEG-2 one's reset above is undone) */
+            avc_begin((quiet ? 0 : AVC_DESCRIBE) | (verbose ? AVC_VERBOSE : 0), fast ? 0 : while_decoding);
         }
         /* show */
         u64 now = now_ticks();
@@ -1382,9 +1525,11 @@ int av_play(int argc, char **argv)
             if (!started) {
                 started = 1;
                 next_show = now;
+                if (h264)                   /* (avc.c described the stream when it set it up) */
+                    period_us = avc_info()->frame_us ? avc_info()->frame_us : 40000;
                 if (osd_was_on)
                     gfx_enable(0);
-                de_setup();
+                show_setup();
             }
             show_next();
             next_show += (u64)period_us * per_us;
@@ -1396,8 +1541,22 @@ int av_play(int argc, char **argv)
                 break;
             continue;
         }
-        /* decode the next picture when a frame buffer is free and the queue is short */
-        int f = nfrm ? free_frame() : 0;
+        /* H.264: the next NAL unit to avc.c while the queue is short (its frames come back in display order; four
+           decoded ahead: a 1080p picture takes 21-29 ms of the 42 a frame has, a big I picture more data than the
+           card reads in a frame's time) */
+        if (h264 && queued < 4) {
+            int r = h264_step();
+            if (r == -2) {
+                failed = 1;
+                break;
+            }
+            if (r == -1)
+                break;                  /* (the stream's end, every frame shown) */
+            if (r > 0)
+                continue;
+        }
+        /* MPEG-2: decode the next picture when a frame buffer is free and the queue is short */
+        int f = h264 ? -1 : nfrm ? free_frame() : 0;
         if (queued < 2 && f >= 0) {
             u32 end;
             if (next_picture(&end)) {
@@ -1485,6 +1644,19 @@ int av_play(int argc, char **argv)
             ;                           /* (the sound's last frames played) */
         snd_stop();
     }
+    if (h264) {                         /* (avc.c's counts in the same lines) */
+        const struct avc_stats *s = avc_stats();
+        st.pictures = s->pictures;
+        st.types[1] = s->types[2];
+        st.types[2] = s->types[0];
+        st.types[3] = s->types[1];
+        st.skipped = s->skipped;
+        st.total_us = s->total_us;
+        st.slowest_us = s->slowest_us;
+        st.errors = s->errors;
+        st.timeouts = s->timeouts;
+        pictures_total += s->pictures;
+    }
     if (!quiet || failed) {
         uprintf("%u pictures decoded (I %u, P %u, B %u), %u skipped, %u shown in %u.%03u s (%u late); decoding took "
                 "%u us on average, %u at most; %u with error flags, %u timed out\n", st.pictures, st.types[1],
@@ -1493,7 +1665,10 @@ int av_play(int argc, char **argv)
         uprintf("read %u bytes (%u TS packets, %u video continuity errors); sound: %u frames (%u bad), %u samples, "
                 "%u bytes dropped%s\n", st.bytes_read, st.packets, st.cc_errors, st.audio_frames, st.audio_bad,
                 st.audio_samples, st.audio_dropped, sound_on ? "" : " (no sound)");
-        if (st.pictures)
+        if (st.pictures && h264)
+            uprintf("%u slices; the last: status 0x%08x, the macroblock reached 0x%08x\n", avc_stats()->slices,
+                    avc_stats()->last_status, avc_stats()->last_mb);
+        else if (st.pictures)
             uprintf("the last picture: status 0x%08x, MBs %u, at 0x%04x, read %u of %u bits, errors 0x%08x\n",
                     st.last_status, st.last_mbs, st.last_pos, st.last_offset, st.last_bits, st.last_err);
     }
@@ -1532,20 +1707,35 @@ static u8 clamp8(s32 v)
     return (u8)(v < 0 ? 0 : v > 255 ? 255 : v);
 }
 
+static u32 avc_tiles;                   /* the picture is an H.264 frame (avc.c's layout) this many macroblocks wide */
+
+/* a line's place among its four in an H.264 tile: they lie in the order 0, 2, 1, 3 */
+static u32 avc_line(u32 l)
+{
+    return (l & ~3u) | (l & 1) << 1 | (l >> 1 & 1);
+}
+
 static u8 luma(const volatile u8 *y, u32 tiles, u32 x, u32 yy)
 {
+    if (avc_tiles)                      /* tiles 16 x 32, a line 16 bytes */
+        return y[((yy >> 5) * tiles + (x >> 4)) * 512 + avc_line(yy & 31) * 16 + (x & 15)];
     return y[((yy >> 4) * tiles + (x >> 5)) * 512 + (yy & 15) * 32 + (x & 31)];
 }
 
+/* the Cb Cr pair at luma (x, yy) */
 static const volatile u8 *chroma_at(const volatile u8 *c, u32 tiles, u32 x, u32 yy)
 {
+    if (avc_tiles) {                    /* tiles 8 pairs x 32 lines */
+        u32 cy = yy >> 1;
+        return c + ((cy >> 5) * tiles + (x >> 4)) * 512 + avc_line(cy & 31) * 16 + (x & 14);
+    }
     return c + ((yy >> 5) * tiles + (x >> 5)) * 512 + ((yy & 0x1E) << 4) + (x & 0x1E);
 }
 
 /* a picture in the decoder's tiled layout (luma y, chroma c, w x h) into a file: 1 written, 0 not (said) */
 static int write_picture(const char *path, const volatile u8 *y, const volatile u8 *c, u32 w, u32 h)
 {
-    u32 tiles = (w + 31) / 32;
+    u32 tiles = avc_tiles ? avc_tiles : (w + 31) / 32;
     int raw = ends_with(path, ".yuv");
     if (ftp_disk_busy() || http_disk_busy()) {      /* (disk.c's one writer is theirs) */
         uprintf("av shot: the FTP server or the web page is moving a file now; try again\n");
@@ -1595,8 +1785,28 @@ static int write_picture(const char *path, const volatile u8 *y, const volatile 
 
 static void shot(const char *path, int frame)
 {
-    if (frame < 0 || !nfrm) {
+    if (frame < 0 || (!h264 && !nfrm) || (h264 && !avc_info()->frames)) {
         uprintf("av shot: no picture decoded yet\n");
+        return;
+    }
+    int first = h264 ? 1 : 0, count = h264 ? avc_info()->frames : nfrm;
+    if (frame >= count) {
+        uprintf("av shot: the frames are %d..%d\n", first, first + count - 1);
+        return;
+    }
+    if (h264) {                         /* (frame: avc.c's number of it; shown as 1.., the engine's own) */
+        const struct avc_info *a = avc_info();
+        if (!avc_number(frame)) {
+            uprintf("av shot: frame %d: the last play decoded nothing into it\n", frame + 1);
+            return;
+        }
+        avc_tiles = a->mbw;
+        int ok = write_picture(path, (const volatile u8 *)KSEG1(avc_luma(frame)),
+                               (const volatile u8 *)KSEG1(avc_chroma(frame)), a->w, a->h);
+        avc_tiles = 0;
+        if (ok)
+            uprintf("av shot: frame %d (picture %u, %c) %u x %u written to %s\n", frame + 1, avc_number(frame),
+                    avc_type(frame), a->w, a->h, path);
         return;
     }
     if (write_picture(path, (const volatile u8 *)KSEG1(AV_WINDOW_PHYS + frm[frame].y),
@@ -1614,8 +1824,13 @@ void av_command(int argc, char **argv)
             return;
         }
         int f = last_shown;
-        if (argc > 3)
-            f = argv[3][0] - '0';
+        if (argc > 3) {                 /* (a frame by its number: MPEG-2 0..4, H.264 1..) */
+            f = 0;
+            for (const char *p = argv[3]; *p >= '0' && *p <= '9' && f < 1000; p++)
+                f = f * 10 + (*p - '0');
+            if (h264)
+                f--;
+        }
         shot(argv[2], f);
     } else if (sub[0] == 's' && sub[1] == 'h' && sub[2] == 'o' && sub[3] == 'w') {
         if (last_shown < 0) {
@@ -1624,7 +1839,7 @@ void av_command(int argc, char **argv)
         }
         osd_was_on = gfx_enabled() || osd_was_on;
         gfx_enable(0);
-        de_setup();
+        show_setup();
         de_show(last_shown);
         uprintf("the last picture on the TV; 'av off' takes it away\n");
     } else if (sub[0] == 'o' && sub[1] == 'f') {
@@ -1650,7 +1865,13 @@ void av_command(int argc, char **argv)
                 DE(0x100), DE(0x104), DE(0x108), DE(0x10C), DE(0x110), DE(0x114), DE(0x118), DE(0x11C), DE(0x134),
                 DE(0x138), DE(0x144), DE(0x148));
         uprintf("  +1c8 %08x +1cc %08x  filters at +1e4 %08x\n", DE(0x1C8), DE(0x1CC), DE(0x1E4));
-        uprintf("player: %u pictures decoded in all; last run %u decoded, %u shown; the frame shown last %d\n",
-                pictures_total, st.pictures, st.shown, last_shown);
+        uprintf("player: %u pictures decoded in all; last run %u decoded, %u shown; ", pictures_total, st.pictures,
+                st.shown);
+        if (last_shown < 0)
+            uprintf("nothing shown\n");
+        else
+            uprintf("the frame shown last %d\n", h264 ? last_shown + 1 : last_shown);
+        if (h264)
+            avc_status();
     }
 }

@@ -111,9 +111,10 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
                        strzalka w prawo / spacja - nastepny obraz z katalogu,
                        w lewo - poprzedni, i - szczegoly, Esc albo q konczy
   play [-n klatki] [-x] [-k] [-v] [-1] <plik>
-                       film z pliku (.ts, .mpg, .m2v, .vob: wideo MPEG-2 albo
-                       MPEG-1, dzwiek MPEG) na TV, dekodowany sprzetowym
-                       dekoderem MPEG-2 ukladu; dzwiek przez "snd". Esc,
+                       film z pliku (.ts, .mpg, .m2v, .vob, .264: wideo
+                       MPEG-2, MPEG-1 albo H.264, dzwiek MPEG) na TV,
+                       dekodowany sprzetowymi dekoderami MPEG-2 / H.264
+                       ukladu; dzwiek przez "snd". Esc,
                        Ctrl-C, q albo EXIT na pilocie konczy; -n tyle klatek,
                        -x tak szybko jak dekoduje (bez dzwieku), -k ostatnia
                        klatka zostaje na TV (zdejmuje ja Esc na klawiaturze
@@ -373,21 +374,28 @@ jak robi to oryginalny soft (dump.bin), 48 kHz na HDMI i na wyjsciu SCART.
 Gry NES graja z dzwiekiem (oba kanaly prostokatne, trojkat, szum, DMC). Na
 pudelku sprawdzone tylko po licznikach (sprzet pobiera probki z predkoscia
 48000/s, nic nie ginie). Test: "video init", "snd init", "snd beep 1000 3000".
-Filmy: "play plik.ts" albo Enter w eksploratorze (.ts, .mpg, .m2v, .vob).
-Obraz dekoduje sprzetowy dekoder MPEG-1/2 ukladu S3811 (ten sam, ktorego
-uzywa oryginalny soft do nagran), dzwiek MPEG (Layer II) dekodowany
-programowo, zmiksowany do mono. Na pudelku: plik 720 x 576, 25 klatek/s,
-6 Mbit/s gra w czasie rzeczywistym (500 klatek w 20,3 s, 0 bledow), klatki
-odczytane z pamieci zgodne z ffmpeg; 1920 x 1080 tez sie dekoduje (do
-24 ms na klatke), ale karta czyta ok. 1 MB/s, wiec duze pliki HD zwalniaja.
+Filmy: "play plik.ts" albo Enter w eksploratorze (.ts, .mpg, .m2v, .vob,
+.264, .h264). Obraz MPEG-1/2 dekoduje sprzetowy dekoder MPEG-2 ukladu S3811
+(ten sam, ktorego uzywa oryginalny soft do nagran), obraz H.264 - drugi
+silnik tego samego bloku (profile Baseline, Main i High, do 1920 x 1080);
+dzwiek MPEG (Layer II) dekodowany programowo, zmiksowany do mono. MPEG-2 na
+pudelku: plik 720 x 576, 25 klatek/s, 6 Mbit/s gra w czasie rzeczywistym
+(500 klatek w 20,3 s, 0 bledow), klatki odczytane z pamieci zgodne
+z ffmpeg; 1920 x 1080 tez sie dekoduje (do 24 ms na klatke), ale pojedyncze
+klatki HD sie spozniaja (3 na 250).
 Skaler obrazu bierze filtry z tablicy w RAM-ie (rejestr +0x1E4 wskazuje
 blok parametrow) - player wpisuje je sam, policzone tak jak w oryginalnym
 sofcie; bez nich obraz na TV byl rozsypany, choc klatki w pamieci dobre.
 Warstwa obrazu czyta klatke linia po linii (tryb 1 w +0x190, bity 17-18);
 w trybie pol (0) obraz mial polowe wysokosci, a pod nim byly smieci.
 Obraz na TV sprawdzony okiem (kamera telefonu): caly, kolory dobre.
-H.264 (DVB-T2, wiekszosc nowych nagran) nie jest obslugiwane - uklad ma do
-tego osobny silnik, jeszcze nie oprogramowany. Pliki wrzucac przez FTP.
+H.264 na pudelku: zwiastun Sintel 1920 x 1080, 24 klatki/s, gra w czasie
+rzeczywistym z dzwiekiem (1253 klatki w 52,6 s, zadna spozniona), klatki
+odczytane z pamieci identyczne co do bajtu z ffmpeg. Nie obslugiwane: H.264
+z przeplotem (1080i, czeste w nagraniach z telewizji HD), 10 bitow, 4:2:2,
+pliki .mp4 (jeszcze nie: przerobic na .ts, np. "ffmpeg -i film.mp4 -c:v copy
+-c:a mp2 film.ts"), HEVC (DVB-T2 w Polsce - uklad nie ma do niego
+dekodera). Pliki wrzucac przez FTP.
 PC z DOS-em: "dos plik.exe" albo Enter w eksploratorze (.exe, .com); jeden
 program bez plikow danych obok (Magicland Dizzy z 1993 ich nie potrzebuje:
 spacja na ekranie ustawien, Z / X albo strzalki - chodzenie, K albo gora -

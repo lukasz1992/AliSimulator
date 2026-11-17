@@ -1,7 +1,8 @@
-/* av.c: a video file player on the S3811's own MPEG-2 decoder ("VE", 0xB8004200) and the display engine's
-   video plane (the "MP" layer under the OSD): 'play <file>' (a .ts, an .mpg program stream or an .m2v
-   elementary stream from a USB disk / the card), sound (MPEG audio Layer II, decoded by mp2.c) through
-   snd.c.  The registers and how the original firmware (dump.bin) drives them are in av.c's header. */
+/* av.c: a video file player on the S3811's own MPEG-2 decoder ("VE", 0xB8004200) -- and its H.264 engine,
+   through avc.c -- and the display engine's video plane (the "MP" layer under the OSD): 'play <file>' (a .ts,
+   an .mpg program stream, an .m2v or .264 elementary stream from a USB disk / the card), sound (MPEG audio
+   Layer II, decoded by mp2.c) through snd.c.  The registers and how the original firmware (dump.bin) drives
+   them are in av.c's and avc.c's headers. */
 #ifndef DEMO_AV_H
 #define DEMO_AV_H
 
@@ -34,7 +35,9 @@ void play_command(int argc, char **argv);       /* (the same for the command tab
 void av_command(int argc, char **argv);
 /* the picture a 'play -k' / 'av show' left on the TV (the OSD hidden under it) taken away: 1 if there was one */
 int av_dismiss(void);
-/* the explorer: is this a file 'play' takes (.ts .mpg .mpeg .m2v .m2t .vob)? */
+/* the explorer: is this a file 'play' takes (.ts .mpg .mpeg .m2v .m2t .vob .trp .264 .h264)? */
 int av_is_video(const char *name);
+/* the data cache written back over [p, p + n) (what the CPU wrote, in RAM before a decoder reads it) */
+void av_cache_flush(const void *p, u32 n);
 
 #endif

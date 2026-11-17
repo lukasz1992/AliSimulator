@@ -607,12 +607,13 @@ masked, everything polled) for the same bootloader. It prints the same banner an
     off it costs nothing and every test result is as before): a game's 994
     frames of sound in 19.8 s all played, none dropped, the game still 8.2 ms
     a frame.
-  - Video files on the chip's own MPEG-2 decoder (`av.c`, `mp2.c`; commands
-    `play [-n frames] [-x] [-k] [-v] [-1] <file>` and `av <status|shot|show|
-    off|reset>`; Enter on a .ts / .mpg / .m2v / .vob in the explorer).
+  - Video files on the chip's own MPEG-2 and H.264 decoders (`av.c`,
+    `avc.c`, `mp2.c`; commands `play [-n frames] [-x] [-k] [-v] [-1] <file>`
+    and `av <status|shot|show|off|reset>`; Enter on a .ts / .mpg / .m2v /
+    .vob / .264 / .h264 in the explorer).
     dump.bin runs every A/V driver on the one MIPS (no second core on the
-    S3811): DECV_S3601 for MPEG-1/2, DECV_AVC for H.264 (a separate engine,
-    not used here), DECA = ALi's libmpg on the CPU, SND (`snd.c`). The
+    S3811): DECV_S3601 for MPEG-1/2, DECV_AVC for H.264 (the same block's
+    second engine, below), DECA = ALi's libmpg on the CPU, SND (`snd.c`). The
     decoder ("VE", 0xB8004200, interrupt 9, reset 0xB8000080 bit 1) decodes
     slices from a buffer at a bit offset / length the CPU gives it and stops
     at the first start code that is not a slice's; the CPU parses the
@@ -650,7 +651,7 @@ masked, everything polled) for the same bootloader. It prints the same banner an
     played); frames read back from RAM (`av shot`) match ffmpeg's to 70 -
     76 dB for I, P and B pictures, interlaced field-DCT, MPEG-1 and
     1920 x 1080 (11 ms a picture on average, 24 at most); Esc ends it in
-    0.22 s and gives the OSD back. Not done: H.264, field pictures (each
+    0.22 s and gives the OSD back. Not done: MPEG-2 field pictures (each
     field into its own frame). The box cannot read its own TV output back
     (VCAP at 0xB800E400 reads all zeros on the S3811), so what the TV shows
     is checked by eye: seen right (the whole 720 x 576 test picture, its
@@ -658,6 +659,52 @@ masked, everything polled) for the same bootloader. It prints the same banner an
     fixes above, each of which was needed (the old filter address again: a
     green mesh). The suite
     checks only how files are taken apart (the emulator has no decoder).
+  - H.264 (`avc.c`: .264 / .h264 elementary streams, transport streams with
+    stream type 0x1B) on the block's other engine, DECV_AVC: the "console"
+    at 0xB8004000 picks it (+0 = 1), its registers are at 0xB8004200 too.
+    The engine does everything below the slice header (CAVLC / CABAC, the
+    predictions, the transforms, the deblocking filter, the implicit
+    weights); the CPU parses the NAL units, the parameter sets and the
+    slice headers, keeps the decoded picture buffer (picture order counts
+    of types 0-2, the reference lists and their modification, the sliding
+    window and MMCO 1-6, the output in display order) and gives the engine
+    each slice as register words, its data from a 256-byte boundary at a
+    bit offset counted in the stream's escaped bytes; its start code
+    detector ends the slice. The register map, from ALi's libcore_hd.a
+    (vdec_avc_hal.o) and dump.bin's newer build, is in `avc.c`'s head; on
+    revision 1 control / start / status are at +0x80 / +0x84 / +0x88
+    (revision 0: +0x20..). Found on the box: the "MB col" buffer (+0x50)
+    holds a region for every frame buffer number k at +0x1000 + k x (32 x
+    the picture's macroblocks + 0x3000, rounded up to 256) -- dump.bin's
+    0x22000 bytes work only because its motion vectors follow; with the
+    neighbour buffer there, the frame buffer whose region reached into it
+    ended its pictures with the error bit (number 0 at 1080p, 5 at 352 x
+    288); a picture's references are marked after its last slice (after
+    its first, a four-slice picture became its own reference); the input
+    registers are written once a slice (twice: time-outs). Frames are
+    tiles one macroblock wide and 32 lines high, every four lines in the
+    order 0, 2, 1, 3; the main picture layer reads that with +0x190 bit 1
+    and the width in macroblocks in +0x178. 1080p takes 12 frame buffers
+    (46 MB with the motion vectors and the "MB col" regions). While the
+    engine decodes a slice the player reads the file and decodes the
+    sound: one after the other, 7 frames of the 1080p trailer below were
+    late. On the box (test code from RAM and the player, every frame read
+    back with `av shot` and compared with ffmpeg's): identical, byte for
+    byte, for Baseline / Main / High, CAVLC and CABAC, I / P / B pictures,
+    up to 5 references, B pictures as references, temporal and spatial
+    direct prediction, explicit and implicit weights, the 8x8 transform,
+    four slices a picture, 352 x 288 to 1920 x 1080. In real time with all
+    their sound: the Sintel trailer (1920 x 1080 High 5.0, 24 frames/s)
+    1253 pictures in 52.6 s, 0 late, 24 ms a picture on average (29 at
+    most); Big Buck Bunny 1280 x 720 High 4.0, 813 in 32.9 s, 0 late;
+    Sintel 720 x 576 Main 3.0, 249 in 10.3 s, 0 late. Not done: interlaced
+    H.264 (field pictures, MBAFF: refused with a message), 4:2:2 / 4:4:4,
+    more than 8 bits, slice groups, data partitioning, SP / SI slices,
+    pictures over 1920 x 1088, .mp4 files; custom scaling matrices are sent
+    as the SDK sends them, not tried on the box; HEVC (stream type 0x24) is
+    named, not played. The suite plays a 32 x 32 H.264 stream in a .ts:
+    its parameter sets read and its picture set up ("video: H.264 Baseline
+    1.0, 32 x 32 ..."), then the emulator's missing engine reported.
 - **File explorer on the TV** (`explorer [n:][path]`, `explorer.c`): the
   current directory's entries (directories first) under a path bar that
   follows `cd` both ways -- a `cd` on the UART lists the new directory, a

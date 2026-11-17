@@ -675,10 +675,11 @@ static const struct command commands[] = {
     {"snd", "<init|beep|status|stop|vol>", "sound output (a prototype of the original firmware's driver: 48 kHz "
      "on HDMI -- after 'video init' -- and the SCART's L/R): init, beep [Hz] [ms] (a sine tone, then what the "
      "DMA did), status (the engine's registers, its DMA position and speed), stop, vol [0..100]", snd_command},
-    {"play", "[-n frames] [-x] [-k] [-v] [-1] <file>", "a video file (.ts, .mpg, .m2v: MPEG-2 / MPEG-1 video, MPEG "
-     "audio) on the TV, decoded by the chip's own MPEG-2 decoder, its sound through 'snd': Esc, Ctrl-C, q or EXIT ends "
-     "(-n: that many frames, -x: as fast as they decode, without sound, -k: the last picture stays on the TV, -v: "
-     "every picture's decoding said, -1: the picture's own size instead of the screen's height)", play_command},
+    {"play", "[-n frames] [-x] [-k] [-v] [-1] <file>", "a video file (.ts, .mpg, .m2v, .264: MPEG-2 / MPEG-1 or H.264 "
+     "video, MPEG audio) on the TV, decoded by the chip's own MPEG-2 / H.264 decoders, its sound through 'snd': Esc, "
+     "Ctrl-C, q or EXIT ends (-n: that many frames, -x: as fast as they decode, without sound, -k: the last picture "
+     "stays on the TV, -v: every picture's (H.264: slice's) decoding said, -1: the picture's own size instead of the "
+     "screen's height)", play_command},
     {"av", "<status|shot <file.bmp|.yuv>|show|off|reset>", "the video player's decoder and picture layer: their "
      "registers, the picture shown last saved to a file (RGB .bmp or raw I420 .yuv), shown again, taken away, the "
      "decoder reset", av_command},
