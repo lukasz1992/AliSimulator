@@ -880,10 +880,11 @@ class VirtualModem(VirtualDevice):
     SIM.  .received lists (interface, bytes) of every packet its AT ports
     took, .sms (number, text) of the messages "sent".  Its RNDIS function
     (interfaces 0 and 1) answers INITIALIZE, QUERY (the MAC address) and SET
-    (the packet filter) and carries frames to a small network behind it: a
-    DHCP server giving 192.168.225.100 (router and DNS .1), ARP for the
-    router, and an echo reply to every ping (.rndis_frames: the frames the
-    host sent).  restart(): it loses its
+    (the packet filter: .rndis_filter) and carries frames to a small network
+    behind it: a DHCP server giving 192.168.225.100 (router and DNS .1), ARP
+    for the router, and an echo reply to every ping (.rndis_frames: the
+    frames the host sent; network_frame() sends one to it).  restart(): it
+    loses its
     configuration -- as the real one once did after AT+CRESET, without the
     port's connection changing -- and once configured again its AT ports say
     RDY, +CPIN: READY, SMS DONE and PB DONE, as after a power-up."""
@@ -937,6 +938,7 @@ class VirtualModem(VirtualDevice):
         self.rndis_answers = []               # RNDIS control messages for GET_ENCAPSULATED_RESPONSE
         self.rndis_in = []                    # RNDIS packet messages for the data IN endpoint
         self.rndis_ready = False
+        self.rndis_filter = None              # the packet filter the host SET (NDIS_PACKET_TYPE_* bits)
 
     def restart(self):
         self.configuration = 0
@@ -987,11 +989,17 @@ class VirtualModem(VirtualDevice):
             self.rndis_answers.append(struct.pack("<IIIIII", 0x80000004, 24 + len(info), rid, status, len(info),
                                                   16 if info else 0) + info)
         elif kind == 5:                                                       # SET
+            if len(m) >= 32 and struct.unpack_from("<I", m, 12)[0] == 0x0001010E:   # OID_GEN_CURRENT_PACKET_FILTER
+                self.rndis_filter = struct.unpack_from("<I", m, 8 + struct.unpack_from("<I", m, 20)[0])[0]
             self.rndis_answers.append(struct.pack("<IIII", 0x80000005, 16, rid, 0))
         elif kind == 6:                                                       # RESET
             self.rndis_answers.append(struct.pack("<IIII", 0x80000006, 16, 0, 0))
         elif kind == 8:                                                       # KEEPALIVE
             self.rndis_answers.append(struct.pack("<IIII", 0x80000008, 16, rid, 0))
+
+    def network_frame(self, frame):
+        """An Ethernet frame from the network behind the module (a test's own: an SSDP search) to the host."""
+        self._rndis_send(bytes(frame))
 
     def _rndis_send(self, frame):
         import struct

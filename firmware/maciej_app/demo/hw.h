@@ -308,11 +308,20 @@ int disk_exists(const char *path);      /* is there a file at that path? (nothin
 u32 disk_changes(void);                 /* changes when a disk comes or goes or a sector is written */
 /* disk.c for ftp.c: a reader and a writer of its own (they last across main loop passes), -1 said why */
 int disk_stat(const char *path, struct disk_entry *o);  /* a file, a directory, a volume's root: 0, -1 */
+struct disk_space {
+    u64 total, avail;                   /* bytes */
+    u32 cluster;                        /* an allocation unit's bytes */
+    char fs[8];                         /* "FAT32", "NTFS" */
+    char label[34];
+    u32 serial;
+};
+int disk_space(const char *path, struct disk_space *o); /* the volume holding path (smb.c): 0, -1 (said why) */
 int disk_stream_open(const char *path, u64 *size);      /* 0, -1 */
-u64 disk_stream_seek(u64 pos);                          /* after the open: on to the cluster / sector holding
-                                                           pos; where it is now (FTP's REST) */
+u64 disk_stream_seek(u64 pos);                          /* to the sector holding pos, forwards or back (FTP's
+                                                           REST, an .mp4's index): where it is now */
 int disk_stream_read(u8 *buf, u32 max);                 /* max: 512 x n, 4096 at most; bytes, 0 the end, -1 */
 void disk_stream_close(void);
+u32 disk_stream_opens(void);            /* how often the reader was opened (a user that kept it: still its?) */
 int disk_upload_open(const char *path, int append);     /* made / emptied / added to: 0, -1 */
 int disk_upload_put(const u8 *data, u32 n);             /* 0, -1 (its clusters freed again) */
 int disk_upload_close(void);                            /* its entry set: 0, -1 */
@@ -320,6 +329,17 @@ int disk_upload_close(void);                            /* its entry set: 0, -1 
 const char *ftp_poll(void);             /* net_poll (the main loop only): a line to show, or 0 */
 void ftp_status(void);                  /* 'netstat' */
 int ftp_disk_busy(void);                /* a file moves (disk.c's reader / writer are FTP's now) */
+/* smb.c: an SMB2 file server on port 445 (Windows' \\box\share: the disks' volumes as shares, no password) */
+#define SMB_RAM_PHYS     0x00900000u      /* its buffers: a listing's entries (1 MB), each client's message in and
+                                             answer out (128 KB each), the pipes' (srvsvc) -- free RAM between the
+                                             demo's stack (to 0x00800000) and the USB / GMA buffers at 0x00F00000 */
+#define SMB_RAM_SIZE     0x00200000u
+/* (amiga.h's AMIGA_RAM_PHYS, 0x00B00000: the Amiga's chip, slow, Kickstart and extension memory, 512 KB each,
+   2 MB to 0x00D00000) */
+const char *smb_poll(void);             /* net_poll (the main loop only): a line to show, or 0 */
+void smb_status(void);                  /* 'netstat' */
+int smb_disk_busy(void);                /* a file is being written (disk.c's writer is the SMB server's now; its
+                                           reader, kept between reads, may be taken: smb.c notices) */
 /* http.c: the web page on port 80 (files, the TV's picture, the command line; no password) */
 const char *http_poll(int in_cmd);      /* net_poll (0), net_uart_poll while a command runs (1): a line, or 0 */
 void http_putc(char c);                 /* uart_putc: every character printed (the page's console) */
@@ -403,6 +423,8 @@ int eth_inside(void);                   /* eth code is reading / handling frames
 void eth_service(void);                 /* the frames waiting and TCP's timers, now (a command's waits) */
 int eth_route(const u8 *ip, u8 mac[6]); /* the next hop's MAC (ARP up to 1 s): 1, 0 */
 int eth_send_ipv4(u8 *frame, const u8 *mac, const u8 *ip, u8 proto, int len);  /* payload at frame + 34 */
+int eth_send_multicast(u8 *frame, const u8 *group, u8 proto, int len, u8 ttl);  /* the same, to a group */
+const u8 *eth_mac(void);                /* the link's MAC */
 int eth_lookup(const char *host, u8 ip[4], const char *who);   /* a.b.c.d or DNS: 1, 0 (said why) */
 int eth_dns_start(const char *name);    /* a DNS question, not waited for: 0, -1 */
 int eth_dns_result(u8 ip[4]);           /* its answer: 1, 0 none yet, -1 no such name */
@@ -443,6 +465,20 @@ int ntp_clock_text(char *buf, int size);        /* "11:23:45 CET" once NTP set t
 u32 net_clock_utc(void);                /* seconds since 1970 (UTC) once NTP set the clock, else 0 */
 void cmd_wget(int argc, char **argv);
 void cmd_ntp(int argc, char **argv);
+/* ssdp.c: SSDP (UPnP discovery, UDP 1900): the box in Windows' Network folder, its web page */
+void ssdp_input(const u8 *src, const u8 *mac, u16 sport, const u8 *data, int len);     /* eth.c (mac: the sender's),
+                                                                                           net.c (to us: mac 0) */
+const char *ssdp_poll(void);            /* net_poll: announcements, answers */
+int ssdp_description(char *buf, int size);      /* http.c: /ssdp/device.xml */
+void ssdp_status(void);                 /* 'netstat' */
+/* tls.c: TLS for wget's https:// (BearSSL 0.6, ../bearssl) over one tcp.c connection at a time */
+void tls_stir(u32 v);                   /* eth.c: each frame as it arrives (randomness for TLS's keys) */
+int tls_begin(int c, const char *host, int check);     /* the handshake (check: the certificate): 1, 0 (said why) */
+int tls_write(const void *data, int n); /* all of it: n, -1 (said why) */
+int tls_read(u8 *buf, int max);         /* bytes, 0 the end, -1 (tls_why) */
+const char *tls_why(void);
+const char *tls_info(void);             /* "TLS 1.2, ECDHE_RSA_WITH_AES_128_GCM_SHA256" */
+void tls_end(void);                     /* close_notify sent (not waited for); the connection stays the caller's */
 void cmd_date(int argc, char **argv);
 void cmd_netstat(int argc, char **argv);
 
@@ -482,9 +518,16 @@ void md_play_region(int region);        /* the console its next game runs on: 'J
 #define VIEW_LIST_PHYS   0x07F00000u      /* the picture's directory, for the next / the one before (1 MB) */
 #define VIEW_LIST_SIZE   0x00100000u
 /* av.c (the video player, av.h): its decoder's buffers in IMAGE_WORK (0x06900000..0x07F00000: the viewer's,
-   never used at the same time), the streams read in 0x05800000..0x05E00000 (between WGET_PHYS's 8 MB and
-   NETLOAD_PHYS) */
+   never used at the same time), the streams read and an .mp4's index in 0x05800000..0x06000000 (between
+   WGET_PHYS's 8 MB and NETLOAD_PHYS) */
 void view_file(const char *path, int once);     /* 'view': the picture on the TV; once: shown, not waited on */
+void view_set_mode(int mode);           /* 'view -s': 1, image.c's decoder only; 'view -c': 2, both compared */
+/* jpeghw.c: baseline JPEG by the video engine's JPEG mode (view.c's first try; image.c's decoder otherwise) */
+const char *jpeghw_plan(const u8 *data, u32 size, u32 data_phys, u32 min_w, u32 min_h, u32 *out_w, u32 *out_h);
+                                        /* 0 (the size it makes: pre-scaled, at least min_w x min_h), or why not */
+const char *jpeghw_detail(void);        /* "4:2:0, 1/2" */
+const char *jpeghw_run(u32 work_phys, u32 work_size, void (*row)(void *ctx, u32 y, const u8 *rgb), void *ctx,
+                       u32 *decode_ms);  /* its rows of RGB: 0, or why not (no row given then) */
 int view_is_picture(const char *name);  /* .jpg .jpeg .png .gif .bmp */
 const char *view_last(void);            /* the path of the picture it showed last (the explorer selects it) */
 void tv_opening(const char *path, int bar);     /* "Opening NAME ..." on the TV at once (bar: a strip at the top,

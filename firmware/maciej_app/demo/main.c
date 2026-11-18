@@ -675,16 +675,18 @@ static const struct command commands[] = {
     {"snd", "<init|beep|status|stop|vol>", "sound output (a prototype of the original firmware's driver: 48 kHz "
      "on HDMI -- after 'video init' -- and the SCART's L/R): init, beep [Hz] [ms] (a sine tone, then what the "
      "DMA did), status (the engine's registers, its DMA position and speed), stop, vol [0..100]", snd_command},
-    {"play", "[-n frames] [-x] [-k] [-v] [-1] <file>", "a video file (.ts, .mpg, .m2v, .264: MPEG-2 / MPEG-1 or H.264 "
-     "video, MPEG audio) on the TV, decoded by the chip's own MPEG-2 / H.264 decoders, its sound through 'snd': Esc, "
+    {"play", "[-n frames] [-x] [-k] [-v] [-1] <file>", "a video file (.ts, .mpg, .m2v, .264, .mp4, .mov: MPEG-2 / "
+     "MPEG-1 or H.264 video, MPEG audio -- an .mp4's sound, AAC, is not played) on the TV, decoded by the chip's own "
+     "MPEG-2 / H.264 decoders, its sound through 'snd': Esc, "
      "Ctrl-C, q or EXIT ends (-n: that many frames, -x: as fast as they decode, without sound, -k: the last picture "
      "stays on the TV, -v: every picture's (H.264: slice's) decoding said, -1: the picture's own size instead of the "
      "screen's height)", play_command},
     {"av", "<status|shot <file.bmp|.yuv>|show|off|reset>", "the video player's decoder and picture layer: their "
      "registers, the picture shown last saved to a file (RGB .bmp or raw I420 .yuv), shown again, taken away, the "
      "decoder reset", av_command},
-    {"view", "[-1] <file>", "a picture (JPEG, PNG, GIF, BMP) on the TV, fitted to it: Right / Space the next one "
-     "in its directory, Left the one before, i its details, Esc or q ends (-1: shown, the command ends)", cmd_view},
+    {"view", "[-1] [-s | -c] <file>", "a picture (JPEG, PNG, GIF, BMP) on the TV, fitted to it: Right / Space the "
+     "next one in its directory, Left the one before, i its details, Esc or q ends (-1: shown, the command ends; a "
+     "baseline JPEG is decoded by the video engine, -s: by the CPU; -c: both, compared, nothing shown)", cmd_view},
     {"sum", "[n:]path", "a file read to its end: its size, CRC-32 (as zlib's, 7-Zip's), first bytes, how fast "
      "(Ctrl-C stops it)", cmd_sum},
     {"mkdir", "<path>", "make a directory (this writes the disk)", cmd_mkdir},
@@ -714,8 +716,9 @@ static const struct command commands[] = {
     {"dhcp", "", "ask the network's DHCP server for an address again", cmd_dhcp},
     {"arp", "", "the ARP table: addresses and the MACs they answer at", cmd_arp},
     /* net.c: wget, NTP, the TCP state (the telnet console on port 23 and netload on 6464 need no command) */
-    {"wget", "[-O n:path] <url>", "an http:// URL: its status line and body on the console, or with -O saved to "
-     "a file (Ctrl-C stops it)", cmd_wget},
+    {"wget", "[-O n:path] [--no-check-certificate] <url>", "an http:// or https:// URL (TLS 1.2; the "
+     "certificate checked against Mozilla's roots and the NTP clock; redirections followed): its status line and "
+     "body on the console, or with -O saved to a file (Ctrl-C stops it)", cmd_wget},
     {"ntp", "[server]", "set the clock from an NTP server (pool.ntp.org; done once after DHCP too)", cmd_ntp},
     {"date", "", "the time of day: UTC and Polish (CET / CEST), once NTP set it", cmd_date},
     {"netstat", "", "TCP: the ports listened on, the connections; the telnet console's client, the FTP server's",
@@ -1583,16 +1586,34 @@ static void cmd_rf(int argc, char **argv)
 
 static void cmd_view(int argc, char **argv)
 {
-    int once = argc > 1 && str_eq(argv[1], "-1"), first = once ? 2 : 1;
+    int once = 0, mode = 0, first = 1;
+    for (; first < argc && argv[first][0] == '-' && argv[first][1] && !argv[first][2]; first++) {
+        if (argv[first][1] == '1')
+            once = 1;
+        else if (argv[first][1] == 's')
+            mode = 1;
+        else if (argv[first][1] == 'c')
+            mode = 2;
+        else
+            break;
+    }
     if (argc <= first) {
-        uprintf("usage: view [-1] <picture file>\n");
+        uprintf("usage: view [-1] [-s | -c] <picture file>\n");
+        return;
+    }
+    if (mode == 2) {                    /* (nothing shown: the console stays) */
+        view_set_mode(2);
+        view_file(joined(argc - first + 1, argv + first - 1), 1);
+        view_set_mode(0);
         return;
     }
     int console = gfx_view_console(), explorer = explorer_shown();
     if (explorer)
         explorer_hide();
     demo_shown = 0;
+    view_set_mode(mode);
     view_file(joined(argc - first + 1, argv + first - 1), once);
+    view_set_mode(0);
     if (!once)
         picture_back(console, explorer);
 }

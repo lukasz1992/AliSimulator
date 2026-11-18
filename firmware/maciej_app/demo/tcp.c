@@ -26,7 +26,8 @@
    or SACK would be the cure). */
 #include "hw.h"
 
-#define CONNS        12              /* (telnet, FTP's two control and data, wget or netload, the web page's six) */
+#define CONNS        14              /* (telnet, FTP's two control and data, wget or netload, the web page's six, the
+                                        SMB server's two) */
 #define LISTENS      8
 #define MSS          1460
 #define SEND_SIZE    32768u             /* each connection's send buffer (the telnet console's output) */

@@ -545,6 +545,7 @@ static int answered;                   /* the engine has finished a slice */
 static int failed;
 static int verbose;                    /* 'play -v': every slice told */
 static int describe;                   /* the stream described in a line when it is set up (not 'play -q') */
+static u32 file_frame_us;              /* a frame's time as the file says it (an .mp4's track), 0 not said */
 static void (*idle_work)(void);        /* the player's, while the engine decodes */
 static u32 pic_us;
 
@@ -1208,7 +1209,8 @@ static int activate(struct sps *s)
     }
     info.sar_w = s->sar_w;
     info.sar_h = s->sar_h;
-    info.frame_us = s->units && s->scale ? muldiv(2 * s->units, 1000000u, s->scale) : 0;
+    info.frame_us = file_frame_us ? file_frame_us : s->units && s->scale ? muldiv(2 * s->units, 1000000u, s->scale)
+                                                                         : 0;
     if (info.frame_us < 5000 || info.frame_us > 200000)
         info.frame_us = 0;              /* (a field rate, or nonsense: the player's default) */
     info.profile = s->profile;
@@ -1323,11 +1325,12 @@ static int slice(const u8 *nal, u32 n, u32 avail, u32 type, u32 ref_idc)
 }
 
 /* ---- the interface ---- */
-void avc_begin(int say, void (*idle)(void))
+void avc_begin(int say, void (*idle)(void), u32 tick, u32 scale)
 {
     int rev1 = chip_rev() != 0;
     verbose = (say & AVC_VERBOSE) != 0;
     describe = (say & AVC_DESCRIBE) != 0;
+    file_frame_us = tick && scale ? muldiv(tick, 1000000u, scale) : 0;
     idle_work = idle;
     r_ctrl = rev1 ? 0x80 : 0x20;
     r_start = rev1 ? 0x84 : 0x24;

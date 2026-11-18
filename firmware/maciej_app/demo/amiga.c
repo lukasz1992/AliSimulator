@@ -70,7 +70,16 @@ typedef signed short s16;
 #define X0          AMIGA_X0            /* the picture's first column and line, in the chips' coordinates */
 #define Y0          AMIGA_Y0
 
+/* chip, slow, Kickstart and extension memory, 512 KB each: in RAM outside the demo's image (amiga.h's
+   AMIGA_RAM_PHYS, through KSEG0; in its .bss they left no room under the stack for the TLS client), zeroed by
+   amiga_load */
+#if defined AMIGA_CPU_TEST || defined AMIGA_HOST          /* (a PC harness: arrays of its own) */
 static u16 chip[0x40000], slow[0x40000], rom[0x40000], ext[0x40000];
+#else
+#define AMIGA_RAM(off)  ((u16 *)(0x80000000u | (AMIGA_RAM_PHYS + (off))))
+static u16 *const chip = AMIGA_RAM(0), *const slow = AMIGA_RAM(0x80000), *const rom = AMIGA_RAM(0x100000),
+           *const ext = AMIGA_RAM(0x180000);
+#endif
 static u32 rom_bytes, ext_bytes;
 static int overlay;                     /* the ROM at 0 too (CIA-A's OVL, at power-on) */
 static u32 lines = 313, lof = 1;        /* this frame's lines; the long-frame bit */
@@ -1720,6 +1729,8 @@ const char *amiga_load(const u8 *kick, u32 kick_size, const u8 *ext_rom, u32 ext
         return "the extension ROM is not 512 KB";
     if (adf && adf_size != 901120)
         return "not an .adf floppy image (901120 bytes: 80 cylinders, 2 sides, 11 sectors of 512 bytes)";
+    for (u32 i = 0; i < 0x40000; i++)  /* (what a 256 KB ROM leaves of its 512 KB, the extension unused: 0) */
+        rom[i] = ext[i] = 0;
     copy_rom(rom, kick, kick_size);
     rom_bytes = kick_size;
     ext_bytes = 0;

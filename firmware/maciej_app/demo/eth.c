@@ -155,10 +155,11 @@ static int ip_text(char *buf, int size, const u8 *ip)
     return usnprintf(buf, size, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
 }
 
-/* frames for us and broadcasts (SET_ETHERNET_PACKET_FILTER: directed | broadcast) */
+/* frames for us, broadcasts and multicasts (SET_ETHERNET_PACKET_FILTER: directed | broadcast | all multicast --
+   SSDP's group 239.255.255.250, ssdp.c; the others are dropped in handle()) */
 static void set_filter(void)
 {
-    (void)usb_request(eth.device, 0x21, 0x43, 0x000C, eth.ctrl_if, 0, 0, 500);
+    (void)usb_request(eth.device, 0x21, 0x43, 0x000E, eth.ctrl_if, 0, 0, 500);
 }
 
 /* ---- frames ---- */
@@ -588,6 +589,7 @@ static const char *handle(int len)
 {
     const u8 *f = rx;
     u16 type = be16(f + 12);
+    tls_stir((u32)len << 16 ^ (u32)f[len - 2] << 8 ^ f[len - 1]);     /* (TLS's randomness: when frames come) */
     int to_us = same(f, eth.mac, 6);
     if (to_us)
         eth.rx_ours++;
@@ -605,7 +607,8 @@ static const char *handle(int len)
             arp_send(2, a + 8, a + 8, a + 14);
         return 0;
     }
-    if (type != 0x0800 || len < 34 || !(to_us || f[0] == 0xFF))
+    int group = f[0] == 0x01 && f[1] == 0x00 && f[2] == 0x5E;  /* (an IPv4 multicast) */
+    if (type != 0x0800 || len < 34 || !(to_us || f[0] == 0xFF || group))
         return 0;
     const u8 *h = f + 14;
     int hl = (h[0] & 15) * 4, total = be16(h + 2);
@@ -613,6 +616,12 @@ static const char *handle(int len)
         return 0;                               /* (no fragments) */
     const u8 *p = h + hl;
     int plen = total - hl;
+    if (group) {                                /* SSDP's (239.255.255.250, UDP 1900): ssdp.c's; others dropped */
+        if (eth.dhcp == 3 && h[9] == 17 && plen >= 8 && h[16] == 239 && h[17] == 255 && h[18] == 255 &&
+            h[19] == 250 && be16(p + 2) == 1900 && be16(p + 4) >= 8 && be16(p + 4) <= plen)
+            ssdp_input(h + 12, f + 6, be16(p), p + 8, be16(p + 4) - 8);
+        return 0;
+    }
     if (h[9] == 17 && plen >= 8 && be16(p + 2) == 68 && be16(p) == 67) {
         if (to_us)
             eth.dhcp_ours++;
@@ -797,6 +806,26 @@ int eth_send_ipv4(u8 *frame, const u8 *mac, const u8 *ip, u8 proto, int len)
     return send_frame(frame, 14 + 20 + len);
 }
 
+/* a multicast IPv4 packet (as eth_send_ipv4's: payload at frame + 34) to `group` -- its MAC 01:00:5E and the
+   group's low 23 bits -- with TTL `ttl`: 0 sent, -1 not */
+int eth_send_multicast(u8 *frame, const u8 *group, u8 proto, int len, u8 ttl)
+{
+    if (!eth_ready() || len > FRAME_MAX - 34)
+        return -1;
+    u8 mac[6] = {0x01, 0x00, 0x5E, (u8)(group[1] & 0x7F), group[2], group[3]};
+    u8 *h = ether(frame, mac, 0x0800);
+    ipv4(h, eth.ip, group, proto, len);
+    h[8] = ttl;
+    h[10] = h[11] = 0;
+    put16(h + 10, checksum(h, 20));
+    return send_frame(frame, 14 + 20 + len);
+}
+
+const u8 *eth_mac(void)                         /* the link's MAC (ssdp.c's UUID) */
+{
+    return eth.mac;
+}
+
 /* "a.b.c.d" or a name (DNS): 1 and its address, 0 (a line starting with `who` said why) */
 int eth_lookup(const char *host, u8 ip[4], const char *who)
 {
@@ -867,11 +896,11 @@ static const char *rndis_start(const struct link *l)
     for (int i = 0; i < 64; i++)
         m[i] = 0;
     put32le(m, 5);                                      /* SET OID_GEN_CURRENT_PACKET_FILTER: directed, multicast,
-                                                           broadcast */
+                                                           all multicast (SSDP's group), broadcast */
     put32le(m + 12, 0x0001010E);
     put32le(m + 16, 4);
     put32le(m + 20, 20);
-    put32le(m + 28, 0x0B);
+    put32le(m + 28, 0x0F);
     if (rndis_call(l, m, 32, 0x80000005, a, sizeof(a)) < 0 || le32(a + 12))
         return "it refused RNDIS's packet filter";
     return 0;

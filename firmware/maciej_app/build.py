@@ -29,10 +29,31 @@ DEFAULT_LOAD_ADDRESS = 0x80000200
 DEMO_SOURCES = ("demo/main.c", "demo/time.c", "demo/uart.c", "demo/gfx.c",
                 "demo/panel.c", "demo/ir.c", "demo/usb.c", "demo/kbd.c", "demo/dog.c", "demo/disk.c",
                 "demo/mouse.c", "demo/console.c", "demo/serial.c", "demo/eth.c",
-                "demo/tcp.c", "demo/net.c", "demo/explorer.c", "demo/ftp.c", "demo/nes.c", "demo/gb.c", "demo/play.c",
+                "demo/tcp.c", "demo/net.c", "demo/explorer.c", "demo/ftp.c", "demo/smb.c", "demo/nes.c", "demo/gb.c",
+                "demo/play.c",
                 "demo/image.c", "demo/view.c", "demo/http.c", "demo/web.S", "demo/rf.c", "demo/snd.c",
                 "demo/z80.c", "demo/sms.c", "demo/zx.c", "demo/a26.c", "demo/c64.c", "demo/amiga.c", "demo/dos.c",
-                "demo/av.c", "demo/avc.c", "demo/mp2.c", "demo/md.c", "demo/zip.c")
+                "demo/av.c", "demo/avc.c", "demo/mp2.c", "demo/md.c", "demo/zip.c", "demo/tls.c",
+                "demo/tls_anchors.S", "demo/ssdp.c", "demo/jpeghw.c")
+BEARSSL = HERE / "bearssl"                      # BearSSL 0.6's files a TLS client needs (bearssl/README.txt)
+
+
+def build_bearssl(prefix, arch_flags, output):
+    """BearSSL's sources (bearssl/src/**/*.c, in name order) compiled into OUTPUT/bearssl/libbearssl.a
+    (deterministic: the same files give the same bytes); its path."""
+    objects = output / "bearssl"
+    if objects.exists():
+        shutil.rmtree(objects)
+    objects.mkdir(parents=True)
+    sources = sorted(BEARSSL.glob("src/**/*.c"), key=lambda p: p.relative_to(BEARSSL).as_posix())
+    flags = [*arch_flags, "-w", "-DBR_USE_URANDOM=0", "-DBR_USE_WIN32_RAND=0", "-DBR_USE_UNIX_TIME=0",
+             "-DBR_USE_WIN32_TIME=0", "-DBR_RDRAND=0", "-DBR_64=0", "-DBR_LOMUL=0",
+             "-I" + str(BEARSSL / "shim"), "-I" + str(BEARSSL / "inc"), "-I" + str(BEARSSL / "src")]
+    subprocess.run([prefix + "gcc", *flags, "-c", *[str(s) for s in sources]], check=True, cwd=objects)
+    library = objects / "libbearssl.a"
+    names = [s.stem + ".o" for s in sources]
+    subprocess.run([prefix + "ar", "rcsD", str(library), *names], check=True, cwd=objects)
+    return library
 
 
 def build(output, version="v1", cross_prefix=None, *, sources=("app.c",),
@@ -60,21 +81,26 @@ def build(output, version="v1", cross_prefix=None, *, sources=("app.c",),
             raise RuntimeError("link.ld no longer has the expected MEMORY line")
         linker_script = output / "link.ld"
         linker_script.write_text(moved, encoding="utf-8")
-    flags = ["-EL", "-march=mips32", "-mabi=32", "-msoft-float", "-mno-mips16",
-             "-mno-abicalls", "-fno-pic", "-fno-pie", "-G0", "-Os", "-ffreestanding",
-             "-fno-builtin", "-fno-stack-protector", "-fno-unwind-tables",
-             "-fno-asynchronous-unwind-tables", "-nostdlib", "-nostartfiles",
+    arch_flags = ["-EL", "-march=mips32", "-mabi=32", "-msoft-float", "-mno-mips16",
+                  "-mno-abicalls", "-fno-pic", "-fno-pie", "-G0", "-Os", "-ffreestanding",
+                  "-fno-builtin", "-fno-stack-protector", "-fno-unwind-tables",
+                  "-fno-asynchronous-unwind-tables"]
+    flags = [*arch_flags, "-nostdlib", "-nostartfiles",
              # Linux cross GCC may default to PIE even with -fno-pie on the
              # compile step. The bootloader supplies no dynamic ELF loader.
              "-static", "-no-pie",
              "-Wall", "-Wextra", "-Werror", f'-DAPP_VERSION="{version}"',
-             # web.S's .incbin finds web.html in the demo's folder
+             # web.S's and tls_anchors.S's .incbin find their files in the demo's folder
              "-Wa,-I" + str(HERE / "demo")]
+    libraries = []
+    if "demo/tls.c" in sources:                 # (wget's https://: BearSSL, its headers for tls.c)
+        libraries.append(str(build_bearssl(prefix, arch_flags, output)))
+        flags += ["-I" + str(BEARSSL / "shim"), "-I" + str(BEARSSL / "inc")]
     for name, value in (defines or {}).items():
         if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
             raise ValueError(f"invalid define name {name!r}")
         flags.append(f"-D{name}" if value is None else f"-D{name}={value}")
-    command = [prefix + "gcc", *flags, str(HERE / start), *[str(HERE / s) for s in sources],
+    command = [prefix + "gcc", *flags, str(HERE / start), *[str(HERE / s) for s in sources], *libraries,
                "-Wl,--build-id=none", "-Wl,-T," + str(linker_script),
                "-Wl,-Map," + str(output / "app.map"), "-o", str(elf)]
     subprocess.run(command, check=True)

@@ -136,7 +136,8 @@ int av_is_video(const char *name)
 {
     return ends_with(name, ".ts") || ends_with(name, ".m2t") || ends_with(name, ".mpg") ||
            ends_with(name, ".mpeg") || ends_with(name, ".m2v") || ends_with(name, ".vob") ||
-           ends_with(name, ".trp") || ends_with(name, ".264") || ends_with(name, ".h264");
+           ends_with(name, ".trp") || ends_with(name, ".264") || ends_with(name, ".h264") ||
+           ends_with(name, ".mp4") || ends_with(name, ".m4v") || ends_with(name, ".mov");
 }
 
 /* ---- FIFOs of elementary stream bytes (linear: the rest moved down when the end is reached) ---- */
@@ -900,7 +901,7 @@ static void de_restore(void)
 }
 
 /* ---- the file and the transport stream / program stream ---- */
-enum { KIND_TS, KIND_PS, KIND_ES };
+enum { KIND_TS, KIND_PS, KIND_ES, KIND_MP4 };
 static int kind, file_end;
 static u16 pmt_pid, video_pid, audio_pid;
 static u8 video_type, audio_type, video_cc = 0xFF;
@@ -1124,11 +1125,459 @@ static void ps_parse(void)
 
 static u8 chunk[4096];
 
+/* ---- MP4 / QuickTime files (.mp4 .m4v .mov): the H.264 track's samples to ves as an elementary stream ----
+   The file is boxes: a 32-bit size (1: a 64-bit one follows the type, 0: to the file's end), a type, the
+   contents.  Its index, moov, lies before or after the samples (mdat): it is read whole into ves first, the
+   video track's tables -- stsc (samples a chunk), stsz (their sizes), stco / co64 (the chunks' places) -- are
+   kept at AV_INDEX_PHYS as the file has them, and the samples are read in their order, each chunk from its
+   place (the sound's chunks between them passed over).  A sample is a picture's NAL units, each after a 1, 2 or
+   4-byte length: each length becomes a start code, the SPS / PPS of the avcC box go first -- avc.c is given an
+   H.264 elementary stream.  The frame rate is the track's (stts, mdhd's time scale).  The sound is not played
+   (AAC, the usual one, is not decoded here). */
+#define FOURCC(a, b, c, d) ((u32)(a) << 24 | (u32)(b) << 16 | (u32)(c) << 8 | (u32)(d))
+
+static u32 be16(const u8 *p)
+{
+    return (u32)p[0] << 8 | p[1];
+}
+
+static u32 be32(const u8 *p)
+{
+    return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3];
+}
+
+static u64 be64(const u8 *p)
+{
+    return (u64)be32(p) << 32 | be32(p + 4);
+}
+
+static struct {
+    u32 samples, chunks, nstsc;         /* the video track's */
+    u32 same_size;                      /* stsz's one size for every sample (0: its table) */
+    const u8 *stsz, *stco, *stsc;       /* the tables, big-endian as in the file (at AV_INDEX_PHYS) */
+    u32 co64, len_size;                 /* 8-byte chunk places; the NAL units' length fields: 1, 2 or 4 bytes */
+    u32 tick, scale;                    /* a frame: tick / scale seconds (0: not said) */
+    u32 i, chunk, chunk_left, stsc_at;  /* the next sample; the chunk read, its samples to come, its stsc entry */
+    u64 at;                             /* the file's next byte wanted */
+    u32 left;                           /* the bytes of the sample being read still to come */
+    u32 nal_left, len_acc, len_have;    /* the NAL unit being copied: its bytes to come; its length field */
+    u64 buf_pos, rd_pos;                /* chunk[] holds the file's bytes from buf_pos on; the reader is at rd_pos */
+    u32 buf_len;
+} mp4;
+
+/* the box at *p (before end): its type, its contents [*body, *body + *n); *p past it: 1, 0 none (or damaged) */
+static int box_next(const u8 **p, const u8 *end, u32 *type, const u8 **body, u32 *n)
+{
+    const u8 *q = *p;
+    if (end - q < 8)
+        return 0;
+    u32 size = be32(q), head = 8;
+    if (size == 1) {                    /* (a 64-bit size: inside moov never over 4 GB) */
+        if (end - q < 16 || be32(q + 8))
+            return 0;
+        size = be32(q + 12);
+        head = 16;
+    } else if (!size)
+        size = (u32)(end - q);
+    if (size < head || size > (u32)(end - q))
+        return 0;
+    *type = be32(q + 4);
+    *body = q + head;
+    *n = size - head;
+    *p = q + size;
+    return 1;
+}
+
+/* the first box of `type` among the boxes in [p, p + n): its contents, *len their size; 0 none (p 0: none) */
+static const u8 *box_find(const u8 *p, u32 n, u32 type, u32 *len)
+{
+    const u8 *body;
+    u32 t;
+    *len = 0;
+    if (!p)
+        return 0;
+    const u8 *end = p + n;
+    while (box_next(&p, end, &t, &body, len))
+        if (t == type)
+            return body;
+    *len = 0;
+    return 0;
+}
+
+static void fourcc_text(u32 t, char s[5])
+{
+    for (int i = 0; i < 4; i++) {
+        u8 c = (u8)(t >> (24 - 8 * i));
+        s[i] = c >= 32 && c < 127 ? (char)c : '?';
+    }
+    s[4] = 0;
+}
+
+/* an MPEG-4 descriptor `tag` at p: its contents (after its tag and its length's 1-4 bytes), 0 another */
+static const u8 *descriptor(const u8 *p, const u8 *end, u32 tag)
+{
+    if (p >= end || *p != tag)
+        return 0;
+    p++;
+    for (int i = 0; i < 4 && p < end; i++)
+        if (!(*p++ & 0x80))
+            break;
+    return p < end ? p : 0;
+}
+
+/* a sound track's codec, named (an mp4a's esds says which: its object type) */
+static const char *sound_name(u32 type, const u8 *e, u32 n)
+{
+    if (type == FOURCC('a', 'c', '-', '3'))
+        return "AC-3";
+    if (type == FOURCC('e', 'c', '-', '3'))
+        return "E-AC-3";
+    if (type == FOURCC('O', 'p', 'u', 's'))
+        return "Opus";
+    if (type == FOURCC('.', 'm', 'p', '3'))
+        return "MP3";
+    if (type == FOURCC('a', 'l', 'a', 'c') || type == FOURCC('f', 'L', 'a', 'C'))
+        return "lossless (ALAC / FLAC)";
+    if (type == FOURCC('s', 'o', 'w', 't') || type == FOURCC('t', 'w', 'o', 's') || type == FOURCC('l', 'p', 'c', 'm') ||
+        type == FOURCC('i', 'p', 'c', 'm'))
+        return "PCM";
+    if (type != FOURCC('m', 'p', '4', 'a') || n < 28)
+        return "of another kind";
+    u32 skip = 28 + (be16(e + 8) == 1 ? 16 : be16(e + 8) == 2 ? 36 : 0), len = 0, wn = 0, oti = 0;   /* (QuickTime's
+                                                                                                    versions) */
+    const u8 *es = skip < n ? box_find(e + skip, n - skip, FOURCC('e', 's', 'd', 's'), &len) : 0;
+    if (!es && skip < n)                /* (a .mov: inside a wave box) */
+        es = box_find(box_find(e + skip, n - skip, FOURCC('w', 'a', 'v', 'e'), &wn), wn, FOURCC('e', 's', 'd', 's'),
+                      &len);
+    if (es && len > 7) {                /* ES_Descriptor (3): ES_ID, flags (and what they announce), then
+                                           DecoderConfigDescriptor (4): the object type */
+        const u8 *end = es + len, *d = descriptor(es + 4, end, 3);
+        if (d && d + 3 < end) {
+            u32 f = d[2];
+            d += 3 + (f & 0x80 ? 2 : 0);
+            if ((f & 0x40) && d < end)
+                d += 1 + *d;
+            d += f & 0x20 ? 2 : 0;
+            d = descriptor(d, end, 4);
+            oti = d ? *d : 0;
+        }
+    }
+    return oti == 0x40 || (oti >= 0x66 && oti <= 0x68) ? "AAC" : oti == 0x69 || oti == 0x6B ? "MPEG audio (MP3 / MP2)" :
+           oti == 0xA5 ? "AC-3" : oti == 0xA6 ? "E-AC-3" : "mp4a, of another kind";
+}
+
+/* the piece of the file holding byte `pos` into chunk[] (a seek first when the reader is not just before it):
+   0, -1 (said) */
+static int mp4_fill(u64 pos)
+{
+    if (pos < mp4.rd_pos || pos >= mp4.rd_pos + sizeof(chunk)) {
+        u64 got = disk_stream_seek(pos);
+        if (got > pos) {
+            uprintf("play: seeking in the file failed\n");
+            return -1;
+        }
+        mp4.rd_pos = got;
+    }
+    for (;;) {
+        int n = disk_stream_read(chunk, sizeof(chunk));
+        if (n <= 0) {
+            uprintf(n < 0 ? "play: reading the file failed\n" : "play: the file ends before its samples do\n");
+            return -1;
+        }
+        st.bytes_read += (u32)n;
+        mp4.buf_pos = mp4.rd_pos;
+        mp4.buf_len = (u32)n;
+        mp4.rd_pos += (u32)n;
+        if (pos < mp4.rd_pos)
+            return 0;
+    }
+}
+
+/* n bytes of the file at pos into `to`: 0, -1 (said) */
+static int mp4_read(u64 pos, u8 *to, u32 n)
+{
+    while (n) {
+        if ((pos < mp4.buf_pos || pos >= mp4.buf_pos + mp4.buf_len) && mp4_fill(pos) < 0)
+            return -1;
+        u32 off = (u32)(pos - mp4.buf_pos), k = mp4.buf_len - off < n ? mp4.buf_len - off : n;
+        copy(to, chunk + off, k);
+        to += k;
+        pos += k;
+        n -= k;
+    }
+    return 0;
+}
+
+/* the moov in [m, m + n): the first H.264 video track's tables (to AV_INDEX_PHYS), its avcC's parameter sets
+   (to *avcc, *avcc_n bytes), its frame rate; the sound named: 0, -1 not played (said) */
+static int mp4_index(const u8 *m, u32 n, const u8 **avcc, u32 *avcc_n)
+{
+    const u8 *p = m, *trak, *stbl = 0, *mdhd = 0;
+    u32 type, len, stbl_n = 0, track = 0, video = 0, other = 0;
+    const char *sound = 0;
+    char cc[5];
+    while (box_next(&p, m + n, &type, &trak, &len)) {
+        if (type != FOURCC('t', 'r', 'a', 'k'))
+            continue;
+        track++;
+        u32 mn = 0, hn = 0, dn = 0, fn = 0, bn = 0, sn = 0;
+        const u8 *mdia = box_find(trak, len, FOURCC('m', 'd', 'i', 'a'), &mn);
+        const u8 *hdlr = box_find(mdia, mn, FOURCC('h', 'd', 'l', 'r'), &hn);
+        const u8 *mh = box_find(mdia, mn, FOURCC('m', 'd', 'h', 'd'), &dn);
+        const u8 *minf = box_find(mdia, mn, FOURCC('m', 'i', 'n', 'f'), &fn);
+        const u8 *st = box_find(minf, fn, FOURCC('s', 't', 'b', 'l'), &bn);
+        const u8 *stsd = box_find(st, bn, FOURCC('s', 't', 's', 'd'), &sn);
+        if (!hdlr || hn < 12 || !mh || dn < 24 || !stsd || sn < 16 || be32(stsd + 8) < 16 || be32(stsd + 8) > sn - 8)
+            continue;
+        u32 handler = be32(hdlr + 8), entry = be32(stsd + 12);  /* (the first sample entry's type) */
+        if (handler == FOURCC('s', 'o', 'u', 'n') && !sound)
+            sound = sound_name(entry, stsd + 16, be32(stsd + 8) - 8);
+        if (handler != FOURCC('v', 'i', 'd', 'e') || video)
+            continue;
+        if (entry != FOURCC('a', 'v', 'c', '1') && entry != FOURCC('a', 'v', 'c', '3')) {
+            other = other ? other : entry;
+            continue;
+        }
+        /* avc1: 8 bytes of SampleEntry, 70 of VisualSampleEntry, then its boxes -- avcC among them */
+        u32 an, en = be32(stsd + 8) - 8;
+        const u8 *a = en > 78 ? box_find(stsd + 16 + 78, en - 78, FOURCC('a', 'v', 'c', 'C'), &an) : 0;
+        if (!a || an < 7 || a[0] != 1 || (a[4] & 3) == 2) {
+            uprintf("play: track %u's H.264 has no usable avcC box: not played\n", track);
+            return -1;
+        }
+        mp4.len_size = (a[4] & 3) + 1u;
+        *avcc = a;
+        *avcc_n = an;
+        video = track;
+        stbl = st;
+        stbl_n = bn;
+        mdhd = mh;
+    }
+    if (!video) {
+        fourcc_text(other, cc);
+        if (other)
+            uprintf("play: the video is %s (%s): only H.264 (avc1) is played from an .mp4\n", cc,
+                    other == FOURCC('h', 'v', 'c', '1') || other == FOURCC('h', 'e', 'v', '1') ? "HEVC" :
+                    other == FOURCC('m', 'p', '4', 'v') ? "MPEG-4 part 2" : other == FOURCC('a', 'v', '0', '1') ?
+                    "AV1" : other == FOURCC('v', 'p', '0', '9') ? "VP9" : "not decoded here");
+        else
+            uprintf("play: no video track in its index\n");
+        return -1;
+    }
+    /* the frame rate: the commonest time between two samples (stts), in mdhd's time scale */
+    u32 tn, zn, cn, on, scale = be32(mdhd + (mdhd[0] == 1 ? 20 : 12));
+    const u8 *stts = box_find(stbl, stbl_n, FOURCC('s', 't', 't', 's'), &tn);
+    const u8 *stsz = box_find(stbl, stbl_n, FOURCC('s', 't', 's', 'z'), &zn);
+    const u8 *stsc = box_find(stbl, stbl_n, FOURCC('s', 't', 's', 'c'), &cn);
+    const u8 *stco = box_find(stbl, stbl_n, FOURCC('s', 't', 'c', 'o'), &on);
+    mp4.co64 = !stco;
+    if (!stco)
+        stco = box_find(stbl, stbl_n, FOURCC('c', 'o', '6', '4'), &on);
+    if (stts && tn >= 8) {
+        u32 most = 0;
+        for (u32 i = 0, k = be32(stts + 4); i < k && 16 + 8 * i <= tn; i++)
+            if (be32(stts + 8 + 8 * i) > most) {
+                most = be32(stts + 8 + 8 * i);
+                mp4.tick = be32(stts + 12 + 8 * i);
+            }
+        mp4.scale = mp4.tick ? scale : 0;
+    }
+    if (!stsz || !stsc || !stco || zn < 12 || cn < 8 || on < 8) {
+        uprintf(box_find(stbl, stbl_n, FOURCC('s', 't', 'z', '2'), &zn) ?
+                "play: the samples' sizes are in an stz2 box: not read here\n" :
+                "play: its video track has no samples in its index (a fragmented .mp4, moof: not read here)\n");
+        return -1;
+    }
+    mp4.same_size = be32(stsz + 4);
+    mp4.samples = be32(stsz + 8);
+    mp4.nstsc = be32(stsc + 4);
+    mp4.chunks = be32(stco + 4);
+    u32 zb = mp4.same_size ? 0 : 4 * mp4.samples, cb = 12 * mp4.nstsc, ob = (mp4.co64 ? 8 : 4) * mp4.chunks;
+    if (!mp4.samples || !mp4.nstsc || !mp4.chunks || zn < 12 + zb || cn < 8 + cb || on < 8 + ob ||
+        be32(stsc + 8) != 1) {
+        uprintf("play: its index is damaged (%u samples, %u chunks)\n", mp4.samples, mp4.chunks);
+        return -1;
+    }
+    if (zb + cb + ob > AV_INDEX_SIZE) {
+        uprintf("play: its index needs %u KB: more than this player keeps (%u KB)\n", (zb + cb + ob) >> 10,
+                AV_INDEX_SIZE >> 10);
+        return -1;
+    }
+    u8 *x = (u8 *)KSEG0(AV_INDEX_PHYS);
+    copy(x, stsz + 12, zb);
+    copy(x + zb, stsc + 8, cb);
+    copy(x + zb + cb, stco + 8, ob);
+    mp4.stsz = x;
+    mp4.stsc = x + zb;
+    mp4.stco = x + zb + cb;
+    u32 fps = mp4.tick ? (mp4.scale / mp4.tick) * 100 + (mp4.scale % mp4.tick) * 100 / mp4.tick : 0;
+    uprintf("mp4: video track %u: H.264, %u frames, ", video, mp4.samples);
+    if (fps)
+        uprintf("%u.%02u frames/s", fps / 100, fps % 100);
+    else
+        uprintf("its frame rate not said");
+    if (sound)
+        uprintf("; sound: %s, not played\n", sound);
+    else
+        uprintf("; no sound\n");
+    return 0;
+}
+
+/* an MP4 / QuickTime file's first box */
+static int mp4_file(const u8 *p, int n)
+{
+    if (n < 8)
+        return 0;
+    u32 size = be32(p), type = be32(p + 4);
+    return (size >= 8 || size == 1) && (type == FOURCC('f', 't', 'y', 'p') || type == FOURCC('m', 'o', 'o', 'v') ||
+           type == FOURCC('m', 'd', 'a', 't') || type == FOURCC('w', 'i', 'd', 'e') || type == FOURCC('f', 'r', 'e', 'e') ||
+           type == FOURCC('s', 'k', 'i', 'p'));
+}
+
+/* the file (`size` bytes; its first chunk[0..got) read) opened as an .mp4: its boxes walked to moov, the index
+   read into ves and taken apart, the parameter sets put into ves: 0, -1 not played (said) */
+static int mp4_open(u64 size, u32 got)
+{
+    static const u8 start[3] = {0, 0, 1};
+    u8 h[16];
+    u64 pos = 0, moov_at = 0, moov_n = 0;
+    mp4.buf_pos = 0;
+    mp4.buf_len = got;
+    mp4.rd_pos = got;
+    while (pos + 8 <= size) {
+        if (mp4_read(pos, h, pos + 16 <= size ? 16 : 8) < 0)
+            return -1;
+        u64 n = be32(h), head = 8;
+        if (n == 1) {
+            n = pos + 16 <= size ? be64(h + 8) : 0;
+            head = 16;
+        } else if (!n)
+            n = size - pos;
+        if (n < head || n > size - pos)
+            break;                      /* (damaged, or cut short: what came before is used) */
+        if (be32(h + 4) == FOURCC('m', 'o', 'o', 'v')) {
+            moov_at = pos + head;
+            moov_n = n - head;
+            break;
+        }
+        pos += n;
+    }
+    if (!moov_n) {
+        uprintf("play: no index (moov) in the file: not played\n");
+        return -1;
+    }
+    if (moov_n > ves.size) {
+        uprintf("play: its index (moov) has %u KB: more than this player reads (%u KB)\n", (u32)(moov_n >> 10),
+                ves.size >> 10);
+        return -1;
+    }
+    if (mp4_read(moov_at, ves.buf, (u32)moov_n) < 0)
+        return -1;
+    const u8 *a = 0;
+    u32 an = 0;
+    if (mp4_index(ves.buf, (u32)moov_n, &a, &an) < 0)
+        return -1;
+    /* the avcC's SPS and PPS first (its 5 bits of SPS count, then each with a 16-bit length; then the PPS count
+       and each); they go to the start of ves, over moov, which is used up -- copied first */
+    static u8 sets[1024];
+    u32 sn = an - 5 < sizeof(sets) ? an - 5 : sizeof(sets);
+    copy(sets, a + 5, sn);
+    ves.rd = ves.wr = 0;
+    u32 i = 0;
+    for (int list = 0; list < 2 && i < sn; list++) {
+        u32 count = list ? sets[i] : sets[i] & 31u;
+        i++;
+        for (u32 k = 0; k < count && i + 2 <= sn; k++) {
+            u32 len = be16(sets + i);
+            if (i + 2 + len > sn)
+                break;
+            put(&ves, start, 3, 1);
+            put(&ves, sets + i + 2, len, 1);
+            i += 2 + len;
+        }
+    }
+    mp4.i = 0;
+    mp4.chunk = ~0u;                    /* (the first chunk is the next) */
+    mp4.chunk_left = mp4.stsc_at = mp4.left = 0;
+    return 0;
+}
+
+/* the next sample's place and size (mp4.at, mp4.left): 0, -1 none left */
+static int mp4_sample(void)
+{
+    if (mp4.i >= mp4.samples)
+        return -1;
+    while (!mp4.chunk_left) {           /* the next chunk: its samples (stsc), its place (stco / co64) */
+        if (++mp4.chunk >= mp4.chunks)
+            return -1;
+        while (mp4.stsc_at + 1 < mp4.nstsc && be32(mp4.stsc + 12 * (mp4.stsc_at + 1)) <= mp4.chunk + 1)
+            mp4.stsc_at++;
+        mp4.chunk_left = be32(mp4.stsc + 12 * mp4.stsc_at + 4);
+        mp4.at = mp4.co64 ? be64(mp4.stco + 8 * mp4.chunk) : be32(mp4.stco + 4 * mp4.chunk);
+    }
+    mp4.left = mp4.same_size ? mp4.same_size : be32(mp4.stsz + 4 * mp4.i);
+    mp4.i++;
+    mp4.chunk_left--;
+    mp4.nal_left = mp4.len_acc = mp4.len_have = 0;  /* (a sample starts with a length field) */
+    return 0;
+}
+
+/* a piece of a sample to ves: each NAL unit's length field becomes a start code */
+static void mp4_nals(const u8 *p, u32 n)
+{
+    static const u8 start[3] = {0, 0, 1};
+    while (n) {
+        if (!mp4.nal_left) {
+            mp4.len_acc = mp4.len_acc << 8 | *p++;
+            n--;
+            if (++mp4.len_have < mp4.len_size)
+                continue;
+            mp4.nal_left = mp4.len_acc;
+            mp4.len_acc = mp4.len_have = 0;
+            put(&ves, start, 3, 1);
+            continue;
+        }
+        u32 k = n < mp4.nal_left ? n : mp4.nal_left;
+        put(&ves, p, k, 1);
+        p += k;
+        n -= k;
+        mp4.nal_left -= k;
+    }
+}
+
+/* feed()'s for an .mp4: the video samples' next bytes (a piece of the file read at most): 1, 0 the end */
+static int mp4_feed(void)
+{
+    if (!mp4.left && mp4_sample() < 0) {
+        file_end = eos = 1;
+        return 0;
+    }
+    if ((mp4.at < mp4.buf_pos || mp4.at >= mp4.buf_pos + mp4.buf_len) && mp4_fill(mp4.at) < 0) {
+        file_end = eos = 1;             /* (said) */
+        return 0;
+    }
+    while (mp4.at >= mp4.buf_pos && mp4.at < mp4.buf_pos + mp4.buf_len) {
+        u32 off = (u32)(mp4.at - mp4.buf_pos), k = mp4.buf_len - off < mp4.left ? mp4.buf_len - off : mp4.left;
+        mp4_nals(chunk + off, k);
+        mp4.at += k;
+        mp4.left -= k;
+        if (mp4.left)
+            break;                      /* (the sample goes on in the next piece) */
+        if (mp4_sample() < 0) {
+            file_end = eos = 1;
+            break;
+        }
+    }
+    return 1;
+}
+
 /* a piece of the file read and taken apart: 1, 0 the file's end (or a read error: said) */
 static int feed(void)
 {
     if (file_end)
         return 0;
+    if (kind == KIND_MP4)
+        return mp4_feed();
     int got = disk_stream_read(chunk, sizeof(chunk));
     if (got <= 0) {
         if (got < 0)
@@ -1288,10 +1737,11 @@ static int want_data(void);
 
 /* while the engine decodes a slice: a piece of the file read -- only while it fits behind the stream's bytes
    without moving them (the engine reads them; one piece of a transport stream or an elementary stream puts at
-   most its own size) -- or the sound fed */
+   most its own size, of an .mp4 at most twice that: a start code for each 1-byte length field) -- or the sound
+   fed */
 static void while_decoding(void)
 {
-    if (want_data() && ves.wr + sizeof(chunk) <= ves.size && aes.wr + sizeof(chunk) <= aes.size)
+    if (want_data() && ves.wr + 2 * sizeof(chunk) <= ves.size && aes.wr + sizeof(chunk) <= aes.size)
         (void)feed();
     else if (sound_on)
         sound_service();
@@ -1386,6 +1836,9 @@ static void reset_state(void)
     u32 *z = (u32 *)&st;
     for (u32 i = 0; i < sizeof(st) / 4; i++)
         z[i] = 0;
+    z = (u32 *)&mp4;
+    for (u32 i = 0; i < sizeof(mp4) / 4; i++)
+        z[i] = 0;
 }
 
 static void show_next(void)
@@ -1429,12 +1882,12 @@ int av_play(int argc, char **argv)
             path = a;
     }
     if (!path) {
-        uprintf("usage: play [-n frames] [-x] [-k] [-v] [-q] [-1] <file.ts|.mpg|.m2v|.264>\n");
+        uprintf("usage: play [-n frames] [-x] [-k] [-v] [-q] [-1] <file.ts|.mpg|.m2v|.264|.mp4>\n");
         return -1;
     }
-    if (ftp_disk_busy() || http_disk_busy()) {      /* (disk.c has one reader: taken, their download would
-                                                       end as if the file did) */
-        uprintf("play: the FTP server or the web page is moving a file now; try again\n");
+    if (ftp_disk_busy() || http_disk_busy() || smb_disk_busy()) {   /* (disk.c has one reader: taken, their
+                                                       download would end as if the file did) */
+        uprintf("play: the FTP server, the web page or the SMB server is moving a file now; try again\n");
         return -1;
     }
     u64 size = 0;
@@ -1454,20 +1907,29 @@ int av_play(int argc, char **argv)
         kind = KIND_PS;
     else if (!chunk[0] && !chunk[1] && chunk[2] == 1 && chunk[3] == 0xB3)
         kind = KIND_ES;
-    else if (annexb_h264(chunk, got)) {
+    else if (mp4_file(chunk, got)) {    /* (before the H.264 test: "00 00 00 01" is also a 64-bit box size) */
+        kind = KIND_MP4;
+        video_type = 0x1B;
+    } else if (annexb_h264(chunk, got)) {
         kind = KIND_ES;
         video_type = 0x1B;
     } else {
-        uprintf("play: %s: not a transport stream, a program stream or an MPEG / H.264 video stream\n", path);
+        uprintf("play: %s: not a transport stream, a program stream, an .mp4 or an MPEG / H.264 video stream\n",
+                path);
         disk_stream_close();
         return -1;
     }
     uprintf("play: %s, %u bytes, %s\n", path, (u32)size,
-            kind == KIND_TS ? "transport stream" : kind == KIND_PS ? "program stream" :
-            video_type == 0x1B ? "H.264 elementary stream" : "MPEG video elementary stream");
+            kind == KIND_TS ? "transport stream" : kind == KIND_PS ? "program stream" : kind == KIND_MP4 ?
+            "MP4 / QuickTime file" : video_type == 0x1B ? "H.264 elementary stream" : "MPEG video elementary stream");
     /* (the first chunk taken apart as feed() does) */
     st.bytes_read = (u32)got;
-    if (kind == KIND_ES)
+    if (kind == KIND_MP4) {
+        if (mp4_open(size, (u32)got) < 0) {
+            disk_stream_close();
+            return -1;
+        }
+    } else if (kind == KIND_ES)
         put(&ves, chunk, (u32)got, 1);
     else if (kind == KIND_TS) {
         for (int i = 0; i + 188 <= got; i += 188)
@@ -1517,7 +1979,8 @@ int av_play(int argc, char **argv)
         }
         if (video_type == 0x1B && !h264) {
             h264 = 1;                   /* (avc.c's engine from now on: the MPEG-2 one's reset above is undone) */
-            avc_begin((quiet ? 0 : AVC_DESCRIBE) | (verbose ? AVC_VERBOSE : 0), fast ? 0 : while_decoding);
+            avc_begin((quiet ? 0 : AVC_DESCRIBE) | (verbose ? AVC_VERBOSE : 0), fast ? 0 : while_decoding,
+                      mp4.tick, mp4.scale);
         }
         /* show */
         u64 now = now_ticks();
@@ -1737,8 +2200,8 @@ static int write_picture(const char *path, const volatile u8 *y, const volatile 
 {
     u32 tiles = avc_tiles ? avc_tiles : (w + 31) / 32;
     int raw = ends_with(path, ".yuv");
-    if (ftp_disk_busy() || http_disk_busy()) {      /* (disk.c's one writer is theirs) */
-        uprintf("av shot: the FTP server or the web page is moving a file now; try again\n");
+    if (ftp_disk_busy() || http_disk_busy() || smb_disk_busy()) {   /* (disk.c's one writer is theirs) */
+        uprintf("av shot: the FTP server, the web page or the SMB server is moving a file now; try again\n");
         return 0;
     }
     if (disk_upload_open(path, 0) < 0)

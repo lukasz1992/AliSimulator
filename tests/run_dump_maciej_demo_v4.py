@@ -5,7 +5,8 @@ Boots the shipped v4 flash image (firmware/maciej_app/bin: dump_maciej.bin
 with the demo as its main code, started by the original bootloader) and
 drives it only through its inputs -- UART bytes, IR frames into the remote
 control receiver, front-panel key presses on the TM1650, a USB stick, a USB
-keyboard, a USB mouse and a USB hub with devices behind it plugged into the
+keyboard, a USB mouse, a USB hub with devices behind it and an LTE module
+(its AT ports; its RNDIS network link, where SSDP is checked) plugged into the
 host port --
 and checks its outputs: the
 command line (whole lines, editing, history, every command; typed on the UART
@@ -1392,6 +1393,46 @@ TINY_H264 = bytes.fromhex(
     "00000001" "419a202bcb")                                      # the P picture's
 
 
+# A 32 x 16 baseline JPEG, 4:2:0, its left half red and its right half blue -- made with Pillow:
+#   Image.fromarray(a, "RGB").save(f, "JPEG", quality=90, subsampling=2, optimize=True)
+TINY_JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffdb0043000302020302020303030304030304050805050404050a070706"
+    "080c0a0c0c0b0a0b0b0d0e12100d0e110e0b0b1016101113141515150c0f171816141812141514ffdb004301030404050405"
+    "09050509140d0b0d141414141414141414141414141414141414141414141414141414141414141414141414141414141414"
+    "1414141414141414ffc00011080010002003012200021101031101ffc4001600010101000000000000000000000000000007"
+    "08ffc40014100100000000000000000000000000000000ffc4001501010100000000000000000000000000000907ffc40014"
+    "110100000000000000000000000000000000ffda000c03010002110311003f00ce8021854d0200e30747ffd9")
+
+
+def check_view_jpeg(box):
+    """The picture viewer on a baseline JPEG ('view'): the video engine's JPEG mode first (jpeghw.c) -- the
+    emulator has none (its registers are plain RAM), so jpeghw finds the engine read nothing and image.c's decoder
+    shows it: red on the left, blue on the right, 40 times larger (1280 x 640), black above; 'view -s' does not try
+    the engine; 'view -c' (both, compared) says why the engine's half failed."""
+    import fat_image
+    stick = VirtualStick(fat_image.build({"PICS/RB.JPG": TINY_JPEG}, fat=12, size_mb=1, partition=False))
+    box.usb.attach("high", stick)
+    box.run(4.0)
+    sim = box.sim
+    out = shell(box, "view -1 1:/PICS/RB.JPG", timeout=60)
+    left, right, top = fb_pixel(sim, 320, 360), fb_pixel(sim, 960, 360), fb_pixel(sim, 640, 20)
+    soft = shell(box, "view -1 -s 1:/PICS/RB.JPG", timeout=60)
+    both = shell(box, "view -c 1:/PICS/RB.JPG", timeout=60)
+
+    def hue(v):
+        r, b = (v >> 10) & 31, v & 31
+        return "red" if r > b + 8 else "blue" if b > r + 8 else ""
+    ok = ("JPEG 32x16, baseline, 4:2:0; shown 1280x640 (whole times larger)" in out
+          and "by the CPU (the video engine: the engine" in out and hue(left) == "red" and hue(right) == "blue"
+          and top == rgb555(0, 0, 0) and "shown 1280x640" in soft and "video engine" not in soft
+          and "1:/PICS/RB.JPG: the engine" in both)
+    check(ok, "view: a baseline JPEG goes to the video engine first; the emulator's engine reads nothing, so the "
+              "CPU decodes it (red left, blue right, 40 times larger); view -s skips the engine; view -c reports it"
+              + ("" if ok else f" {out!r} {soft!r} {both!r} {[hex(v) for v in (left, right, top)]}"))
+    box.usb.detach()
+    box.run(0.6)
+
+
 def tiny_ts(stream_type, es=b""):
     """A transport stream of a PAT, a PMT (program 1 at PID 0x100: one video stream of that type at PID 0x101) and
     ten packets of that stream: a PES header, `es` (the elementary stream's bytes, up to 175), zeros."""
@@ -1422,12 +1463,77 @@ def tiny_ts(stream_type, es=b""):
     return out
 
 
+def tiny_mp4(es, entry=b"avc1", len_size=4, co64=False, gap=16):
+    """An .mp4 of an Annex B H.264 stream: its SPS / PPS in the avcC box, each slice a sample in a chunk of its own
+    (each NAL unit after a len_size-byte length), `gap` bytes of something else after each chunk (a sound's), the
+    index (moov) after the samples (mdat) -- as cameras and ffmpeg write it; stco or co64 for the chunks' places."""
+    def box(t, body):
+        return struct.pack(">I", 8 + len(body)) + t + body
+
+    def full(t, body, flags=0):
+        return box(t, struct.pack(">I", flags) + body)
+    nals = [p.rstrip(b"\0") for p in es.split(b"\0\0\1")[1:]]
+    sps, pps, slices = nals[0], nals[1], nals[2:]
+    ftyp = box(b"ftyp", b"isom" + struct.pack(">I", 0x200) + b"isomavc1")
+    samples = [len(s).to_bytes(len_size, "big") + s for s in slices]
+    data, places = b"", []
+    for s in samples:
+        places.append(len(ftyp) + 8 + len(data))
+        data += s + b"\xaa" * gap
+    avcc = bytes([1, sps[1], sps[2], sps[3], 0xFC | (len_size - 1), 0xE1]) + struct.pack(">H", len(sps)) + sps + \
+        b"\x01" + struct.pack(">H", len(pps)) + pps
+    visual = bytes(6) + struct.pack(">H", 1) + bytes(16) + struct.pack(">HHII", 32, 32, 0x480000, 0x480000) + \
+        bytes(4) + struct.pack(">H", 1) + bytes(32) + struct.pack(">Hh", 0x18, -1)
+    n = len(samples)
+    stbl = box(b"stbl", full(b"stsd", struct.pack(">I", 1) + box(entry, visual + box(b"avcC", avcc)))
+               + full(b"stts", struct.pack(">III", 1, n, 512))
+               + full(b"stsc", struct.pack(">IIII", 1, 1, 1, 1))
+               + full(b"stsz", struct.pack(">II", 0, n) + b"".join(struct.pack(">I", len(s)) for s in samples))
+               + (full(b"co64", struct.pack(">I", n) + b"".join(struct.pack(">Q", p) for p in places)) if co64 else
+                  full(b"stco", struct.pack(">I", n) + b"".join(struct.pack(">I", p) for p in places))))
+    minf = box(b"minf", full(b"vmhd", bytes(8), 1) + box(b"dinf", full(b"dref", struct.pack(">I", 1)
+                                                                         + full(b"url ", b"", 1))) + stbl)
+    mdia = box(b"mdia", full(b"mdhd", struct.pack(">IIIIHH", 0, 0, 12800, 512 * n, 0x55C4, 0))
+               + full(b"hdlr", bytes(4) + b"vide" + bytes(12) + b"\0") + minf)
+    tkhd = full(b"tkhd", struct.pack(">IIIII", 0, 0, 1, 0, 512 * n) + bytes(16) + bytes(36)
+                + struct.pack(">II", 32 << 16, 32 << 16), 3)
+    mvhd = full(b"mvhd", struct.pack(">IIIIIH", 0, 0, 1000, 80, 0x10000, 0x100) + bytes(70) + struct.pack(">I", 2))
+    return ftyp + box(b"mdat", data) + box(b"moov", mvhd + box(b"trak", tkhd + mdia))
+
+
+def check_dma_receiver(box):
+    """Every IN on endpoint B ends with the DMA receiver set back (+0x60 = 0x20, init_dma_rx_state) before an OUT
+    starts the transmitter (+0x60 bit 0).  Left started, the box's receiver woke with the OUT's en_dma_transfer
+    and wrote into the bulk buffer the OUT was sending: FTP uploads to a card came back with wrong bytes (usb.c,
+    epb_end).  The emulator's controller model writes nothing then, so the order of the stores is what is
+    checked, over every transfer of the run."""
+    started, outs, bad = False, 0, []
+    for t, o, _s, v in box.usb.writes:
+        if o != 0x60:
+            continue
+        if v & 0x20:
+            started = False
+        if v & 0x10:
+            started = True
+        if v & 0x01:
+            outs += 1
+            if started:
+                bad.append(t)
+    check(outs > 0 and not bad, f"every endpoint B IN is ended with the DMA receiver set back before an OUT starts "
+                                f"the transmitter ({outs} OUTs"
+                                + (f"; {len(bad)} with the receiver still started, the first at {bad[0]} s)"
+                                   if bad else ")"))
+
+
 def check_play(box):
     """The video player ('play'): the emulator has no MPEG-2 or H.264 decoder, so only how a file is taken apart --
     an H.264 stream's parameter sets read and its picture set up, then the decoder found silent and the play ended
-    cleanly; a file of no stream refused; 'av status' reads the decoder's registers."""
+    cleanly, from a .ts and from an .mp4 (its index after its samples: the reader seeks there and back); an .mp4
+    of HEVC refused; a file of no stream refused; 'av status' reads the decoder's registers."""
     import fat_image
     stick = VirtualStick(fat_image.build({"VIDEO/AVC.TS": tiny_ts(0x1B, TINY_H264),
+                                          "VIDEO/AVC.MP4": tiny_mp4(TINY_H264, len_size=2, co64=True, gap=40000),
+                                          "VIDEO/HEVC.MP4": tiny_mp4(TINY_H264, entry=b"hvc1"),
                                           "VIDEO/JUNK.TS": bytes(range(256)) * 8},
                                          fat=12, size_mb=1, partition=False))
     box.usb.attach("high", stick)
@@ -1443,6 +1549,16 @@ def check_play(box):
     check(ok, "play: an H.264 .ts: its stream described (SPS: Baseline 1.0, 32 x 32), the emulator's missing decoder "
               "reported, 'av status' on the H.264 decoder, junk refused"
               + ("" if ok else f" {avc!r} {status!r} {junk!r}"))
+    mp4 = shell(box, "play 1:/VIDEO/AVC.MP4", timeout=60)
+    hevc = shell(box, "play 1:/VIDEO/HEVC.MP4", timeout=60)
+    ok = ("MP4 / QuickTime file" in mp4 and "mp4: video track 1: H.264, 2 frames, 25.00 frames/s; no sound" in mp4
+          and "video: H.264 Baseline 1.0, 32 x 32, 25.00 frames/s, pixels 1:1, 1 reference frame," in mp4
+          and "play: the H.264 decoder does not answer" in mp4
+          and "play: the video is hvc1 (HEVC): only H.264 (avc1) is played from an .mp4" in hevc)
+    check(ok, "play: an .mp4 (2-byte NAL lengths, 64-bit chunk places, its index 80 KB in, after its samples: seeks "
+              "there, back and over a 40 KB sound chunk): its track read, its avcC's SPS described, its first sample "
+              "given to the decoder; an HEVC .mp4 refused"
+              + ("" if ok else f" {mp4!r} {hevc!r}"))
     box.usb.detach()
     box.run(0.6)
 
@@ -1896,6 +2012,71 @@ def check_modem(box):
     box.run(0.6)
 
 
+def check_ssdp(box):
+    """SSDP (ssdp.c) over the LTE module's network link -- the emulator has no Ethernet adapter, and the demo
+    takes the module's RNDIS function when there is none: the packet filter it sets takes all multicast; once
+    DHCP gave the address, NOTIFY ssdp:alive for the device's three names goes to 239.255.255.250:1900 in
+    rounds 2 s apart (TTL 4), with an IGMPv2 report for the group (TTL 1); an M-SEARCH from the module's router
+    to the group, or to the box itself, is answered to its sender for upnp:rootdevice / ssdp:all, one for
+    another device type is not; netstat counts them.  (/ssdp/device.xml needs TCP, which the module's small
+    network does not carry.)"""
+    modem = VirtualModem()
+    box.t.pending.clear()
+    box.usb.attach("high", modem)
+    out = box.t.wait_for(b"(DHCP), router", 30).decode("latin-1")
+    me, router = bytes([192, 168, 225, 100]), bytes([192, 168, 225, 1])
+    group, group_mac = bytes([239, 255, 255, 250]), bytes.fromhex("01005e7ffffa")
+    uuid = "uuid:4d333830-3176-3400-8000-" + VirtualModem.RNDIS_MAC.hex()
+    box.run(10.0)           # (rounds at once and 2 s later by the demo's clock: 6.8 s here, where Count runs at
+    sent = list(modem.rndis_frames)                         # 100 MHz and the demo counts the chip's 337.5)
+    notify = [f for f in sent if f[:6] == group_mac and f[23] == 17 and f[36:38] == b"\x07\x6c"]
+    texts = [f[42:].decode("latin-1") for f in notify]
+    names = sorted({m.group(1) for t in texts for m in [re.search(r"\r\nNT: (\S+)\r\n", t)] if m})
+    check("192.168.225.100 (DHCP)" in out and modem.rndis_filter == 0x0F and len(notify) >= 6
+          and names == sorted(["upnp:rootdevice", uuid, "urn:schemas-upnp-org:device:Basic:1"])
+          and all(f[26:30] == me and f[30:34] == group and f[22] == 4 for f in notify)
+          and all(t.startswith("NOTIFY * HTTP/1.1\r\n") and "\r\nNTS: ssdp:alive\r\n" in t
+                  and "\r\nLOCATION: http://192.168.225.100/ssdp/device.xml\r\n" in t for t in texts),
+          f"SSDP: the RNDIS packet filter takes all multicast (0x{modem.rndis_filter or 0:02x}); after DHCP "
+          f"{len(notify)} NOTIFY ssdp:alive (two rounds at least) to 239.255.255.250:1900 (TTL 4) for "
+          f"upnp:rootdevice, {uuid} (the link's MAC) and the Basic:1 device type, LOCATION the web page's "
+          f"/ssdp/device.xml")
+    igmp = [f for f in sent if f[:6] == group_mac and f[23] == 2 and f[22] == 1 and f[34] == 0x16
+            and f[38:42] == group and VirtualModem._csum(f[34:42]) == 0]
+    check(bool(igmp), "SSDP: an IGMPv2 membership report for 239.255.255.250 (TTL 1, its checksum right)")
+
+    def search(st, to_box=False, port=50000):
+        text = (f"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\n"
+                f"ST: {st}\r\n\r\n").encode()
+        udp = struct.pack(">HHHH", port, 1900, 8 + len(text), 0) + text
+        dst_mac = VirtualModem.RNDIS_MAC if to_box else group_mac
+        mark = len(modem.rndis_frames)
+        modem.network_frame(dst_mac + VirtualModem.NET_MAC + b"\x08\x00"
+                            + modem._ip(router, me if to_box else group, 17, udp))
+        box.run(2.0)                                        # (answered within 0.3 s of the demo's clock)
+        return [f[42:].decode("latin-1") for f in modem.rndis_frames[mark:]
+                if f[:6] == VirtualModem.NET_MAC and f[23] == 17 and f[30:34] == router
+                and f[34:36] == b"\x07\x6c" and struct.unpack(">H", f[36:38])[0] == port]
+
+    root = search("upnp:rootdevice")
+    every = search("ssdp:all", port=50001)
+    other = search("urn:schemas-upnp-org:device:MediaRenderer:1", port=50002)
+    direct = search("upnp:rootdevice", to_box=True, port=50003)
+    check(len(root) == 1 and root[0].startswith("HTTP/1.1 200 OK\r\n") and "\r\nST: upnp:rootdevice\r\n" in root[0]
+          and f"\r\nUSN: {uuid}::upnp:rootdevice\r\n" in root[0] and "\r\nEXT:\r\n" in root[0]
+          and "\r\nLOCATION: http://192.168.225.100/ssdp/device.xml\r\n" in root[0]
+          and len(every) == 3 and not other and len(direct) == 1,
+          "SSDP: an M-SEARCH for upnp:rootdevice to the group answered to its sender (200 OK, ST, USN, EXT, "
+          "LOCATION); ssdp:all: three answers; another device type: none; one sent to the box's own address: "
+          "answered too")
+    out = box.command("netstat")
+    check(re.search(r"SSDP \(UPnP discovery, UDP 1900\): " + re.escape(uuid) + r", \d+ NOTIFYs sent, 4 searches "
+                    r"seen, 5 answers sent \(the last to 192\.168\.225\.1\)", out) is not None,
+          "netstat: the SSDP line (its UUID, NOTIFYs, 4 searches, 5 answers, the last to the router)")
+    box.usb.detach()
+    box.run(0.6)
+
+
 def check_files(box, w16, w32, w12, exact):
     """Files' contents written: a command's output into a file ('>' and '>>'), cp (into a directory, onto
     another disk), mv (rename, into a directory, a directory with its '..', the current directory's path),
@@ -2307,6 +2488,7 @@ def run(args):
     check_dos(box)
     check_md(box)
     check_play(box)
+    check_view_jpeg(box)
 
     # ---- a shell on the USB disks: cd, mkdir, rm, ... ------------------------------
     check_shell(box)
@@ -2316,6 +2498,8 @@ def run(args):
 
     # ---- USB serial ports: an LTE module's AT ports (tty, at, cu) --------------------
     check_modem(box)
+    check_ssdp(box)
+    check_dma_receiver(box)
 
     # ---- the experimental display set-up ---------------------------------------
     box.command("testscreen")
@@ -2360,9 +2544,10 @@ def run(args):
     start = box.sim._vtime()
     while box.sim._vtime() < start + 0.5:
         box.t.read(4096, start + 0.5 - box.sim._vtime())
-    # (8 s: the bootloader checks the main code before it looks for 'c' -- 4.7 s of emulated time for the 588 KB
-    # demo with the Z80 / 2600 players; maciej_uart.py on the real box keeps sending for up to 90 s)
-    while box.sim._vtime() < start + 8:
+    # (12 s: the bootloader checks the main code before it looks for 'c' -- 4.7 s of emulated time for the 588 KB
+    # demo with the Z80 / 2600 players, 8.3 s for the 1.1 MB one with TLS; maciej_uart.py on the real box keeps
+    # sending for up to 90 s)
+    while box.sim._vtime() < start + 12:
         box.t.write(b"c")
         nxt = box.sim._vtime() + 1 / 30
         while box.sim._vtime() < nxt:
@@ -2379,7 +2564,7 @@ def run(args):
     check("Version: v4" in box.boot().decode("latin-1"), "and its reboot command starts the demo again")
     box.t.pending.clear()
     mark = len(box.t.received)
-    deadline = box.sim._vtime() + 8
+    deadline = box.sim._vtime() + 12                   # (the bootloader's check first: 8.3 s, as above)
     while box.sim._vtime() < deadline:                 # maciej_uart.capture_boot's pacing, in emulated time
         box.t.write(b"c")
         nxt = min(deadline, box.sim._vtime() + 0.05)

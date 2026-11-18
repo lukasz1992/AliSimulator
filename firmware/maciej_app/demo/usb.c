@@ -685,12 +685,22 @@ static void epb_start(const struct device *d, u8 ep, u16 maxp, u32 phys, u32 cou
 }
 
 /* ends endpoint B's IN, done or not: the FIFO reset does (clearing the
-   transfer's bits alone leaves the controller sending tokens) */
+   transfer's bits alone leaves the controller sending tokens) -- and the DMA
+   receiver is set back to its first state, as the transmitter is after every
+   OUT (usb_bulk_out).  Left started, an IN that had received nothing (a
+   network adapter's frames looked for, none waiting) woke again with the
+   next OUT's en_dma_transfer and wrote into its buffer, USB_BULK_PHYS, which
+   that OUT was sending: on the box FTP uploads to a card came back with 66 to
+   250 wrong bytes from byte 62 of a 4 KB write (the receiver's index 32 after
+   the 31-byte command block, about 400 after the data).  Here only: set back
+   before every OUT as well, the uploads ran at half the speed (the box got
+   three times as many segments twice: something went missing on the way) */
 static void epb_end(void)
 {
     USB[R_SPEED] = (u8)(USB[R_SPEED] & ~0x0C);
     USB[R_DMA_AUTO] = 0;
     fifo_reset(R_EPB_STATUS);
+    USB[R_DMA_STATE] = 0x20;                        /* init_dma_rx_state */
     flags2();
     flags2_seen &= (u8)~0x22;
 }
@@ -805,6 +815,7 @@ int usb_in_read(u8 *data, int max)
         n = (u32)max;
     for (u32 i = 0; i < n; i++)
         data[i] = buf[i];
+    epb_end();                          /* (every IN ends so: its DMA receiver set back before an OUT, see epb_end) */
     return n ? (int)n : -2;
 }
 

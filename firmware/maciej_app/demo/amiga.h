@@ -18,6 +18,10 @@ typedef unsigned short u16;
 typedef unsigned int u32;
 typedef signed int s32;
 
+/* where the box keeps the machine's memories (chip, slow, Kickstart, extension: 512 KB each), physical RAM after
+   the SMB server's buffers (hw.h's map); a PC harness builds amiga.c with AMIGA_HOST for arrays instead */
+#define AMIGA_RAM_PHYS   0x00B00000u
+
 /* The picture: 352 x 272 low-resolution pixels -- PAL's usual 320 x 256 screen (DIWSTRT 0x2C81, DIWSTOP
    0x2CC1) with 16 pixels of border left and right and 8 lines above and below, where overscanned screens go
    (Magicland Dizzy's game is 320 x 259, its TRSi intro 352 wide); a high-resolution line shows each pair of its

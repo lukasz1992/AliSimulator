@@ -1857,8 +1857,8 @@ static int cmd_ts(int argc, char **argv)
         uprintf("rf ts: no FEC lock (0x1D = 0x%02x): 'rf tune' a multiplex first\n", dm_r(0x1D));
         return -1;
     }
-    if (file && (ftp_disk_busy() || http_disk_busy())) {
-        uprintf("rf ts: the FTP server or the web page is moving a file now; try again\n");
+    if (file && (ftp_disk_busy() || http_disk_busy() || smb_disk_busy())) {
+        uprintf("rf ts: the FTP server, the web page or the SMB server is moving a file now; try again\n");
         return -1;
     }
     if (file && disk_upload_open(file, 0) < 0)

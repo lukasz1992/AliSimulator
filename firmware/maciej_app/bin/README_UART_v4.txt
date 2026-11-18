@@ -106,15 +106,19 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
                        zapisuje (tylko wolumin zamkniety czysto przez Windows:
                        "Bezpieczne usuwanie"); reset-journal czysci dziennik
                        tak jak ntfs-3g
-  view [-1] <plik>     obraz na TV (JPEG zwykly i progresywny, PNG, GIF, BMP),
+  view [-1] [-s | -c] <plik>
+                       obraz na TV (JPEG zwykly i progresywny, PNG, GIF, BMP),
                        dopasowany do ekranu, obrocony wg EXIF zdjecia;
                        strzalka w prawo / spacja - nastepny obraz z katalogu,
-                       w lewo - poprzedni, i - szczegoly, Esc albo q konczy
+                       w lewo - poprzedni, i - szczegoly, Esc albo q konczy.
+                       Zwykly JPEG dekoduje sprzetowo uklad wideo (-s: tylko
+                       procesor; -c: oba, porownane, nic nie pokazuje)
   play [-n klatki] [-x] [-k] [-v] [-1] <plik>
-                       film z pliku (.ts, .mpg, .m2v, .vob, .264: wideo
-                       MPEG-2, MPEG-1 albo H.264, dzwiek MPEG) na TV,
-                       dekodowany sprzetowymi dekoderami MPEG-2 / H.264
-                       ukladu; dzwiek przez "snd". Esc,
+                       film z pliku (.ts, .mpg, .m2v, .vob, .264, .mp4,
+                       .mov: wideo MPEG-2, MPEG-1 albo H.264, dzwiek MPEG;
+                       dzwiek .mp4, AAC, nie gra) na TV, dekodowany
+                       sprzetowymi dekoderami MPEG-2 / H.264 ukladu;
+                       dzwiek przez "snd". Esc,
                        Ctrl-C, q albo EXIT na pilocie konczy; -n tyle klatek,
                        -x tak szybko jak dekoduje (bez dzwieku), -k ostatnia
                        klatka zostaje na TV (zdejmuje ja Esc na klawiaturze
@@ -250,9 +254,13 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
   ping [-c n] <host>   ping jak w Linuksie przez siec: adres albo nazwa
                        (DNS z DHCP), TTL i czas kazdej odpowiedzi, Ctrl-C
                        konczy i pokazuje statystyke (samo "ping": pong)
-  wget [-O n:plik] <url>
-                       strona http:// przez siec: na konsoli albo
-                       zapisana na dysku USB (https nieobslugiwane)
+  wget [-O n:plik] [--no-check-certificate] <url>
+                       strona http:// albo https:// przez siec: na konsoli
+                       albo zapisana na dysku USB; przekierowania (301,
+                       302...) sa sledzone. https: TLS 1.2 (BearSSL),
+                       certyfikat sprawdzany wzgledem 118 glownych urzedow
+                       Mozilli i zegara z NTP ("date" musi pokazywac czas);
+                       --no-check-certificate nie sprawdza nic. Bez TLS 1.3.
   ntp [serwer] / date  zegar z sieci (sam po DHCP) / data i godzina: UTC
                        i polska (CET / CEST)
   netstat              TCP: porty, polaczenia, liczniki
@@ -273,6 +281,13 @@ Komende mozna tez zaczac od '/' (np. /restart, /lsusb).
   telnet. Gdy dziala polecenie (np. gra), obraz, pilot i linia polecen
   dzialaja dalej, a pliki czekaja na jego koniec; jeden plik naraz
   (strona albo FTP - drugi dostaje "sprobuj za chwile").
+  \\<adres tunera>\4 (port 445, SMB2, bez hasla) - dyski jako udzialy
+  Windows: w Eksploratorze, "net view \\<adres>", "net use", robocopy;
+  kopiowanie w obie strony, zmiana nazw, usuwanie, katalogi. Logowanie
+  jako gosc: Windows 10 Home / Pro je przyjmuje, Windows 11 24H2 Pro oraz
+  wersje Enterprise / Education je blokuja. Jeden zapisywany plik naraz.
+  SSDP (UPnP, UDP 1900): tuner widac w Windows w "Sieci" (Inne urzadzenia)
+  jako "M3801 v4 demo (adres)"; dwuklik otwiera strone tunera.
   Data i godzina z NTP: w prawym gornym rogu konsoli na TV, po czasie pracy
   watchdog [test|off|on]
                        watchdog ukladu: dziala od startu demo; gdy demo stanie
@@ -345,7 +360,10 @@ predkosc, "cu n" otwiera terminal. Sprawdzone: CH340 1a86:7523 (ustawianie
 predkosci). CH341A w trybie I2C/SPI (1a86:5512, programator 24xx/25xx) jest
 tylko rozpoznawany.
 Obrazy: "view plik" albo Enter w eksploratorze; zdjecie 2000 x 1333 JPEG
-dekoduje sie okolo 1,5 s. Gry NES: "nes plik.nes" albo Enter w
+dekoduje sie okolo 1,5 s. Zwykly (nie progresywny) JPEG dekoduje uklad wideo
+(tryb JPEG dekodera MPEG-2): 1920 x 1080 w 56 ms zamiast 1 s, zdjecie
+6000 x 4000 pokazane w ok. 1 s zamiast 14 s. Progresywny, niskiej jakosci
+albo nietypowy JPEG dekoduje procesor jak dotad. Gry NES: "nes plik.nes" albo Enter w
 eksploratorze; dziala pelne 60 klatek/s (klatka ok. 8 ms + 1,5 ms rysowania).
 Gier komercyjnych (np. Mario) demo nie zawiera - mozna uzyc wlasnych kopii
 albo darmowych gier homebrew (np. Nova the Squirrel, Thwaite).
@@ -375,14 +393,14 @@ Gry NES graja z dzwiekiem (oba kanaly prostokatne, trojkat, szum, DMC). Na
 pudelku sprawdzone tylko po licznikach (sprzet pobiera probki z predkoscia
 48000/s, nic nie ginie). Test: "video init", "snd init", "snd beep 1000 3000".
 Filmy: "play plik.ts" albo Enter w eksploratorze (.ts, .mpg, .m2v, .vob,
-.264, .h264). Obraz MPEG-1/2 dekoduje sprzetowy dekoder MPEG-2 ukladu S3811
-(ten sam, ktorego uzywa oryginalny soft do nagran), obraz H.264 - drugi
-silnik tego samego bloku (profile Baseline, Main i High, do 1920 x 1080);
-dzwiek MPEG (Layer II) dekodowany programowo, zmiksowany do mono. MPEG-2 na
-pudelku: plik 720 x 576, 25 klatek/s, 6 Mbit/s gra w czasie rzeczywistym
-(500 klatek w 20,3 s, 0 bledow), klatki odczytane z pamieci zgodne
-z ffmpeg; 1920 x 1080 tez sie dekoduje (do 24 ms na klatke), ale pojedyncze
-klatki HD sie spozniaja (3 na 250).
+.264, .h264, .mp4, .m4v, .mov). Obraz MPEG-1/2 dekoduje sprzetowy dekoder
+MPEG-2 ukladu S3811 (ten sam, ktorego uzywa oryginalny soft do nagran),
+obraz H.264 - drugi silnik tego samego bloku (profile Baseline, Main
+i High, do 1920 x 1080); dzwiek MPEG (Layer II) dekodowany programowo,
+zmiksowany do mono. MPEG-2 na pudelku: plik 720 x 576, 25 klatek/s,
+6 Mbit/s gra w czasie rzeczywistym (500 klatek w 20,3 s, 0 bledow), klatki
+odczytane z pamieci zgodne z ffmpeg; 1920 x 1080 tez sie dekoduje (do
+24 ms na klatke), ale pojedyncze klatki HD sie spozniaja (3 na 250).
 Skaler obrazu bierze filtry z tablicy w RAM-ie (rejestr +0x1E4 wskazuje
 blok parametrow) - player wpisuje je sam, policzone tak jak w oryginalnym
 sofcie; bez nich obraz na TV byl rozsypany, choc klatki w pamieci dobre.
@@ -391,11 +409,17 @@ w trybie pol (0) obraz mial polowe wysokosci, a pod nim byly smieci.
 Obraz na TV sprawdzony okiem (kamera telefonu): caly, kolory dobre.
 H.264 na pudelku: zwiastun Sintel 1920 x 1080, 24 klatki/s, gra w czasie
 rzeczywistym z dzwiekiem (1253 klatki w 52,6 s, zadna spozniona), klatki
-odczytane z pamieci identyczne co do bajtu z ffmpeg. Nie obslugiwane: H.264
-z przeplotem (1080i, czeste w nagraniach z telewizji HD), 10 bitow, 4:2:2,
-pliki .mp4 (jeszcze nie: przerobic na .ts, np. "ffmpeg -i film.mp4 -c:v copy
--c:a mp2 film.ts"), HEVC (DVB-T2 w Polsce - uklad nie ma do niego
-dekodera). Pliki wrzucac przez FTP.
+odczytane z pamieci identyczne co do bajtu z ffmpeg, obraz na TV sprawdzony
+okiem. Pliki .mp4 / .mov: obraz H.264 gra (720p z pliku .mp4 w czasie
+rzeczywistym, klatki identyczne z ffmpeg), dzwiek (zwykle AAC) nie - film
+gra bez dzwieku; z dzwiekiem: przerobic na .ts, np. "ffmpeg -i film.mp4
+-c:v copy -c:a mp2 film.ts". Nie obslugiwane: H.264 z przeplotem (1080i,
+czeste w nagraniach z telewizji HD), 10 bitow, 4:2:2, HEVC (DVB-T2
+w Polsce i nowsze telefony: uklad nie ma do niego dekodera), pliki .mp4
+dzielone na fragmenty (moof). Pliki wrzucac przez FTP. Wczesniejsze wydania
+v4 potrafily zepsuc plik wysylany przez FTP na dysk USB (kilkadziesiat
+bajtow w kilku miejscach; blad w obsludze DMA kontrolera USB, naprawiony) -
+pliki wyslane wczesniej warto porownac z oryginalem.
 PC z DOS-em: "dos plik.exe" albo Enter w eksploratorze (.exe, .com); jeden
 program bez plikow danych obok (Magicland Dizzy z 1993 ich nie potrzebuje:
 spacja na ekranie ustawien, Z / X albo strzalki - chodzenie, K albo gora -

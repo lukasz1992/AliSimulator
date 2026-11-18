@@ -1,6 +1,8 @@
 /* What the v4 demo does with TCP and UDP (tcp.c, eth.c):
-     - 'wget [-O n:path] <http://host[:port]/path>': an HTTP/1.0 GET, the
-       body printed (or saved to a FAT volume through disk_write_file);
+     - 'wget [-O n:path] [--no-check-certificate] <http[s]://host[:port]/path>':
+       an HTTP/1.0 GET (over TLS for https://: tls.c, BearSSL), redirections
+       followed, the body printed (or saved to a FAT volume through
+       disk_write_file);
      - a telnet console on port 23 (one client): everything printed goes to
        it as well (uart_putc -> telnet_putc), what it types reaches the
        command line as if typed on the UART (uart.c's injection queue, which
@@ -550,10 +552,15 @@ static int ntp_send(const u8 ip[4])
     return eth_send_ipv4(ntp_frame, mac, ip, 17, 8 + 48);
 }
 
-/* eth.c: a UDP datagram to our address (not DHCP's, not DNS's): an NTP server's answer to our request is kept
-   (called inside eth's handle: nothing printed, nothing sent) */
+/* eth.c: a UDP datagram to our address (not DHCP's, not DNS's): an NTP server's answer to our request is kept,
+   an SSDP search sent to the box itself goes to ssdp.c (called inside eth's handle: nothing printed, nothing
+   sent) */
 void net_udp_input(const u8 *src, u16 sport, u16 dport, const u8 *data, int len)
 {
+    if (dport == 1900) {
+        ssdp_input(src, 0, sport, data, len);
+        return;
+    }
     if (dport != NTP_PORT || sport != 123 || len < 48 || !same(src, ntp_server, 4))
         return;
     if ((data[0] & 7) != 4 || data[1] == 0 || be32(data + 24) != ntp_cookie)
@@ -791,12 +798,64 @@ void cmd_date(int argc, char **argv)
 /* wget                                                                */
 /* ================================================================== */
 static struct {
-    char head[512];                     /* the response's header (its start, as much as fits) */
+    char head[2048];                    /* the response's header (its start, as much as fits) */
     u32 head_len;
     int newlines, in_body, cr;
+    int moved;                          /* a redirection with a Location: followed, its body not read */
     u8 *store;                          /* -O: the body goes here (WGET_PHYS), else to the console */
     u32 body, stored;
 } wg;
+
+static char where[400];                 /* the URL asked for (a redirection's Location takes its place) */
+
+/* where's scheme, host and port: the length of "https://host:port" */
+static int origin_len(const char *url)
+{
+    int i = 0;
+    while (url[i] && !(url[i] == ':' && url[i + 1] == '/' && url[i + 2] == '/'))
+        i++;
+    if (url[i])
+        i += 3;
+    while (url[i] && url[i] != '/' && url[i] != '?' && url[i] != '#')
+        i++;
+    return i;
+}
+
+/* a Location (absolute, "//host/path", "/path" or relative to the page's folder) made the URL to ask for
+   next, in where: 1, or 0 (too long) */
+static int resolve(const char *loc)
+{
+    static char t[sizeof(where)];
+    int n = 0, max = (int)sizeof(t) - 1;
+    if (prefixed(loc, "http://") || prefixed(loc, "https://")) {
+        n = 0;
+    } else if (loc[0] == '/' && loc[1] == '/') {        /* the same scheme */
+        while (where[n] && where[n] != ':' && n < max)
+            t[n] = where[n], n++;
+        if (n < max)
+            t[n++] = ':';
+    } else {
+        int o = origin_len(where), keep = o;
+        if (loc[0] != '/') {                            /* the page's folder (its path up to the last '/') */
+            for (int i = o; where[i] && where[i] != '?' && where[i] != '#'; i++)
+                if (where[i] == '/')
+                    keep = i + 1;
+        }
+        for (; n < keep && n < max; n++)
+            t[n] = where[n];
+        if (loc[0] != '/' && keep == o && n < max)
+            t[n++] = '/';
+    }
+    for (int i = 0; loc[i]; i++) {
+        if (n >= max)
+            return 0;
+        t[n++] = loc[i];
+    }
+    t[n] = 0;
+    for (int i = 0; i <= n; i++)
+        where[i] = t[i];
+    return 1;
+}
 
 /* a header line's value ("content-length" -> "1256"), 0 when the header has none */
 static const char *header_value(const char *name, char *out, int size)
@@ -822,7 +881,8 @@ static const char *header_value(const char *name, char *out, int size)
     return 0;
 }
 
-/* the header is over: its status line ("HTTP/1.1 200 OK" -> "200 OK"), the length and type */
+/* the header is over: its status line ("HTTP/1.1 200 OK" -> "200 OK"), the length and type -- or, for a
+   redirection, where it points (followed: wg.moved) */
 static void header_done(const char *out)
 {
     u32 i = 0;
@@ -834,6 +894,17 @@ static void header_done(const char *out)
         status[n++] = wg.head[i];
     status[n] = 0;
     uprintf("%s\n", n ? status : "(no status line)");
+    int code = n >= 3 ? (status[0] - '0') * 100 + (status[1] - '0') * 10 + (status[2] - '0') : 0;
+    static char location[sizeof(where)];
+    if ((code == 301 || code == 302 || code == 303 || code == 307 || code == 308) &&
+        header_value("location", location, sizeof(location)) && location[0]) {
+        if (resolve(location)) {
+            uprintf("Location: %s [following]\n", where);
+            wg.moved = 1;
+            return;
+        }
+        uprintf("Location: %s (too long to follow)\n", location);
+    }
     char length[16], type[48];
     const char *l = header_value("content-length", length, sizeof(length));
     const char *t = header_value("content-type", type, sizeof(type));
@@ -865,7 +936,7 @@ static void body_byte(u8 b)
 /* received bytes: the header until its empty line, then the body */
 static void wget_bytes(const u8 *p, int n, const char *out)
 {
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n && !wg.moved; i++) {
         if (wg.in_body) {
             body_byte(p[i]);
             continue;
@@ -883,37 +954,36 @@ static void wget_bytes(const u8 *p, int n, const char *out)
     }
 }
 
-/* "http://host[:port]/path" -> host, port, path: 1, or 0 (a line said why) */
-static int parse_url(const char *url, char *host, int host_size, u16 *port, const char **path)
+/* "http[s]://host[:port]/path" -> host, port, path, tls (https): 1, or 0 (a line said why) */
+static int parse_url(const char *url, char *host, int host_size, u16 *port, const char **path, int *tls)
 {
-    if (prefixed(url, "https://")) {
-        uprintf("wget: https:// is not supported: there is no TLS on this box (try http://)\n");
-        return 0;
-    }
-    if (prefixed(url, "http://"))
+    *tls = prefixed(url, "https://");
+    if (*tls)
+        url += 8;
+    else if (prefixed(url, "http://"))
         url += 7;
     for (const char *s = url; *s && *s != '/'; s++)
         if (s[0] == ':' && s[1] == '/' && s[2] == '/') {
-            uprintf("wget: only http:// URLs\n");
+            uprintf("wget: only http:// and https:// URLs\n");
             return 0;
         }
     int n = 0;
-    while (*url && *url != ':' && *url != '/' && n < host_size - 1)
+    while (*url && *url != ':' && *url != '/' && *url != '?' && *url != '#' && n < host_size - 1)
         host[n++] = *url++;
     host[n] = 0;
-    u32 p = 80;
+    u32 p = *tls ? 443 : 80;
     if (*url == ':') {
         p = 0;
         url++;
         while (*url >= '0' && *url <= '9' && p <= 65535)
             p = p * 10 + (u32)(*url++ - '0');
     }
-    if (!n || !p || p > 65535 || (*url && *url != '/')) {
-        uprintf("wget: not a URL I can read: http://host[:port]/path\n");
+    if (!n || !p || p > 65535 || (*url && *url != '/' && *url != '?' && *url != '#')) {
+        uprintf("wget: not a URL I can read: http[s]://host[:port]/path\n");
         return 0;
     }
     *port = (u16)p;
-    *path = *url ? url : "/";
+    *path = url;
     return 1;
 }
 
@@ -941,56 +1011,63 @@ static int wget_connect(int c)
     }
 }
 
-/* 'wget [-O n:path] <http://host[:port]/path>': HTTP/1.0 GET; the status line, then the body on the console --
-   or saved (the body held in RAM at WGET_PHYS, up to 8 MB, then written as 'command > path' writes); Ctrl-C
-   stops it, so does 15 s without data; the bytes, the time and the rate at the end */
-void cmd_wget(int argc, char **argv)
+/* one GET of the URL in where: 1 when it was a redirection (where holds its Location now), 0 when it is over
+   (said what came) */
+static int wget_once(const char *out, int check)
 {
     static const char stopped[] = "stopped";
-    const char *url = 0, *out = 0, *path;
-    int bad = 0;
-    for (int i = 1; i < argc && !bad; i++) {
-        if (argv[i][0] == '-' && argv[i][1] == 'O' && !argv[i][2])
-            bad = !(i + 1 < argc && (out = argv[++i]));
-        else if (argv[i][0] != '-' && !url)
-            url = argv[i];
-        else
-            bad = 1;
-    }
-    if (bad || !url) {
-        uprintf("usage: wget [-O n:path] <http://host[:port]/path>\n");
-        return;
-    }
     char host[64], ip_text[16];
     u16 port;
     u8 ip[4];
-    if (!parse_url(url, host, sizeof(host), &port, &path) || !eth_lookup(host, ip, "wget"))
-        return;
+    const char *path;
+    int tls;
+    if (!parse_url(where, host, sizeof(host), &port, &path, &tls) || !eth_lookup(host, ip, "wget"))
+        return 0;
     usnprintf(ip_text, sizeof(ip_text), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
     uprintf("Connecting to %s (%s):%u... ", host, ip_text, port);
     int c = tcp_connect(ip, port);
     if (c < 0) {
         uprintf("failed: %s.\n", eth_ready() ? "no ARP answer on the way there" : "eth0 has no address");
-        return;
+        return 0;
     }
     if (!wget_connect(c)) {
         tcp_abort(c);
-        return;
+        return 0;
     }
     uprintf("connected.\n");
-    char req[256];
-    int n = port == 80 ? usnprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\n", path, host)
-                       : usnprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s:%u\r\n", path, host, port);
+    if (tls && !tls_begin(c, host, check)) {
+        tcp_abort(c);
+        return 0;
+    }
+    static char req[sizeof(where) + 200], target[sizeof(where)];
+    int t = 0;                          /* the path without its #fragment ("http://host?x" asks for "/?x") */
+    if (*path != '/')
+        target[t++] = '/';
+    for (const char *s = path; *s && *s != '#' && t < (int)sizeof(target) - 1; s++)
+        target[t++] = *s;
+    target[t] = 0;
+    int n = port == (tls ? 443 : 80) ? usnprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\n", target, host)
+                                     : usnprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s:%u\r\n", target, host,
+                                                 port);
     n += usnprintf(req + n, (int)sizeof(req) - n, "User-Agent: m3801-wget/" APP_VERSION "\r\nAccept: */*\r\n"
                    "Connection: close\r\n\r\n");
     if (n >= (int)sizeof(req)) {
         uprintf("wget: the URL is too long\n");
+        if (tls)
+            tls_end();
         tcp_abort(c);
-        return;
+        return 0;
     }
-    tcp_send(c, req, n);
-    tcp_push(c);
-    uprintf("HTTP request sent, awaiting response... ");
+    if (tls) {
+        if (tls_write(req, n) < 0) {
+            tcp_abort(c);
+            return 0;
+        }
+    } else {
+        tcp_send(c, req, n);
+        tcp_push(c);
+    }
+    uprintf("%s request sent, awaiting response... ", tls ? "HTTPS" : "HTTP");
     u8 *mem = (u8 *)&wg;
     for (u32 i = 0; i < sizeof(wg); i++)
         mem[i] = 0;
@@ -1000,10 +1077,27 @@ void cmd_wget(int argc, char **argv)
     int progress = 0;
     static u8 buf[2048];
     for (;;) {
-        int k = tcp_recv(c, buf, sizeof(buf));
+        int k;
+        if (tls) {                      /* (TLS waits for its records itself: Ctrl-C and the 15 s in tls.c) */
+            k = tls_read(buf, sizeof(buf));
+            if (k < 0) {
+                why = tls_why();
+                if (prefixed(why, "stopped")) {
+                    uprintf("^C\n");
+                    why = stopped;
+                }
+                break;
+            }
+            if (!k)
+                break;                          /* the server ended it: all there */
+        } else {
+            k = tcp_recv(c, buf, sizeof(buf));
+        }
         if (k > 0) {
             last = now_ms();
             wget_bytes(buf, k, out);
+            if (wg.moved)
+                break;
             if (wg.store && wg.body > WGET_MAX) {
                 why = "longer than 8 MB: its first 8 MB kept";
                 break;
@@ -1034,10 +1128,14 @@ void cmd_wget(int argc, char **argv)
         }
     }
     u32 ms = (u32)(now_ms() - t0);
-    if (why)
+    if (tls)
+        tls_end();
+    if (why || wg.moved)
         tcp_abort(c);
     else
         tcp_close(c);
+    if (wg.moved)
+        return 1;
     if (progress)
         uprintf("\n");
     if (!wg.in_body)
@@ -1054,6 +1152,42 @@ void cmd_wget(int argc, char **argv)
         disk_write_file(out, wg.store, wg.stored, 0);
         uprintf("done\n");
     }
+    return 0;
+}
+
+/* 'wget [-O n:path] [--no-check-certificate] <http[s]://host[:port]/path>': HTTP/1.0 GET, over TLS for https://
+   (tls.c); the status line, then the body on the console -- or saved (the body held in RAM at WGET_PHYS, up to
+   8 MB, then written as 'command > path' writes); a redirection (301, 302, 303, 307, 308) followed, up to 10;
+   Ctrl-C stops it, so does 15 s without data; the bytes, the time and the rate at the end */
+void cmd_wget(int argc, char **argv)
+{
+    const char *url = 0, *out = 0;
+    int bad = 0, check = 1;
+    for (int i = 1; i < argc && !bad; i++) {
+        if (argv[i][0] == '-' && argv[i][1] == 'O' && !argv[i][2])
+            bad = !(i + 1 < argc && (out = argv[++i]));
+        else if (prefixed(argv[i], "--no-check-certificate") && !argv[i][22])
+            check = 0;
+        else if (argv[i][0] != '-' && !url)
+            url = argv[i];
+        else
+            bad = 1;
+    }
+    if (bad || !url) {
+        uprintf("usage: wget [-O n:path] [--no-check-certificate] <http[s]://host[:port]/path>\n");
+        return;
+    }
+    if (str_len(url) >= (int)sizeof(where)) {
+        uprintf("wget: the URL is too long\n");
+        return;
+    }
+    for (int i = 0; (where[i] = url[i]) != 0; i++)
+        ;
+    for (int hops = 0; wget_once(out, check); hops++)
+        if (hops == 9) {
+            uprintf("wget: 10 redirections: stopped\n");
+            return;
+        }
 }
 
 /* ================================================================== */
@@ -1094,6 +1228,10 @@ const char *net_poll(void)
     s = http_poll(0);
     if (s)
         return s;
+    s = smb_poll();
+    if (s)
+        return s;
+    (void)ssdp_poll();
     return ntp_auto();
 }
 
@@ -1110,4 +1248,6 @@ void cmd_netstat(int argc, char **argv)
     uprintf("netload (port %u): python tools/maciej_netload.py <this box's address> [app.bin]\n", NETLOAD_PORT);
     ftp_status();
     http_status();
+    smb_status();
+    ssdp_status();
 }

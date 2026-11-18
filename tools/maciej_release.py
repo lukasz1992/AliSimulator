@@ -36,12 +36,14 @@ COMMANDS = {
                     "function (SIMCom A7670E) when there is no adapter or it gets no address; MAC, address from "
                     "DHCP, router",
         "dhcp": "ask the DHCP server for an address again", "arp": "the ARP table",
-        "wget": "[-O n:path] <http://url>: a page over the network link (TCP, HTTP/1.0): on the console, or "
-                "saved to a disk",
+        "wget": "[-O n:path] [--no-check-certificate] <http(s)://url>: a page over the network link (TCP, "
+                "HTTP/1.0; https:// over TLS 1.2 with BearSSL, the certificate checked against Mozilla's roots and "
+                "the NTP clock; redirections followed): on the console, or saved to a disk",
         "ntp": "[server]: the clock set over the network (pool.ntp.org; also by itself after DHCP)",
         "date": "the date and time: UTC and Polish (CET / CEST)",
-        "netstat": "TCP: the ports listened on (21 FTP server, 23 telnet console, 80 web page, 6464 netload), "
-                   "connections, counters, the FTP server's client, the web page's address",
+        "netstat": "TCP: the ports listened on (21 FTP server, 23 telnet console, 80 web page, 445 SMB file server "
+                   "-- Windows' \\\\box\\4 --, 6464 netload), connections, counters, the FTP and SMB servers' "
+                   "clients, the web page's address, SSDP",
         "loop": "the main loop since the last look: passes, the slowest, which part took the time",
         "info": "chip, clock, memory layout, uptime", "uptime": "time since start",
         "echo": "prints its arguments", "md": "dump memory", "mr": "read a 32-bit word",
@@ -87,9 +89,10 @@ COMMANDS = {
         "ntfs": "[n:] [reset-journal]: an NTFS volume's geometry, its journal's state and whether the demo writes "
                 "it (only a volume Windows closed cleanly: 'Safely remove'); reset-journal empties the journal "
                 "as ntfs-3g does",
-        "view": "[-1] <file>: a picture on the TV (JPEG baseline / progressive, PNG, GIF, BMP), fitted to it, "
-                "turned as a photo's EXIF says; Right / Space the next one in its directory, Left the one before, "
-                "Esc or q ends",
+        "view": "[-1] [-s | -c] <file>: a picture on the TV (JPEG baseline / progressive, PNG, GIF, BMP), fitted "
+                "to it, turned as a photo's EXIF says; Right / Space the next one in its directory, Left the one "
+                "before, Esc or q ends; a baseline JPEG is decoded by the video engine's JPEG mode (-s: by the CPU; "
+                "-c: both, compared)",
         "play": "[-n frames] [-x] [-k] [-v] [-1] <file>: a video file (.ts, .mpg, .m2v, .vob: MPEG-2 / MPEG-1 "
                 "video, MPEG audio) on the TV, decoded by the S3811's own MPEG-2 decoder, its sound through 'snd'; "
                 "Esc, Ctrl-C, q or the remote's EXIT ends (-n that many frames, -x as fast as it decodes, -k the "

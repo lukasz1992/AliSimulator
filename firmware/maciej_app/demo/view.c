@@ -22,17 +22,56 @@ struct fit {
     u32 oy, rows;                       /* the made row being summed; the file's rows in it so far */
 };
 
+static int view_mode;                   /* 0 the video engine first for a baseline JPEG, 1 image.c's decoder only
+                                           ('view -s'), 2 both compared ('view -c') */
+
+void view_set_mode(int mode)
+{
+    view_mode = mode;
+}
+
+/* the fit made ready for a picture of w x h coming a row at a time (its out, acc, cols and xmap in place) */
+static void fit_start(struct fit *f, u32 w, u32 h)
+{
+    f->w = w, f->h = h;
+    for (u32 x = 0; x < f->fw; x++)
+        f->cols[x] = 0;
+    for (u32 x = 0; x < f->fw * 3; x++)
+        f->acc[x] = 0;
+    for (u32 x = 0; x < w; x++) {
+        f->xmap[x] = (u16)(x * f->fw / w);
+        f->cols[f->xmap[x]]++;
+    }
+    for (u32 i = 0; i < f->fw * f->fh; i++)
+        f->out[i] = RGB(0, 0, 0);
+    f->oy = 0, f->rows = 0;
+}
+
+/* 2^24 / n rounded up, n 2..256: an average of n bytes' sum as a multiply and a shift -- the same as the
+   division's (exact while 255 n (n - 1) < 2^24) -- instead of three divisions a pixel, a third of a 1080p
+   picture's fitting time */
+static u32 recip[257];
+
 static void fit_flush(struct fit *f)
 {
     if (!f->rows || f->oy >= f->fh)
         return;
+    if (!recip[2])
+        for (u32 n = 2; n <= 256; n++)
+            recip[n] = ((1u << 24) + n - 1) / n;
     u16 *o = f->out + f->oy * f->fw;
-    for (u32 x = 0; x < f->fw; x++) {
-        u32 n = f->cols[x] * f->rows;
-        if (!n)
-            n = 1;
-        o[x] = RGB(f->acc[x * 3] / n, f->acc[x * 3 + 1] / n, f->acc[x * 3 + 2] / n);
-        f->acc[x * 3] = f->acc[x * 3 + 1] = f->acc[x * 3 + 2] = 0;
+    u32 *acc = f->acc, rows = f->rows, fw = f->fw;
+    const u32 *cols = f->cols;
+    for (u32 x = 0; x < fw; x++, acc += 3) {
+        u32 n = cols[x] * rows, r = acc[0], g = acc[1], b = acc[2];
+        if (n > 256) {
+            r /= n, g /= n, b /= n;
+        } else if (n > 1) {
+            u32 m = recip[n];
+            r = r * m >> 24, g = g * m >> 24, b = b * m >> 24;
+        }
+        o[x] = RGB(r, g, b);
+        acc[0] = acc[1] = acc[2] = 0;
     }
     f->rows = 0;
 }
@@ -45,9 +84,11 @@ static void fit_row(void *ctx, u32 y, const u8 *rgb)
         fit_flush(f);
         f->oy = oy;
     }
-    u32 *acc = f->acc;
-    for (u32 x = 0; x < f->w; x++, rgb += 3) {
-        u32 *a = acc + f->xmap[x] * 3;
+    u32 *acc = f->acc, w = f->w;        /* (in locals: the stores to acc could be to f, as far as the compiler
+                                           knows, and f's fields were read again every pixel) */
+    const u16 *xmap = f->xmap;
+    for (u32 x = 0; x < w; x++, rgb += 3) {
+        u32 *a = acc + xmap[x] * 3;
         a[0] += rgb[0];
         a[1] += rgb[1];
         a[2] += rgb[2];
@@ -243,20 +284,27 @@ static int show_file(const char *path, int quiet)
         uprintf("%s: %ux%u: too wide\n", path, in.width, in.height);
         return -1;
     }
-    for (u32 x = 0; x < f.fw; x++)
-        f.cols[x] = 0;
-    for (u32 x = 0; x < f.fw * 3; x++)
-        f.acc[x] = 0;
-    for (u32 x = 0; x < in.width; x++) {
-        f.xmap[x] = (u16)(x * f.fw / in.width);
-        f.cols[f.xmap[x]]++;
-    }
-    for (u32 i = 0; i < f.fw * f.fh; i++)
-        f.out[i] = RGB(0, 0, 0);
-    f.oy = 0, f.rows = 0;
     stop_keyed = 0;
     image_poll = stop_wanted;
-    why = image_decode(data, (u32)got, work + used, left - used, fit_row, &f);
+    /* a baseline JPEG: the video engine's JPEG mode first (jpeghw.c), pre-scaling it to no less than it is
+       shown; image.c's decoder for anything else, and for a JPEG the engine does not take or did not finish */
+    char how[80];
+    how[0] = 0;
+    u32 hw_w, hw_h, hw_ms = 0;
+    why = "";
+    if (view_mode != 1 && in.kind[0] == 'J' && !jpeghw_plan(data, (u32)got, MEDIA_PHYS, f.fw, f.fh, &hw_w, &hw_h)) {
+        fit_start(&f, hw_w, hw_h);
+        why = jpeghw_run(IMAGE_WORK_PHYS + used, left - used, fit_row, &f, &hw_ms);
+        if (!why)
+            usnprintf(how, sizeof(how), " by the video engine (%s: %u ms, %ux%u made)", jpeghw_detail(), hw_ms,
+                      hw_w, hw_h);
+        else if (!stop_keyed)
+            usnprintf(how, sizeof(how), " by the CPU (the video engine: %s)", why);
+    }
+    if (why && !stop_keyed) {
+        fit_start(&f, in.width, in.height);
+        why = image_decode(data, (u32)got, work + used, left - used, fit_row, &f);
+    }
     image_poll = 0;
     if (why && !stop_keyed && !f.oy && !f.rows) {       /* (not one row of it came: the TV says why, as for a file
                                                            that is no picture -- not a black screen) */
@@ -295,10 +343,90 @@ static int show_file(const char *path, int quiet)
     gfx_view(0);
     u64 t3 = now_ms();
     if (!quiet || why)
-        uprintf("%s: %s %ux%u, %s%s; shown %ux%u%s (read %u ms, decoded %u ms, drawn %u ms)%s%s\n", path, in.kind,
-                in.width, in.height, in.detail, turned || o > 1 ? ", turned as its EXIF says" : "", ow, oh,
-                k > 1 ? " (whole times larger)" : "", (u32)(t1 - t0), (u32)(t2 - t1), (u32)(t3 - t2),
+        uprintf("%s: %s %ux%u, %s%s; shown %ux%u%s (read %u ms, decoded %u ms%s, drawn %u ms)%s%s\n", path,
+                in.kind, in.width, in.height, in.detail, turned || o > 1 ? ", turned as its EXIF says" : "", ow, oh,
+                k > 1 ? " (whole times larger)" : "", (u32)(t1 - t0), (u32)(t2 - t1), how, (u32)(t3 - t2),
                 why ? " -- stopped: " : "", why ? why : "");
+    return 0;
+}
+
+/* 'view -c': a JPEG decoded by image.c's decoder (its rows kept at WGET_PHYS, as many as 8 MB holds) and by the
+   video engine at full size, compared value by value; nothing shown */
+static u8 *cmp_rgb;
+static u32 cmp_w, cmp_rows, cmp_max, cmp_off, cmp_x, cmp_y, cmp_seen;
+static u32 cmp_sum;                     /* (8 MB of values at most 255 off: under 2^31) */
+
+static void cmp_store(void *ctx, u32 y, const u8 *rgb)
+{
+    (void)ctx;
+    if (y < cmp_rows)
+        for (u32 i = 0; i < cmp_w * 3; i++)
+            cmp_rgb[y * cmp_w * 3 + i] = rgb[i];
+    if ((y & 63) == 0)
+        console_service();
+}
+
+static void cmp_check(void *ctx, u32 y, const u8 *rgb)
+{
+    (void)ctx;
+    if (y >= cmp_rows)
+        return;
+    const u8 *s = cmp_rgb + y * cmp_w * 3;
+    for (u32 i = 0; i < cmp_w * 3; i++) {
+        u32 d = rgb[i] > s[i] ? rgb[i] - s[i] : s[i] - rgb[i];
+        cmp_sum += d;
+        if (d > cmp_max)
+            cmp_max = d;
+        if (d > 8 && !cmp_off++)
+            cmp_x = i / 3, cmp_y = y;
+    }
+    cmp_seen++;
+}
+
+static int compare_file(const char *path)
+{
+    u8 *data = (u8 *)KSEG0(MEDIA_PHYS);
+    u32 size = 0;
+    int got = disk_read_head(path, data, MEDIA_MAX, &size);
+    if (got < 0)
+        return -1;
+    struct image_info in;
+    const char *why = image_info(data, (u32)got, &in);
+    u32 w, h, hw_ms = 0;
+    if (!why)
+        why = in.kind[0] != 'J' ? "not a JPEG" : jpeghw_plan(data, (u32)got, MEDIA_PHYS, in.width, in.height, &w, &h);
+    if (why) {
+        uprintf("%s: the video engine does not take it: %s\n", path, why);
+        return -1;
+    }
+    cmp_rgb = (u8 *)KSEG0(WGET_PHYS);
+    cmp_w = w;
+    cmp_rows = WGET_MAX / (w * 3) < h ? WGET_MAX / (w * 3) : h;
+    stop_keyed = 0;
+    image_poll = stop_wanted;
+    u64 t0 = now_ms();
+    why = image_decode(data, (u32)got, (u8 *)KSEG0(IMAGE_WORK_PHYS), IMAGE_WORK_SIZE, cmp_store, 0);
+    u64 t1 = now_ms();
+    if (!why) {
+        (void)jpeghw_plan(data, (u32)got, MEDIA_PHYS, in.width, in.height, &w, &h);
+        cmp_max = cmp_off = cmp_seen = 0, cmp_sum = 0;
+        why = jpeghw_run(IMAGE_WORK_PHYS, IMAGE_WORK_SIZE, cmp_check, 0, &hw_ms);
+    }
+    u64 t2 = now_ms();
+    image_poll = 0;
+    if (why) {
+        uprintf("%s: %s\n", path, why);
+        return -1;
+    }
+    u32 n = cmp_seen * cmp_w * 3;
+    u32 mean = n ? cmp_sum / n * 100 + cmp_sum % n * 100 / n : 0;
+    uprintf("%s: JPEG %ux%u, %s: the CPU %u ms, the video engine %u ms (%u ms its decoding, the rest to RGB); %u of "
+            "%u rows compared: largest difference %u, mean %u.%02u, %u values off by more than 8", path, in.width,
+            in.height, jpeghw_detail(), (u32)(t1 - t0), (u32)(t2 - t1), hw_ms, cmp_seen, h, cmp_max, mean / 100,
+            mean % 100, cmp_off);
+    if (cmp_off)
+        uprintf(" (the first at %u, %u)", cmp_x, cmp_y);
+    uprintf("\n");
     return 0;
 }
 
@@ -471,6 +599,10 @@ static int show(const char *path, int bar, int wait)
 
 void view_file(const char *path, int once)
 {
+    if (view_mode == 2) {
+        (void)compare_file(path);
+        return;
+    }
     usnprintf(cur, sizeof(cur), "%s", path);
     if (show(cur, 0, !once) < 0)
         return;

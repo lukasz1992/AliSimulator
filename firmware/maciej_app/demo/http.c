@@ -360,8 +360,8 @@ static int disk_free(struct client *cl, int in_cmd, int moving)
         fail(cl, 503, "A command is running on the box: its disks are its own until it ends");
         return 0;
     }
-    if (moving && (disk_owner || ftp_disk_busy())) {
-        fail(cl, 503, "The box moves one file at a time (another download or upload, the page's or FTP's): "
+    if (moving && (disk_owner || ftp_disk_busy() || smb_disk_busy())) {
+        fail(cl, 503, "The box moves one file at a time (another download or upload, the page's, FTP's or SMB's): "
                       "try again in a moment");
         return 0;
     }
@@ -639,6 +639,9 @@ static void request(struct client *cl, int in_cmd)
     }
     if (get && (same(target, "/") || same(target, "/index.html"))) {
         send_mem(cl, 200, "text/html; charset=utf-8", web_page, (u32)(web_page_end - web_page), 0);
+    } else if (get && same(target, "/ssdp/device.xml")) {      /* (UPnP's description of the box: ssdp.c) */
+        char *t = text_of(cl);
+        send_mem(cl, 200, "text/xml; charset=utf-8", t, (u32)ssdp_description(t, HTTP_TEXT_SIZE), 0);
     } else if (get && same(target, "/api/info")) {
         info(cl, in_cmd);
     } else if (get && same(target, "/api/out")) {

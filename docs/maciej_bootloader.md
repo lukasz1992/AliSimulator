@@ -335,9 +335,36 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   1460, go-back-N retransmission (400 ms doubling to 3.2 s), FIN and RST
   both ways; while a connection is busy the frames are read every pass.
   `netstat` lists them. On it:
-  - `wget [-O n:path] <http://url>`: HTTP/1.0, the body on the console or
-    saved to a disk (example.com in 0.08 s; 1 MB from the internet at
-    760 KB/s onto the card); https:// is refused with a message.
+  - `wget [-O n:path] [--no-check-certificate] <http[s]://url>`: HTTP/1.0,
+    the body on the console or saved to a disk (example.com in 0.08 s; 1 MB
+    from the internet at 760 KB/s onto the card); a redirection (301, 302,
+    303, 307, 308) is followed, up to 10. https:// goes over TLS 1.2
+    (`tls.c`): BearSSL 0.6 (`firmware/maciej_app/bearssl`, MIT, the 86 of
+    its 277 source files a full client needs; build.py compiles them into a
+    library when `tls.c` is built), every cipher suite of its full client,
+    SNI, the certificate chain checked against Mozilla's 118 roots
+    (`tls_anchors.bin`, built in by `tls_anchors.S`; `tools/tls_anchors.py`
+    makes it from curl's cacert.pem and lists the roots in
+    `tls_anchors.txt`) and the NTP clock, the name checked against the
+    host's; `--no-check-certificate` takes the server's key and checks
+    nothing. The box has no random number generator: TLS's randomness is
+    CP0 Count sampled as Ethernet frames arrive and around the handshake,
+    hashed with the clock and the last seed -- unpredictable without
+    cycle-exact sight of the box, not a hardware RNG. No TLS 1.3 (BearSSL
+    has none). About 100 KB of code and 46 KB of buffers; to make room
+    under the stack the Amiga player's four 512 KB memories moved out of
+    the image to physical 0x00B00000 (`amiga.h`'s AMIGA_RAM_PHYS). The
+    demo is 1.1 MB now (448 KB packed): the original bootloader's check of
+    it before it starts takes 8.3 s of emulated time, against 4.7 s for
+    the 588 KB demo, so the suite holds 'c' for 12 s (the box's own time
+    not measured: it was netloaded, not flashed). On the
+    box (2026-11-18): example.com, github.com (after its http:// 301),
+    letsencrypt.org and www.google.com fetched with the certificate checked
+    (handshakes 0.22 - 0.63 s, ECDHE with ChaCha20-Poly1305 or AES-GCM);
+    badssl.com's self-signed, expired and wrong-host certificates each
+    refused with its reason, the self-signed one taken with
+    `--no-check-certificate`; 8 MB saved to the card at 320 - 350 KB/s
+    (AES-128-GCM), byte for byte the file a PC downloaded.
   - A telnet console on port 23: the command line as on the UART (one
     client; what the box prints goes to both, what the client types is
     fed in as if typed, Ctrl-C included).
@@ -395,7 +422,7 @@ masked, everything polled) for the same bootloader. It prints the same banner an
     (waits up to 15 s for new output), `POST /api/in` -- errors as JSON
     `{"error": ...}` with the disk.c message. HTTP/1.1 with keep-alive
     (a connection a request would leave tcp.c's connections in TIME_WAIT),
-    six connections (a browser's per host; tcp.c has 12 now, and 8
+    six connections (a browser's per host; tcp.c has 14 now, with SMB's two, and 8
     listening ports). It runs in the main loop and, while a command runs,
     from `net_uart_poll` (as the telnet console's input), where everything
     but the disks goes on -- the picture, the keys, the output -- and the
@@ -412,6 +439,41 @@ masked, everything polled) for the same bootloader. It prints the same banner an
     while it ran, the disks refused meanwhile, Ctrl-C from the page ended
     it. The emulator has no network adapter, so the suite does not reach
     it.
+  - An SMB2 file server on port 445 (`smb.c`) for Windows' own client:
+    `\\192.168.0.161\4` (or `\4 PHONE CARD`: the shares are the disks'
+    volumes, named as FTP's root names them), `net view`, Explorer, `net
+    use`, robocopy. Dialect 2.1 (2.0.2; an SMB1 NEGOTIATE gets SMB2's
+    answer), SPNEGO / NTLMSSP with any user and password taken -- a guest
+    session, so nothing is signed (Windows 10 Home and Pro allow guest
+    logons; Enterprise / Education and Windows 11 24H2 Pro refuse them),
+    the srvsvc pipe's NetShareEnum for the share list,
+    FSCTL_VALIDATE_NEGOTIATE_INFO, compounded requests; files read and
+    written through disk.c's reader and writer as FTP's are (reads anywhere;
+    writes from the start or at the end -- what the writer can do; an
+    allocation or end of 0 empties a file), rename / move, delete, mkdir /
+    rmdir, the listing classes Explorer asks for, free space. Two clients,
+    48 open files; one file written at a time; ASCII names. On the box from
+    Windows 10 (2026-11-18): `net view`, `dir`, Copy-Item / robocopy of a
+    3 MB file and of a folder tree both ways (byte for byte), Set-Content /
+    Add-Content, rename, move, a copy within the share, delete, rmdir /s;
+    3 MB up in 15.8 s and down in 3.5 s -- uploads as fast as FTP's (the
+    card is what takes the time). Found on the way: Windows logs off when
+    FSCTL_VALIDATE_NEGOTIATE_INFO's answer is unsigned (so the session is a
+    guest's); PowerShell empties a file with an allocation size of 0, then
+    writes after what it read of it.
+  - SSDP, UPnP's discovery (`ssdp.c`, UDP 1900, group 239.255.255.250):
+    the box is a basic UPnP root device (its UUID from the MAC) -- NOTIFY
+    ssdp:alive three times 2 s apart once DHCP gave an address, then every
+    10 minutes (max-age 30), an IGMPv2 report every minute (for switches
+    that snoop IGMP); M-SEARCH for ssdp:all, upnp:rootdevice, its uuid or
+    device type answered; its description at `/ssdp/device.xml` on the
+    web page's server ("M3801 v4 demo (address)", the web page as its
+    presentation URL). The Ethernet adapter's filter now takes all
+    multicast (CDC ECM's ALL_MULTICAST, RNDIS's), eth.c hands over the
+    group's datagrams and drops the rest. On the box: its NOTIFYs heard on
+    the PC, every M-SEARCH answered, and Windows' UPnP device finder
+    (UPnP.UPnPDeviceFinder, what the Network folder's "Other devices"
+    uses) lists it by name; Explorer's view itself was not looked at.
   - More game players, each a machine in its own file that knows nothing of
     the box (play.c hosts them, as the NES and the Game Boy): `z80.c`, a Z80
     core (every opcode incl. the undocumented ones and MEMPTR; zexdoc and
@@ -610,7 +672,7 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   - Video files on the chip's own MPEG-2 and H.264 decoders (`av.c`,
     `avc.c`, `mp2.c`; commands `play [-n frames] [-x] [-k] [-v] [-1] <file>`
     and `av <status|shot|show|off|reset>`; Enter on a .ts / .mpg / .m2v /
-    .vob / .264 / .h264 in the explorer).
+    .vob / .264 / .h264 / .mp4 / .m4v / .mov in the explorer).
     dump.bin runs every A/V driver on the one MIPS (no second core on the
     S3811): DECV_S3601 for MPEG-1/2, DECV_AVC for H.264 (the same block's
     second engine, below), DECA = ALi's libmpg on the CPU, SND (`snd.c`). The
@@ -697,14 +759,55 @@ masked, everything polled) for the same bootloader. It prints the same banner an
     their sound: the Sintel trailer (1920 x 1080 High 5.0, 24 frames/s)
     1253 pictures in 52.6 s, 0 late, 24 ms a picture on average (29 at
     most); Big Buck Bunny 1280 x 720 High 4.0, 813 in 32.9 s, 0 late;
-    Sintel 720 x 576 Main 3.0, 249 in 10.3 s, 0 late. Not done: interlaced
+    Sintel 720 x 576 Main 3.0, 249 in 10.3 s, 0 late. On the TV a frame of
+    the 1080p trailer was seen right (by eye). Not done: interlaced
     H.264 (field pictures, MBAFF: refused with a message), 4:2:2 / 4:4:4,
     more than 8 bits, slice groups, data partitioning, SP / SI slices,
-    pictures over 1920 x 1088, .mp4 files; custom scaling matrices are sent
-    as the SDK sends them, not tried on the box; HEVC (stream type 0x24) is
-    named, not played. The suite plays a 32 x 32 H.264 stream in a .ts:
-    its parameter sets read and its picture set up ("video: H.264 Baseline
-    1.0, 32 x 32 ..."), then the emulator's missing engine reported.
+    pictures over 1920 x 1088; custom scaling matrices are sent as the SDK
+    sends them, not tried on the box; HEVC (stream type 0x24) is named, not
+    played. The suite plays a 32 x 32 H.264 stream in a .ts: its parameter
+    sets read and its picture set up ("video: H.264 Baseline 1.0, 32 x 32
+    ..."), then the emulator's missing engine reported.
+  - .mp4 / .m4v / .mov files (`av.c`'s MP4 reader): the H.264 track (avc1
+    / avc3) given to `avc.c` as an elementary stream. The index (moov) is
+    found by walking the top-level boxes (64-bit sizes too) and read whole
+    into the stream buffer -- before or after the samples (mdat): ffmpeg
+    and cameras put it after them, so the reader seeks there and back
+    (`disk_stream_seek` now goes to any sector, forwards or back; on FAT a
+    seek back walks the cluster chain again from the file's first cluster).
+    The video track's stsc / stsz / stco (or co64) tables are kept as the
+    file has them (2 MB at 0x05E00000: about 400000 samples), the samples
+    are read in their order, each chunk from its place, the sound's chunks
+    between them passed over; each NAL unit's 1, 2 or 4-byte length becomes
+    a start code and the avcC box's SPS / PPS go first. The frame rate is
+    the track's (the commonest stts step in mdhd's time scale). The sound
+    is named (an mp4a's esds -- inside a wave box in a .mov -- says AAC,
+    MPEG audio, AC-3) and not played. Refused with a message: other video
+    (HEVC, MPEG-4 part 2, AV1, VP9), fragmented files (moof: no samples in
+    the index), stz2 sizes. On the box: Sintel 720 x 576 as .mp4 and .mov,
+    249 pictures in 10.19 s, 0 late; Big Buck Bunny 720p (its index after
+    11.6 MB of samples) 813 in 32.88 s, 0 late, its frames read back
+    identical to ffmpeg's; a 1080p trailer excerpt damaged by FTP uploads
+    (below) 624 pictures in 26.4 s, 0 late, its damaged slices flagged, no
+    hang. The suite plays a 80 KB .mp4 with 2-byte NAL lengths and co64,
+    its index after its samples (seeks forward, back and over a 40 KB sound
+    chunk), and refuses an HEVC one.
+  - Found and fixed meanwhile (`usb.c`, `epb_end`): files uploaded by FTP
+    to a USB disk sometimes came back with 66 to 250 wrong bytes from byte
+    62 of a 4 KB block -- the controller's DMA receiver, left started by an
+    IN that had received nothing (the network adapter's frames looked for,
+    none waiting), woke with the next OUT's en_dma_transfer and wrote into
+    its buffer, the bulk buffer that OUT was sending to the disk. Shown on
+    the box with a debug build: the bytes FTP handed the disk writer had
+    the file's CRC-32, while the bulk buffer changed under the transmitter
+    (the receiver's index 32 after the 31-byte command block, about 400
+    after the 4 KB of data). Each IN now ends with the receiver set back
+    (+0x60 = 0x20, init_dma_rx_state), as the transmitter is after every
+    OUT: three 15 MB uploads in a row came back identical, at 0.24 MB/s
+    (the receiver also set back before every OUT, uploads ran at half
+    that speed). The suite checks the order of those stores over every
+    transfer of its run (the emulator's controller model writes nothing
+    stray).
 - **File explorer on the TV** (`explorer [n:][path]`, `explorer.c`): the
   current directory's entries (directories first) under a path bar that
   follows `cd` both ways -- a `cd` on the UART lists the new directory, a
@@ -742,6 +845,36 @@ masked, everything polled) for the same bootloader. It prints the same banner an
   starts loading the TV says "Opening NAME ..." (the next picture in the viewer: a strip at the top
   over the one shown); one that cannot be opened says "Could not open NAME" and why (the last line
   printed) for 4 s or until a key.
+  - A baseline JPEG goes to the video engine first (`jpeghw.c`): the JPEG
+    mode of the MPEG-2 block (0xB8004200, "hardware version 1": its
+    extension registers at 0xB8004100), driven as dump.bin's own MJPEG
+    decoder drives it (0x800FEB48..) and as the SDK's picture decoder
+    does (libplus_hd.a: imagedec_acc36's `jh_*`, `jh_m3602_hw_init`,
+    imagedec_main's `buildhuff_hwtable` / `write_hufftable` and
+    `decode_next_row_hw_vld`). The engine does the Huffman decoding, the
+    dequantisation, the IDCT and the frames, an MCU a start, pre-scaled
+    1/2 .. 1/8 when the picture is shown that much smaller; the CPU loads
+    the tables, points it at each MCU's first bit (+0x24 / +0x28 / +0x2C),
+    reads where it stopped, passes restart markers and stuffed bytes, and
+    turns the tiled frames (the MPEG-2 decoder's: luma 32 x 16, Cb / Cr
+    pairs) into rows of RGB for the viewer's fitting. It takes grey,
+    4:2:0, 4:2:2 and 4:4:4 (shown 4:2:2: the engine halves 4:4:4's colour
+    across) with quantisers up to 127 (quality 50 and better); anything
+    else -- progressive, 4:1:1 / 4:4:0 (untried), low quality, a file over
+    12 MB -- and an engine that does not finish goes to `image.c`, as does
+    everything in the emulator (no JPEG engine there: jpeghw finds it read
+    no bits at the first MCU). `view -s` decodes with the CPU only, `view -c`
+    with both at full size and compares every value. On the box
+    (2026-11-18): the engine's decoding of 1920 x 1080 4:2:0 took 56 ms
+    against the CPU's 1030, 4000 x 2250 227 against 4075, 1280 x 720
+    4:2:2 40 against 566; the largest difference 2 or 3 (the IDCTs'
+    rounding), none above 8 -- grey, 1001 x 777 and a file of 67 restart
+    markers too. In the viewer: 1080p 504 ms against 1221, the 4000 x 2250
+    photo 689 against 4721, a 6000 x 4000 one (at 1/4) 985 against 14381;
+    the rest of the time is the fitting to the screen (made quicker for
+    both: a multiply instead of three divisions a pixel) and the conversion
+    to RGB. The TV pictures were not looked at; the suite checks the
+    fallback in the emulator.
 - **NES player** (`nes [-f frames] [-k script] <file.nes>`, `nes.c`,
   `play.c`): a NES machine -- the 6502 with the unofficial instructions,
   the picture chip drawn a scanline at a time (the sprite-0 hit at its dot,

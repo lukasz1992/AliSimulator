@@ -64,6 +64,8 @@ struct volume {
     u32 fsinfo;                         /* FAT32: the FSInfo sector (0: none) */
     u32 alloc_hint;                     /* where the search for a free cluster starts */
     u8 written;                         /* (written since it was mounted: the FSInfo counts made unknown) */
+    u8 free_known;                      /* free_clusters counted (disk_space), then kept as clusters come and go */
+    u32 free_clusters, free_gen, free_changes;  /* (its disk's medium, and NTFS: the changes count, it holds for) */
     char label[34];                     /* FAT: 11 characters, NTFS: 32 */
     /* NTFS */
     const char *problem;                /* why its files are not read (0: they are) */
@@ -2205,6 +2207,7 @@ struct reader {
     u8 resident;                        /* NTFS: its bytes in its record (copied into file_res) */
     u32 run;                            /* NTFS: the run (file_runs) being read */
     u32 cluster, in, steps;             /* FAT: the cluster being read, its sector, the chain's steps */
+    u32 first;                          /* FAT: the file's first cluster (a seek back walks the chain again) */
     struct runs *runs;                  /* NTFS: its runs and a small file's bytes (0: file_runs, file_res --
                                            ftp.c's reader has its own: it lasts across main loop passes) */
     u8 *res;
@@ -2228,7 +2231,7 @@ static int file_open(struct reader *r, struct disk *k, const struct volume *v, c
     }
     if (v->fs == FS_FAT) {
         r->size = r->init = e->size;
-        r->cluster = e->cluster;
+        r->cluster = r->first = e->cluster;
         r->in = r->steps = 0;
         return 0;
     }
@@ -2679,6 +2682,8 @@ static u32 fat_alloc(struct disk *k, struct volume *v)
                 return 0;
             }
             v->alloc_hint = c + 1;
+            if (v->free_known && v->free_clusters)
+                v->free_clusters--;
             return c;
         }
         c = c + 1 < v->clusters + 2 ? c + 1 : 2;
@@ -2692,10 +2697,13 @@ static u32 fat_alloc(struct disk *k, struct volume *v)
 /* a chain of clusters made free */
 static int free_chain(struct disk *k, const struct volume *v, u32 c)
 {
+    struct volume *w = (struct volume *)v;      /* (its free count kept) */
     for (u32 steps = 0; c >= 2 && c < v->clusters + 2 && steps <= v->clusters; steps++) {
         u32 next;
         if (fat_get(k, v, c, &next) < 0 || fat_set(k, v, c, 0) < 0)
             return -1;
+        if (w->free_known)
+            w->free_clusters++;
         c = next;
         if (!(steps & 0x3F))
             (void)now_ms();
@@ -6895,6 +6903,13 @@ int disk_stat(const char *arg, struct disk_entry *o)
     return 0;
 }
 
+static u32 stream_opens;                /* disk_stream_open's calls (smb.c: is the reader still its own?) */
+
+u32 disk_stream_opens(void)
+{
+    return stream_opens;
+}
+
 /* the file at `arg` opened for disk_stream_read: 0 (its size into *size), -1 (said why) */
 int disk_stream_open(const char *arg, u64 *size)
 {
@@ -6903,6 +6918,7 @@ int disk_stream_open(const char *arg, u64 *size)
     static struct entry e;
     u32 dir;
     const char *from;
+    stream_opens++;
     stream.k = 0;
     const char *path = locate(arg, &k, &v, &dir, &from);
     if (!path || walk_path(k, v, dir, from, path, &e, 0) < 0)
@@ -6924,8 +6940,8 @@ int disk_stream_open(const char *arg, u64 *size)
 
 static u64 reader_seek(struct reader *r, u64 pos);
 
-/* right after disk_stream_open: the reader moved on towards `pos` -- to the start of the cluster (FAT) or the
-   sector (NTFS) that holds it; where it is now (the bytes from there to pos are the caller's to leave out) */
+/* the reader moved to the sector holding `pos` (forwards or back, any time after disk_stream_open): where it is
+   now (the bytes from there to pos are the caller's to leave out) */
 u64 disk_stream_seek(u64 pos)
 {
     return stream.k ? reader_seek(&stream, pos) : 0;
@@ -7335,6 +7351,81 @@ static void df_volume(struct disk *k, struct volume *v)
     uprintf("%s: %u MB free, %u MB used (%u%% free)\n", text, free_mb, total_mb - free_mb, pct > 100 ? 100 : pct);
 }
 
+/* the volume holding `arg`: its size and free space, file system and label (smb.c).  The free clusters are
+   counted once (FAT: in the FAT, NTFS: in its $Bitmap) and then kept: FAT's as fat_alloc / free_chain take and
+   give them, NTFS's counted again after a change -- the FSInfo count disk.c makes unknown at its first write,
+   and a count at every look took seconds on a big card: 0, -1 (said why) */
+int disk_space(const char *arg, struct disk_space *o)
+{
+    static struct reader r;
+    static struct entry e;
+    struct disk *k;
+    struct volume *v;
+    u32 dir;
+    const char *from;
+    if (!locate(arg, &k, &v, &dir, &from))
+        return -1;
+    u32 total, cbytes;
+    if (v->fs == FS_FAT) {
+        total = v->clusters;
+        cbytes = (u32)v->spc * SECTOR;
+    } else if (v->fs == FS_NTFS && readable(v)) {
+        total = v->ntfs_clusters;
+        cbytes = (u32)SECTOR << v->csh;
+    } else {
+        uprintf("its files are not read\n");
+        return -1;
+    }
+    if (!v->free_known || v->free_gen != k->gen || (v->fs == FS_NTFS && v->free_changes != changes)) {
+        u32 n_free = 0;
+        if (v->fs == FS_FAT) {
+            for (u32 c = 2; c < v->clusters + 2; c++) {
+                u32 value;
+                if (fat_get(k, v, c, &value) < 0) {
+                    uprintf("the FAT did not read (%s)\n", io_error());
+                    return -1;
+                }
+                n_free += !value;
+                if (!(c & 0xFFF))
+                    (void)now_ms();
+            }
+        } else {
+            for (unsigned i = 0; i < sizeof(e); i++)
+                ((u8 *)&e)[i] = 0;
+            e.cluster = 6;              /* ($Bitmap) */
+            if (file_open(&r, k, v, &e, "space") < 0)
+                return -1;
+            u32 seen = 0;
+            int n;
+            while (seen < total && (n = file_read(&r, file_buf, sizeof(file_buf))) > 0)
+                for (int i = 0; i < n && seen < total; i++)
+                    for (int j = 0; j < 8 && seen < total; j++, seen++)
+                        n_free += !(file_buf[i] & (1u << j));
+            if (seen < total) {
+                uprintf("its $Bitmap did not read\n");
+                return -1;
+            }
+        }
+        v->free_clusters = n_free;
+        v->free_known = 1;
+        v->free_gen = k->gen;
+        v->free_changes = changes;
+    }
+    o->total = (u64)total * cbytes;
+    o->avail = (u64)(v->free_clusters < total ? v->free_clusters : total) * cbytes;
+    o->cluster = cbytes;
+    const char *fs = v->fs == FS_NTFS ? "NTFS" : v->fat == 32 ? "FAT32" : v->fat == 16 ? "FAT16" : "FAT12";
+    int i = 0;
+    for (; fs[i]; i++)
+        o->fs[i] = fs[i];
+    o->fs[i] = 0;
+    for (i = 0; i < (int)sizeof(o->label) - 1 && v->label[i]; i++)
+        o->label[i] = v->label[i];
+    o->label[i] = 0;
+    o->serial = v->start * 2654435761u ^ v->sectors;
+    return 0;
+}
+
 void disk_df(const char *arg)
 {
     int any = 0;
@@ -7366,28 +7457,38 @@ void disk_df(const char *arg)
         uprintf("no USB disk\n");
 }
 
-/* the reader moved to `pos`, or back to its cluster's start (FAT) or sector's (NTFS): where it is now */
+/* the reader moved to the sector holding `pos` (a resident NTFS file's: to pos), forwards or back -- FAT walks its
+   cluster chain on from the cluster being read, or again from the file's first one: where it is now (the bytes
+   from there to pos are the caller's to leave out; a chain that ends early leaves the reader where it was) */
 static u64 reader_seek(struct reader *r, u64 pos)
 {
     const struct volume *v = r->v;
-    if (pos > r->size)
-        pos = r->size;
+    if (pos >= r->size) {
+        r->pos = r->size;               /* (the end: file_read gives 0; a seek back from here starts the chain
+                                           again) */
+        return r->pos;
+    }
     if (v->fs == FS_FAT) {
         u32 shift = 9;
         while ((1u << shift) < (u32)v->spc * SECTOR)
             shift++;
-        u32 steps = (u32)(pos >> shift), c = r->cluster;
-        for (u32 i = 0; i < steps && c; i++) {
+        u32 steps = (u32)(pos >> shift), from = r->steps, c = r->cluster;
+        if (steps < from || r->pos >= r->size) {        /* (back, or from the end -- where the cluster read last
+                                                           is not the next one's) */
+            from = 0;
+            c = r->first;
+        }
+        for (u32 i = from; i < steps && c; i++) {
             c = next_cluster(r->k, v, c);
-            if (!(i & 0xFFF))
+            if (!((i - from) & 0xFFF))
                 (void)now_ms();
         }
         if (!c)
-            return r->pos;              /* (a chain that ends early: read from the start) */
+            return r->pos;
         r->cluster = c;
-        r->in = 0;
         r->steps = steps;
-        r->pos = (u64)steps << shift;
+        r->in = (u32)(pos >> 9) & (v->spc - 1u);        /* (a cluster's sectors: a power of two) */
+        r->pos = pos & ~(u64)(SECTOR - 1);
     } else if (r->resident) {
         r->pos = pos;
     } else {

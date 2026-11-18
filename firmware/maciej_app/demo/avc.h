@@ -32,10 +32,11 @@ struct avc_stats {
 /* a new stream: the engine reset, everything forgotten.  say: AVC_DESCRIBE the stream described in a line when
    its first picture sets it up ('video: H.264 ...'; not with 'play -q'), AVC_VERBOSE every slice told too
    ('play -v').  idle: called again and again while the engine decodes a slice -- the player reads the file and
-   decodes the sound meanwhile; it must not move the stream's bytes the engine reads */
+   decodes the sound meanwhile; it must not move the stream's bytes the engine reads.  tick / scale: a frame's
+   time in seconds as the file says it (an .mp4's track), else 0 / 0 (the SPS's timing, else 25 frames/s) */
 #define AVC_DESCRIBE 1
 #define AVC_VERBOSE 2
-void avc_begin(int say, void (*idle)(void));
+void avc_begin(int say, void (*idle)(void), u32 tick, u32 scale);
 /* one NAL unit: `nal` its header byte (in RAM the engine reads, KSEG0), `n` bytes; the stream's bytes go on
    to `avail` bytes from nal -- a start code must follow the NAL unit within them (the engine's start code
    detector ends a slice there): AVC_DONE, AVC_FULL, AVC_FAIL */

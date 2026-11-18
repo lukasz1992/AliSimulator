@@ -1,8 +1,8 @@
 /* av.c: a video file player on the S3811's own MPEG-2 decoder ("VE", 0xB8004200) -- and its H.264 engine,
    through avc.c -- and the display engine's video plane (the "MP" layer under the OSD): 'play <file>' (a .ts,
-   an .mpg program stream, an .m2v or .264 elementary stream from a USB disk / the card), sound (MPEG audio
-   Layer II, decoded by mp2.c) through snd.c.  The registers and how the original firmware (dump.bin) drives
-   them are in av.c's and avc.c's headers. */
+   an .mpg program stream, an .m2v or .264 elementary stream, an .mp4 / .mov's H.264 track, from a USB disk /
+   the card), sound (MPEG audio Layer II, decoded by mp2.c) through snd.c.  The registers and how the original
+   firmware (dump.bin) drives them are in av.c's and avc.c's headers. */
 #ifndef DEMO_AV_H
 #define DEMO_AV_H
 
@@ -27,6 +27,9 @@
 #define AV_STAGE_SIZE    0x000FF000u
 #define AV_PARAM_PHYS    0x05DFF000u      /* the display engine's parameter block: the scaler's filters (its
                                              +0x1E4 register points here; 0x560 bytes) */
+#define AV_INDEX_PHYS    0x05E00000u      /* an .mp4's video track: its samples' sizes and its chunks' places,
+                                             as its index (moov) has them (2 MB, up to NETLOAD_PHYS) */
+#define AV_INDEX_SIZE    0x00200000u
 
 /* 'play [-n frames] [-x] [-k] [-v] [-q] <file>': 0, -1 it could not start */
 int av_play(int argc, char **argv);
@@ -35,7 +38,7 @@ void play_command(int argc, char **argv);       /* (the same for the command tab
 void av_command(int argc, char **argv);
 /* the picture a 'play -k' / 'av show' left on the TV (the OSD hidden under it) taken away: 1 if there was one */
 int av_dismiss(void);
-/* the explorer: is this a file 'play' takes (.ts .mpg .mpeg .m2v .m2t .vob .trp .264 .h264)? */
+/* the explorer: is this a file 'play' takes (.ts .mpg .mpeg .m2v .m2t .vob .trp .264 .h264 .mp4 .m4v .mov)? */
 int av_is_video(const char *name);
 /* the data cache written back over [p, p + n) (what the CPU wrote, in RAM before a decoder reads it) */
 void av_cache_flush(const void *p, u32 n);
