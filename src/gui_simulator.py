@@ -11,6 +11,7 @@ import time
 import chips
 import dump_catalog
 from simulator import AliMipsSimulator, DUMPS_DIR, flash_size_for, resolve_dump
+import usb_stick_ui
 from mips16_decoder import MIPS16Decoder
 
 FAMILIES = list(chips.FAMILY_CHOICES)
@@ -195,6 +196,7 @@ class MIPSSimulatorGUI:
             # Load the binary and attach default tuner/demod/GPIO peripherals
             self.sim.loadFile(self.BINARY_FILE, chip=chip_arg)
             self.sim.attach_tuner()
+            self.usb_row.attach(self.sim) if hasattr(self, "usb_row") else usb_stick_ui.attach(self.sim)
             
             # Printf hook (Legacy support from old GUI)
             self.sim.mu.hook_add(UC_HOOK_CODE, self.hook_printf, begin=0xAFC00494, end=0xAFC00494)
@@ -567,6 +569,7 @@ class MIPSSimulatorGUI:
         self.spi_dump_var = tk.BooleanVar(value=False)
         tk.Checkbutton(row2, text="SPI Trace", variable=self.spi_dump_var,
                        command=self._on_spi_dump_toggled).pack(side=tk.LEFT, padx=2)
+        self.usb_row = usb_stick_ui.UsbRow(target_frame, lambda: self.sim, self.log)
         self._sync_dump_combo_display()
         
         # Controls
